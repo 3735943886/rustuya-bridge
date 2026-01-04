@@ -2,8 +2,8 @@ use bytes::Bytes;
 use clap::Parser;
 use futures_util::StreamExt;
 use log::{error, info};
-use rustuya::Manager;
 use rustuya::protocol::CommandType;
+use rustuya::{Manager, Scanner};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -495,6 +495,40 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
         }
         "device/status" | "device/set_dps" | "device/request" => {
             handle_device_command(ctx, &action, &req, &mut used_keys).await
+        }
+        "scan" => {
+            let ctx_scan = ctx.clone();
+            tokio::spawn(async move {
+                let scanner = Scanner::new().with_timeout(Duration::from_secs(18));
+                let stream = scanner.scan_stream();
+                tokio::pin!(stream);
+
+                while let Some(dev) = stream.next().await {
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("id".to_string(), Value::String(dev.id.clone()));
+                    payload.insert("ip".to_string(), Value::String(dev.ip.clone()));
+                    if let Some(v) = &dev.version {
+                        payload.insert("version".to_string(), Value::String(v.to_string()));
+                    }
+                    if let Some(pk) = &dev.product_key {
+                        payload.insert("product_key".to_string(), Value::String(pk.to_string()));
+                    }
+
+                    ctx_scan
+                        .publish_event("scanner".to_string(), Value::Object(payload).to_string())
+                        .await;
+                }
+
+                // Send empty payload to signal end of scan
+                ctx_scan
+                    .publish_event("scanner".to_string(), "{}".to_string())
+                    .await;
+            });
+
+            ApiResponse::ok("scan", "bridge").with_extra(
+                "message",
+                "Scan started. Results will be published to 'scanner' topic.".into(),
+            )
         }
         _ => ApiResponse::error(format!("Unknown action: {}", action)),
     };

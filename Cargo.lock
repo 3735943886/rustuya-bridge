@@ -867,9 +867,9 @@ dependencies = [
 
 [[package]]
 name = "rustuya"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d0752a41d4db5c074e5514cb88e95ad94ddb55273fa335b41effbcc308fef8"
+checksum = "9b8f5e8c23e871bf6398d7744410fdb96bbc5e052f764c0d9adc211058094592"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "rustuya-bridge"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "bytes",
  "clap",
