@@ -1,0 +1,6 @@
+# Rust
+/target/
+*/target/
+
+# Temporary files
+*.json
