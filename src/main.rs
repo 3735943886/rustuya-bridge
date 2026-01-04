@@ -132,20 +132,24 @@ struct BridgeContext {
 impl BridgeContext {
     /// Atomically saves the current device state to a JSON file.
     async fn save_state(&self) {
-        let devices = self.devices.read().await;
-        let json = match serde_json::to_string_pretty(&*devices) {
-            Ok(j) => j,
-            Err(e) => {
-                error!("Failed to serialize devices: {}", e);
-                return;
+        let json = {
+            let devices = self.devices.read().await;
+            match serde_json::to_string_pretty(&*devices) {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("Failed to serialize devices: {}", e);
+                    return;
+                }
             }
         };
 
         // Ensure parent directory exists
-        if let Some(parent) = std::path::Path::new(&self.state_file).parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                error!("Failed to create directories for state file: {}", e);
-            }
+        if let Some(parent) = std::path::Path::new(&self.state_file).parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            error!("Failed to create directories for state file: {}", e);
+            return;
         }
 
         // Write to temporary file first, then rename (atomic write)
@@ -226,7 +230,7 @@ async fn main() {
     // 2. Load State and Initialize Manager
     let loaded_devices = load_state(&cli.state_file).await;
     let manager = Manager::new();
-    for (_, config) in &loaded_devices {
+    for config in loaded_devices.values() {
         let _ = manager
             .add(&config.id, &config.ip, &config.key, config.version.as_str())
             .await;
