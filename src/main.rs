@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use clap::Parser;
 use futures_util::StreamExt;
 use log::{error, info};
@@ -9,13 +10,90 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
-use zeromq::{PubSocket, RepSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 // --- Constants ---
 const STATE_FILE: &str = "rustuya.json";
 const DEFAULT_COMMAND_ADDR: &str = "tcp://0.0.0.0:37358";
 const DEFAULT_EVENT_ADDR: &str = "tcp://0.0.0.0:37359";
 const SAVE_DEBOUNCE_SECS: u64 = 30;
+const CHANNEL_CAPACITY: usize = 100;
+const AUTO_VALUE: &str = "Auto";
+
+// --- Types & Responses ---
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Status {
+    Ok,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiResponse {
+    status: Status,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+impl ApiResponse {
+    fn base(status: Status) -> Self {
+        Self {
+            status,
+            action: None,
+            id: None,
+            error: None,
+            warnings: Vec::new(),
+            extra: HashMap::new(),
+        }
+    }
+
+    fn ok(action: impl Into<String>, id: impl Into<String>) -> Self {
+        let mut res = Self::base(Status::Ok);
+        res.action = Some(action.into());
+        res.id = Some(id.into());
+        res
+    }
+
+    fn error(msg: impl Into<String>) -> Self {
+        let mut res = Self::base(Status::Error);
+        res.error = Some(msg.into());
+        res
+    }
+
+    fn warning(action: impl Into<String>, id: impl Into<String>, msg: String) -> Self {
+        let mut res = Self::ok(action, id);
+        res.status = Status::Warning;
+        res.warnings = vec![msg];
+        res
+    }
+
+    fn with_extra(mut self, key: &str, value: Value) -> Self {
+        self.extra.insert(key.to_string(), value);
+        self
+    }
+
+    fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings.extend(warnings);
+        if !self.warnings.is_empty() && matches!(self.status, Status::Ok) {
+            self.status = Status::Warning;
+        }
+        self
+    }
+
+    fn to_json_string(&self) -> String {
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| r#"{"status":"error","error":"Serialization failed"}"#.into())
+    }
+}
 
 // --- Config & Context ---
 #[derive(Parser, Debug)]
@@ -130,11 +208,11 @@ async fn main() {
     let cli = Cli::parse();
 
     // 1. Initialize ZMQ Sockets
-    let mut rep_socket = RepSocket::new();
-    rep_socket
+    let mut router_socket = RouterSocket::new();
+    router_socket
         .bind(&cli.command_addr)
         .await
-        .expect("Failed to bind REP socket");
+        .expect("Failed to bind ROUTER socket");
 
     let mut pub_socket = PubSocket::new();
     pub_socket
@@ -142,7 +220,7 @@ async fn main() {
         .await
         .expect("Failed to bind PUB socket");
 
-    let (event_tx, mut event_rx) = mpsc::channel::<ZmqMessage>(100);
+    let (event_tx, mut event_rx) = mpsc::channel::<ZmqMessage>(CHANNEL_CAPACITY);
     let (save_tx, mut save_rx) = mpsc::channel(1);
 
     // 2. Load State and Initialize Manager
@@ -207,22 +285,45 @@ async fn main() {
     });
 
     info!(
-        "ZMQ Bridge running. Command(REP): {}, Event(PUB): {}",
+        "ZMQ Bridge running.\nCommand(REP): {}, Event(PUB): {}",
         cli.command_addr, cli.event_addr
     );
 
-    // 4. Main Command Loop (REP)
+    // 4. Main Command Loop (ROUTER)
+    // Using a channel to handle responses asynchronously (Identity, Payload, is_req)
+    let (res_tx, mut res_rx) = mpsc::channel::<(Bytes, String, bool)>(CHANNEL_CAPACITY);
+
     loop {
         tokio::select! {
-            req = rep_socket.recv() => {
+            req = router_socket.recv() => {
                 match req {
                     Ok(msg) => {
-                        let res_payload = handle_request(ctx.clone(), msg).await;
-                        if let Err(e) = rep_socket.send(ZmqMessage::from(res_payload)).await {
-                            error!("ZMQ REP send error: {}", e);
-                        }
+                        let ctx = ctx.clone();
+                        let tx = res_tx.clone();
+                        tokio::spawn(async move {
+                            if msg.len() < 2 {
+                                error!("Invalid ROUTER message: expected at least 2 frames (Identity + Payload)");
+                                return;
+                            }
+                            let identity = msg.get(0).unwrap().clone();
+                            // Detect REQ style: [Identity, Empty, Payload]
+                            let is_req = msg.len() >= 3 && msg.get(1).map(|f| f.is_empty()).unwrap_or(false);
+
+                            let res_payload = handle_request(ctx, msg).await;
+                            let _ = tx.send((identity, res_payload, is_req)).await;
+                        });
                     }
-                    Err(e) => error!("ZMQ REP recv error: {}", e),
+                    Err(e) => error!("ZMQ ROUTER recv error: {}", e),
+                }
+            }
+            Some((identity, res_payload, is_req)) = res_rx.recv() => {
+                let mut res_msg = ZmqMessage::from(identity);
+                if is_req {
+                    res_msg.push_back(vec![].into()); // Empty delimiter for REQ
+                }
+                res_msg.push_back(res_payload.into());
+                if let Err(e) = router_socket.send(res_msg).await {
+                    error!("ZMQ ROUTER send error: {}", e);
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -237,39 +338,45 @@ async fn main() {
 
 // --- Request Handler ---
 async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
-    let payload = match msg.get(0) {
+    // In ROUTER mode:
+    // - From DEALER: [Identity, Payload]
+    // - From REQ:    [Identity, Empty, Payload]
+    let payload_idx = if msg.len() >= 3 && msg.get(1).map(|f| f.is_empty()).unwrap_or(false) {
+        2
+    } else {
+        1
+    };
+
+    let payload = match msg.get(payload_idx) {
         Some(p) => String::from_utf8_lossy(p),
-        None => return error_json("Empty message", None),
+        None => return ApiResponse::error("Empty message").to_json_string(),
     };
 
     let req: Value = match serde_json::from_str(&payload) {
         Ok(v) => v,
-        Err(e) => return error_json(&format!("Invalid JSON: {}", e), None),
+        Err(e) => return ApiResponse::error(format!("Invalid JSON: {}", e)).to_json_string(),
     };
 
     let action = req["action"].as_str().unwrap_or("").to_string();
 
     // Track used keys and warnings
-    let mut used_keys = std::collections::HashSet::new();
+    let mut used_keys = std::collections::HashSet::from(["action".to_string()]);
     let mut warnings = Vec::new();
-    used_keys.insert("action".to_string());
 
-    let res_json = match action.as_str() {
+    let response = match action.as_str() {
         "manager/add" | "manager/remove" => {
             let id = req["id"].as_str().unwrap_or("");
             let key = req["key"].as_str().unwrap_or("");
-            let ip = req["ip"].as_str().unwrap_or("Auto");
-            let version = req["version"].as_str().unwrap_or("Auto");
+            let ip = req["ip"].as_str().unwrap_or(AUTO_VALUE);
+            let version = req["version"].as_str().unwrap_or(AUTO_VALUE);
 
             used_keys.insert("id".to_string());
             if action == "manager/add" {
-                used_keys.insert("key".to_string());
-                used_keys.insert("ip".to_string());
-                used_keys.insert("version".to_string());
+                used_keys.extend(["key", "ip", "version"].iter().map(|s| s.to_string()));
             }
 
             if id.is_empty() {
-                return error_json("Missing 'id'", None);
+                return ApiResponse::error("Missing 'id'").to_json_string();
             }
 
             if action == "manager/remove" {
@@ -277,58 +384,65 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
                 let mut devices = ctx.devices.write().await;
                 devices.remove(id);
                 ctx.request_save();
-                serde_json::json!({
-                    "status": "ok",
-                    "action": "removed",
-                    "id": id
-                })
+                ApiResponse::ok("removed", id)
             } else {
-                // manager/add logic: check if exists, then add or modify
                 let mut devices = ctx.devices.write().await;
-                let exists = devices.contains_key(id);
+                let existing = devices.get(id);
 
-                let res = if exists {
-                    ctx.manager.modify(id, ip, key, version).await
-                } else {
-                    ctx.manager.add(id, ip, key, version).await
-                };
-
-                match res {
-                    Ok(_) => {
-                        let detail_action = if exists { "modified" } else { "added" };
-                        devices.insert(
-                            id.to_string(),
-                            DeviceConfig {
-                                id: id.to_string(),
-                                ip: ip.to_string(),
-                                key: key.to_string(),
-                                version: version.to_string(),
-                            },
-                        );
-                        ctx.request_save();
-                        serde_json::json!({
-                            "status": "ok",
-                            "action": detail_action,
-                            "id": id
-                        })
+                if let Some(config) = existing {
+                    if config.ip == ip && config.key == key && config.version == version {
+                        ApiResponse::warning(
+                            "ignored",
+                            id,
+                            format!("Device {} already exists with same config. Ignored.", id),
+                        )
+                    } else {
+                        match ctx.manager.modify(id, ip, key, version).await {
+                            Ok(_) => {
+                                devices.insert(
+                                    id.to_string(),
+                                    DeviceConfig {
+                                        id: id.to_string(),
+                                        ip: ip.to_string(),
+                                        key: key.to_string(),
+                                        version: version.to_string(),
+                                    },
+                                );
+                                ctx.request_save();
+                                ApiResponse::ok("modified", id)
+                            }
+                            Err(e) => ApiResponse::error(format!("Manager error: {:?}", e)),
+                        }
                     }
-                    Err(e) => return error_json(&format!("Manager error: {:?}", e), None),
+                } else {
+                    match ctx.manager.add(id, ip, key, version).await {
+                        Ok(_) => {
+                            devices.insert(
+                                id.to_string(),
+                                DeviceConfig {
+                                    id: id.to_string(),
+                                    ip: ip.to_string(),
+                                    key: key.to_string(),
+                                    version: version.to_string(),
+                                },
+                            );
+                            ctx.request_save();
+                            ApiResponse::ok("added", id)
+                        }
+                        Err(e) => ApiResponse::error(format!("Manager error: {:?}", e)),
+                    }
                 }
             }
         }
         "manager/status" => {
-            // The bridge's device list is the source of truth because it contains the local keys.
             let devices_config = ctx.devices.read().await;
-            let connection_states = ctx.manager.list().await;
+            let mut connection_states = ctx.manager.list().await;
 
             let mut synced = false;
-            // 1. If in bridge config but missing in manager -> Add to manager
+            // 1. Bridge config -> Manager
             for (id, config) in devices_config.iter() {
                 if !connection_states.contains_key(id) {
-                    let msg = format!(
-                        "Device {} found in bridge config but missing in manager. Syncing (Add)...",
-                        id
-                    );
+                    let msg = format!("Device {} missing in manager. Syncing (Add)...", id);
                     error!("{}", msg);
                     warnings.push(msg);
                     let _ = ctx
@@ -339,12 +453,12 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
                 }
             }
 
-            // 2. If in manager but missing in bridge config -> Remove from manager
+            // 2. Manager -> Bridge config
             let mut to_remove = Vec::new();
             for id in connection_states.keys() {
                 if !devices_config.contains_key(id) {
                     let msg = format!(
-                        "Device {} found in manager but missing in bridge config. Syncing (Remove)...",
+                        "Device {} missing in bridge config. Syncing (Remove)...",
                         id
                     );
                     error!("{}", msg);
@@ -357,12 +471,9 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
                 ctx.manager.remove(&id).await;
             }
 
-            // If we synced, re-fetch connection states to be accurate
-            let connection_states = if synced {
-                ctx.manager.list().await
-            } else {
-                connection_states
-            };
+            if synced {
+                connection_states = ctx.manager.list().await;
+            }
 
             let mut devices_with_status = serde_json::Map::new();
             for (id, config) in devices_config.iter() {
@@ -374,17 +485,14 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
                 devices_with_status.insert(id.clone(), device_val);
             }
 
-            serde_json::json!({
-                "status": "ok",
-                "rustuya_version": env!("CARGO_PKG_VERSION"),
-                "devices": devices_with_status,
-                "synced": synced
-            })
+            ApiResponse::base(Status::Ok)
+                .with_extra("version", env!("CARGO_PKG_VERSION").into())
+                .with_extra("devices", Value::Object(devices_with_status))
         }
         "device/status" | "device/set_dps" | "device/request" => {
             handle_device_command(ctx, &action, &req, &mut used_keys).await
         }
-        _ => return error_json(&format!("Unknown action: {}", action), None),
+        _ => ApiResponse::error(format!("Unknown action: {}", action)),
     };
 
     // Detect unused keys
@@ -396,17 +504,7 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
         }
     }
 
-    let mut final_res = res_json;
-    if !warnings.is_empty() {
-        if let Some(obj) = final_res.as_object_mut() {
-            if obj.get("status").and_then(|s| s.as_str()) == Some("ok") {
-                obj.insert("status".to_string(), Value::String("warning".to_string()));
-            }
-            obj.insert("warnings".to_string(), Value::from(warnings));
-        }
-    }
-
-    final_res.to_string()
+    response.with_warnings(warnings).to_json_string()
 }
 
 /// Helper for device-specific commands to reduce handle_request size.
@@ -415,18 +513,18 @@ async fn handle_device_command(
     action: &str,
     req: &Value,
     used_keys: &mut std::collections::HashSet<String>,
-) -> Value {
+) -> ApiResponse {
     let id = match req["id"].as_str() {
         Some(id) => {
             used_keys.insert("id".to_string());
             id
         }
-        None => return serde_json::json!({"status": "error", "error": "Missing 'id'"}),
+        None => return ApiResponse::error("Missing 'id'"),
     };
 
     let dev = match ctx.manager.get(id).await {
         Some(dev) => dev,
-        None => return serde_json::json!({"status": "error", "error": "Device not found"}),
+        None => return ApiResponse::error("Device not found"),
     };
 
     let cid = req["cid"].as_str().map(|s| {
@@ -437,16 +535,16 @@ async fn handle_device_command(
     match action {
         "device/status" => {
             dev.request(CommandType::DpQuery, None, cid).await;
-            serde_json::json!({"status": "ok"})
+            ApiResponse::ok(action, id)
         }
         "device/set_dps" => {
             if let Some(dps) = req["dps"].as_object() {
                 used_keys.insert("dps".to_string());
                 dev.request(CommandType::Control, Some(Value::Object(dps.clone())), cid)
                     .await;
-                serde_json::json!({"status": "ok"})
+                ApiResponse::ok(action, id)
             } else {
-                serde_json::json!({"status": "error", "error": "'dps' object required"})
+                ApiResponse::error("'dps' object required")
             }
         }
         "device/request" => {
@@ -463,25 +561,14 @@ async fn handle_device_command(
                         Some(req_data)
                     };
                     dev.request(cmd, data_opt, cid).await;
-                    serde_json::json!({"status": "ok"})
+                    ApiResponse::ok(action, id)
                 } else {
-                    serde_json::json!({"status": "error", "error": format!("Invalid CommandType {}", cmd_val)})
+                    ApiResponse::error(format!("Invalid CommandType {}", cmd_val))
                 }
             } else {
-                serde_json::json!({"status": "error", "error": "'cmd' (u32) required"})
+                ApiResponse::error("'cmd' (u32) required")
             }
         }
         _ => unreachable!(),
     }
-}
-
-fn error_json(msg: &str, warnings: Option<Vec<String>>) -> String {
-    let mut res = serde_json::json!({
-        "status": "error",
-        "error": msg
-    });
-    if let Some(w) = warnings {
-        res["warnings"] = Value::from(w);
-    }
-    res.to_string()
 }
