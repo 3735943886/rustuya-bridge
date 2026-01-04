@@ -24,7 +24,7 @@ import zmq
 # Command Socket
 context = zmq.Context()
 socket = context.socket(zmq.REQ)
-socket.connect("tcp://0.0.0.0:37358")
+socket.connect("tcp://127.0.0.1:37358")
 socket.setsockopt(zmq.RCVTIMEO, 2000) # 2s timeout
 
 def send_command(payload):
@@ -43,7 +43,7 @@ import zmq
 # Event Socket
 context = zmq.Context()
 socket = context.socket(zmq.SUB)
-socket.connect("tcp://0.0.0.0:37359")
+socket.connect("tcp://127.0.0.1:37359")
 socket.subscribe("") # Subscribe to all devices
 
 while True:
@@ -61,11 +61,11 @@ async def main():
     
     # 1. Command Socket (DEALER)
     cmd_socket = ctx.socket(zmq.DEALER)
-    cmd_socket.connect("tcp://0.0.0.0:37358")
+    cmd_socket.connect("tcp://127.0.0.1:37358")
     
     # 2. Event Socket (SUB)
     sub_socket = ctx.socket(zmq.SUB)
-    sub_socket.connect("tcp://0.0.0.0:37359")
+    sub_socket.connect("tcp://127.0.0.1:37359")
     sub_socket.subscribe("")
 
     async def listen_events():

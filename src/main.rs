@@ -527,6 +527,10 @@ async fn handle_device_command(
         None => return ApiResponse::error("Device not found"),
     };
 
+    if !dev.is_connected() {
+        return ApiResponse::error("Device is offline");
+    }
+
     let cid = req["cid"].as_str().map(|s| {
         used_keys.insert("cid".to_string());
         s.to_string()
