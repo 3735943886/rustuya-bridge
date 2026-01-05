@@ -230,6 +230,10 @@ async fn main() {
     // 2. Load State and Initialize Manager
     let loaded_devices = load_state(&cli.state_file).await;
     let manager = Manager::new();
+
+    // Create listener BEFORE adding devices to capture initial events (connection, etc.)
+    let rustuya_rx = manager.listener();
+
     for config in loaded_devices.values() {
         let _ = manager
             .add(&config.id, &config.ip, &config.key, config.version.as_str())
@@ -277,7 +281,6 @@ async fn main() {
     // 3.3 Rustuya Manager Event Listener
     let ctx_listener = ctx.clone();
     tokio::spawn(async move {
-        let rustuya_rx = ctx_listener.manager.listener();
         tokio::pin!(rustuya_rx);
         while let Some(event) = rustuya_rx.next().await {
             if let Some(payload) = event.message.payload_as_string() {
@@ -368,7 +371,7 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
     let mut warnings = Vec::new();
 
     let response = match action.as_str() {
-        "manager/add" | "manager/remove" => {
+        "manager/add" | "manager/remove" | "manager/clear" => {
             let id = req["id"].as_str().unwrap_or("");
             let key = req["key"].as_str().unwrap_or("");
             let ip = req["ip"].as_str().unwrap_or(AUTO_VALUE);
@@ -377,6 +380,14 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
             used_keys.insert("id".to_string());
             if action == "manager/add" {
                 used_keys.extend(["key", "ip", "version"].iter().map(|s| s.to_string()));
+            }
+
+            if action == "manager/clear" {
+                ctx.manager.clear().await;
+                let mut devices = ctx.devices.write().await;
+                devices.clear();
+                ctx.request_save();
+                return ApiResponse::ok("cleared", "manager").to_json_string();
             }
 
             if id.is_empty() {
@@ -440,51 +451,23 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
         }
         "manager/status" => {
             let devices_config = ctx.devices.read().await;
-            let mut connection_states = ctx.manager.list().await;
-
-            let mut synced = false;
-            // 1. Bridge config -> Manager
-            for (id, config) in devices_config.iter() {
-                if !connection_states.contains_key(id) {
-                    let msg = format!("Device {} missing in manager. Syncing (Add)...", id);
-                    error!("{}", msg);
-                    warnings.push(msg);
-                    let _ = ctx
-                        .manager
-                        .add(&config.id, &config.ip, &config.key, config.version.as_str())
-                        .await;
-                    synced = true;
-                }
-            }
-
-            // 2. Manager -> Bridge config
-            let mut to_remove = Vec::new();
-            for id in connection_states.keys() {
-                if !devices_config.contains_key(id) {
-                    let msg = format!(
-                        "Device {} missing in bridge config. Syncing (Remove)...",
-                        id
-                    );
-                    error!("{}", msg);
-                    warnings.push(msg);
-                    to_remove.push(id.clone());
-                    synced = true;
-                }
-            }
-            for id in to_remove {
-                ctx.manager.remove(&id).await;
-            }
-
-            if synced {
-                connection_states = ctx.manager.list().await;
-            }
+            let connection_states = ctx.manager.list().await;
 
             let mut devices_with_status = serde_json::Map::new();
             for (id, config) in devices_config.iter() {
                 let mut device_val = serde_json::to_value(config).unwrap_or(Value::Null);
                 if let Some(obj) = device_val.as_object_mut() {
-                    let is_connected = connection_states.get(id).cloned().unwrap_or(false);
-                    obj.insert("connected".to_string(), Value::Bool(is_connected));
+                    if let Some(info) = connection_states.iter().find(|d| d.id == *id) {
+                        obj.insert("connected".to_string(), Value::Bool(info.is_connected));
+                        // Found values (actual IP/version) are used in response if available
+                        obj.insert("ip".to_string(), Value::String(info.address.to_string()));
+                        obj.insert(
+                            "version".to_string(),
+                            Value::String(info.version.to_string()),
+                        );
+                    } else {
+                        obj.insert("connected".to_string(), Value::Bool(false));
+                    }
                 }
                 devices_with_status.insert(id.clone(), device_val);
             }
