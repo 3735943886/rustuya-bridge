@@ -383,8 +383,8 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
             }
 
             if action == "manager/clear" {
-                ctx.manager.clear().await;
                 let mut devices = ctx.devices.write().await;
+                ctx.manager.clear().await;
                 devices.clear();
                 ctx.request_save();
                 return ApiResponse::ok("cleared", "manager").to_json_string();
@@ -395,8 +395,8 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
             }
 
             if action == "manager/remove" {
-                ctx.manager.remove(id).await;
                 let mut devices = ctx.devices.write().await;
+                ctx.manager.remove(id).await;
                 devices.remove(id);
                 ctx.request_save();
                 ApiResponse::ok("removed", id)
