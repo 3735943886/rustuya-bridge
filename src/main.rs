@@ -141,12 +141,64 @@ struct DeviceConfig {
     version: String,
 }
 
+struct WorkerTask {
+    identity: Bytes,
+    is_req: bool,
+    request: BridgeRequest,
+}
+
+struct DeviceWorkerHandle {
+    tx: mpsc::Sender<WorkerTask>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DeviceWorkerHandle {
+    fn drop(&mut self) {
+        self._handle.abort();
+    }
+}
+
 struct BridgeContext {
     manager: Manager,
     event_tx: mpsc::Sender<ZmqMessage>,
     state_file: String,
     devices: RwLock<HashMap<String, DeviceConfig>>,
     save_tx: mpsc::Sender<()>,
+    // Worker channels
+    manager_tx: mpsc::Sender<WorkerTask>,
+    scanner_tx: mpsc::Sender<WorkerTask>,
+    device_workers: RwLock<HashMap<String, DeviceWorkerHandle>>,
+    res_tx: mpsc::Sender<(Bytes, String, bool)>,
+    // For graceful shutdown
+    _background_tasks: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl BridgeContext {
+    async fn add_task(&self, handle: tokio::task::JoinHandle<()>) {
+        self._background_tasks.write().await.push(handle);
+    }
+
+    async fn shutdown(&self) {
+        info!("Shutting down bridge context...");
+
+        // 1. Stop all device workers (RAII)
+        {
+            let mut workers = self.device_workers.write().await;
+            workers.clear(); // Aborts all device workers
+        }
+
+        // 2. Stop all background tasks
+        {
+            let mut tasks = self._background_tasks.write().await;
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+
+        // 3. Final state save
+        self.save_state().await;
+        info!("Bridge context shutdown complete.");
+    }
 }
 
 // --- Implementation ---
@@ -204,7 +256,101 @@ impl BridgeContext {
 
     // --- Atomic State Operations ---
 
-    async fn add_device(&self, config: DeviceConfig) -> Result<ApiResponse, String> {
+    async fn spawn_device_worker(self: &Arc<Self>, id: String) -> Result<(), String> {
+        // 1. Check if worker already exists
+        {
+            let workers = self.device_workers.read().await;
+            if workers.contains_key(&id) {
+                return Ok(());
+            }
+        }
+
+        // 2. Verify device exists in Manager
+        if self.manager.get(&id).await.is_none() {
+            return Err(format!("Device {} not found in Manager", id));
+        }
+
+        let (tx, mut rx) = mpsc::channel::<WorkerTask>(CHANNEL_CAPACITY);
+        let ctx = self.clone();
+        let device_id = id.clone();
+
+        let handle = tokio::spawn(async move {
+            info!("Worker started for device {}", device_id);
+            while let Some(task) = rx.recv().await {
+                let res = match task.request {
+                    BridgeRequest::DeviceStatus { id, cid } => {
+                        info!("Device status: id={}, cid={:?}", id, cid);
+                        match ctx.get_connected_device(&id).await {
+                            Ok(dev) => {
+                                dev.status().await;
+                                ApiResponse::ok("device/status", id)
+                            }
+                            Err(e) => e,
+                        }
+                    }
+                    BridgeRequest::SetDps { id, dps, cid } => {
+                        info!("Device set_dps: id={}, dps={:?}, cid={:?}", id, dps, cid);
+                        match ctx.get_connected_device(&id).await {
+                            Ok(dev) => {
+                                dev.set_dps(Value::Object(dps)).await;
+                                ApiResponse::ok("device/set_dps", id)
+                            }
+                            Err(e) => e,
+                        }
+                    }
+                    BridgeRequest::DeviceRequest { id, cmd, data, cid } => {
+                        let command = match CommandType::from_u32(cmd) {
+                            Some(c) => c,
+                            None => {
+                                let _ = ctx
+                                    .res_tx
+                                    .send((
+                                        task.identity,
+                                        ApiResponse::error(format!("Invalid CommandType {}", cmd))
+                                            .to_json_string(),
+                                        task.is_req,
+                                    ))
+                                    .await;
+                                continue;
+                            }
+                        };
+
+                        info!(
+                            "Device request: id={}, cmd={:?}, data={:?}, cid={:?}",
+                            id, command, data, cid
+                        );
+
+                        match ctx.get_connected_device(&id).await {
+                            Ok(dev) => {
+                                dev.request(command, data, cid).await;
+                                ApiResponse::ok(format!("device/{:?}", command).to_lowercase(), id)
+                            }
+                            Err(e) => e,
+                        }
+                    }
+                    _ => ApiResponse::error("Invalid request for device worker"),
+                };
+
+                let _ = ctx
+                    .res_tx
+                    .send((task.identity, res.to_json_string(), task.is_req))
+                    .await;
+            }
+            info!("Worker stopped for device {}", device_id);
+        });
+
+        let mut workers = self.device_workers.write().await;
+        workers.insert(
+            id,
+            DeviceWorkerHandle {
+                tx,
+                _handle: handle,
+            },
+        );
+        Ok(())
+    }
+
+    async fn add_device(self: &Arc<Self>, config: DeviceConfig) -> Result<ApiResponse, String> {
         let mut devices = self.devices.write().await;
 
         self.manager
@@ -226,6 +372,11 @@ impl BridgeContext {
         let mut devices = self.devices.write().await;
         self.manager.remove(id).await;
         devices.remove(id);
+
+        // Stop worker
+        let mut workers = self.device_workers.write().await;
+        workers.remove(id);
+
         self.request_save();
         Ok(ApiResponse::ok("removed", id))
     }
@@ -234,6 +385,11 @@ impl BridgeContext {
         let mut devices = self.devices.write().await;
         self.manager.clear().await;
         devices.clear();
+
+        // Stop all workers
+        let mut workers = self.device_workers.write().await;
+        workers.clear();
+
         self.request_save();
         Ok(ApiResponse::ok("cleared", "manager"))
     }
@@ -282,6 +438,102 @@ impl BridgeContext {
     }
 }
 
+async fn manager_worker(ctx: Arc<BridgeContext>, mut rx: mpsc::Receiver<WorkerTask>) {
+    info!("Manager worker started");
+    while let Some(task) = rx.recv().await {
+        let res = match task.request {
+            BridgeRequest::Add {
+                id,
+                key,
+                ip,
+                version,
+            } => ctx
+                .add_device(DeviceConfig {
+                    id,
+                    ip,
+                    key,
+                    version,
+                })
+                .await
+                .unwrap_or_else(ApiResponse::error),
+            BridgeRequest::Remove { id } => ctx
+                .remove_device(&id)
+                .await
+                .unwrap_or_else(ApiResponse::error),
+            BridgeRequest::Clear => ctx.clear_devices().await.unwrap_or_else(ApiResponse::error),
+            BridgeRequest::Status => ctx.get_manager_status().await,
+            _ => ApiResponse::error("Invalid request for manager worker"),
+        };
+        let _ = ctx
+            .res_tx
+            .send((task.identity, res.to_json_string(), task.is_req))
+            .await;
+    }
+    info!("Manager worker stopped");
+}
+
+async fn scanner_worker(ctx: Arc<BridgeContext>, mut rx: mpsc::Receiver<WorkerTask>) {
+    info!("Scanner worker started");
+    while let Some(task) = rx.recv().await {
+        match task.request {
+            BridgeRequest::Scan => {
+                let ctx_scan = ctx.clone();
+                // Send immediate response that scan started
+                let _ = ctx
+                    .res_tx
+                    .send((
+                        task.identity,
+                        ApiResponse::ok("scan", "bridge")
+                            .with_extra(
+                                "message",
+                                "Scan started. Results will be published to 'scanner' topic."
+                                    .into(),
+                            )
+                            .to_json_string(),
+                        task.is_req,
+                    ))
+                    .await;
+
+                // Then run the scan
+                let scanner = Scanner::new().with_timeout(Duration::from_secs(18));
+                let stream = scanner.scan_stream();
+                tokio::pin!(stream);
+
+                while let Some(dev) = stream.next().await {
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("id".to_string(), Value::String(dev.id.clone()));
+                    payload.insert("ip".to_string(), Value::String(dev.ip.clone()));
+                    if let Some(v) = &dev.version {
+                        payload.insert("version".to_string(), Value::String(v.to_string()));
+                    }
+                    if let Some(pk) = &dev.product_key {
+                        payload.insert("product_key".to_string(), Value::String(pk.to_string()));
+                    }
+
+                    ctx_scan
+                        .publish_event("scanner".to_string(), Value::Object(payload).to_string())
+                        .await;
+                }
+
+                ctx_scan
+                    .publish_event("scanner".to_string(), "{}".to_string())
+                    .await;
+            }
+            _ => {
+                let _ = ctx
+                    .res_tx
+                    .send((
+                        task.identity,
+                        ApiResponse::error("Invalid request for scanner worker").to_json_string(),
+                        task.is_req,
+                    ))
+                    .await;
+            }
+        }
+    }
+    info!("Scanner worker stopped");
+}
+
 /// Loads device state from the JSON file.
 async fn load_state(path: &str) -> HashMap<String, DeviceConfig> {
     if !std::path::Path::new(path).exists() {
@@ -326,6 +578,9 @@ async fn main() {
 
     let (event_tx, mut event_rx) = mpsc::channel::<ZmqMessage>(CHANNEL_CAPACITY);
     let (save_tx, mut save_rx) = mpsc::channel(1);
+    let (res_tx, mut res_rx) = mpsc::channel::<(Bytes, String, bool)>(CHANNEL_CAPACITY);
+    let (manager_tx, manager_rx) = mpsc::channel::<WorkerTask>(CHANNEL_CAPACITY);
+    let (scanner_tx, scanner_rx) = mpsc::channel::<WorkerTask>(CHANNEL_CAPACITY);
 
     // 2. Load State and Initialize Manager
     let loaded_devices = load_state(&cli.state_file).await;
@@ -344,15 +599,26 @@ async fn main() {
         manager,
         event_tx,
         state_file: cli.state_file,
-        devices: RwLock::new(loaded_devices),
+        devices: RwLock::new(loaded_devices.clone()),
         save_tx,
+        manager_tx,
+        scanner_tx,
+        device_workers: RwLock::new(HashMap::new()),
+        res_tx: res_tx.clone(),
+        _background_tasks: RwLock::new(Vec::new()),
     });
 
-    // 3. Spawn Background Tasks
+    // 3. Spawn Workers
+    ctx.add_task(tokio::spawn(manager_worker(ctx.clone(), manager_rx)))
+        .await;
+    ctx.add_task(tokio::spawn(scanner_worker(ctx.clone(), scanner_rx)))
+        .await;
+
+    // 4. Spawn Background Tasks
 
     // 3.1 Debounced State Persistence
     let ctx_save = ctx.clone();
-    tokio::spawn(async move {
+    ctx.add_task(tokio::spawn(async move {
         while let Some(()) = save_rx.recv().await {
             loop {
                 tokio::select! {
@@ -367,20 +633,22 @@ async fn main() {
                 }
             }
         }
-    });
+    }))
+    .await;
 
     // 3.2 ZMQ Event Broadcaster (PUB)
-    tokio::spawn(async move {
+    ctx.add_task(tokio::spawn(async move {
         while let Some(msg) = event_rx.recv().await {
             if let Err(e) = pub_socket.send(msg).await {
                 error!("ZMQ PUB error: {}", e);
             }
         }
-    });
+    }))
+    .await;
 
     // 3.3 Rustuya Manager Event Listener
     let ctx_listener = ctx.clone();
-    tokio::spawn(async move {
+    ctx.add_task(tokio::spawn(async move {
         tokio::pin!(rustuya_rx);
         while let Some(event) = rustuya_rx.next().await {
             if let Some(payload) = event.message.payload_as_string() {
@@ -389,24 +657,21 @@ async fn main() {
                     .await;
             }
         }
-    });
+    }))
+    .await;
 
     info!(
         "ZMQ Bridge running.\nCommand(REP): {}, Event(PUB): {}",
         cli.command_addr, cli.event_addr
     );
 
-    // 4. Main Command Loop (ROUTER)
-    // Using a channel to handle responses asynchronously (Identity, Payload, is_req)
-    let (res_tx, mut res_rx) = mpsc::channel::<(Bytes, String, bool)>(CHANNEL_CAPACITY);
-
+    // 5. Main Command Loop (ROUTER)
     loop {
         tokio::select! {
             req = router_socket.recv() => {
                 match req {
                     Ok(msg) => {
                         let ctx = ctx.clone();
-                        let tx = res_tx.clone();
                         tokio::spawn(async move {
                             if msg.len() < 2 {
                                 error!("Invalid ROUTER message: expected at least 2 frames (Identity + Payload)");
@@ -425,15 +690,76 @@ async fn main() {
                                 }
                             };
 
-                            let res_payload = match serde_json::from_str::<BridgeRequest>(&payload) {
-                                Ok(req) => handle_request(ctx, req).await.to_json_string(),
+                            match serde_json::from_str::<BridgeRequest>(&payload) {
+                                Ok(req) => {
+                                    let task = WorkerTask {
+                                        identity: identity.clone(),
+                                        is_req,
+                                        request: req,
+                                    };
+
+                                    match &task.request {
+                                        BridgeRequest::Add { .. } |
+                                        BridgeRequest::Remove { .. } |
+                                        BridgeRequest::Clear |
+                                        BridgeRequest::Status => {
+                                            let _ = ctx.manager_tx.send(task).await;
+                                        }
+                                        BridgeRequest::Scan => {
+                                            let _ = ctx.scanner_tx.send(task).await;
+                                        }
+                                        BridgeRequest::DeviceStatus { id, .. } |
+                                        BridgeRequest::SetDps { id, .. } |
+                                        BridgeRequest::DeviceRequest { id, .. } => {
+                                            // 1. Check if worker exists
+                                            let exists = {
+                                                let workers = ctx.device_workers.read().await;
+                                                workers.contains_key(id)
+                                            };
+
+                                            // 2. If not, check if device is registered and spawn worker
+                                            if !exists {
+                                                let is_registered = {
+                                                    let devices = ctx.devices.read().await;
+                                                    devices.contains_key(id)
+                                                };
+
+                                                if is_registered {
+                                                    let spawn_res = ctx.spawn_device_worker(id.clone()).await;
+                                                    if let Err(e) = spawn_res {
+                                                        let _ = ctx.res_tx.send((
+                                                            identity,
+                                                            ApiResponse::error(e).to_json_string(),
+                                                            is_req
+                                                        )).await;
+                                                        return;
+                                                    }
+                                                }
+                                            }
+
+                                            // 3. Dispatch to worker
+                                            let workers = ctx.device_workers.read().await;
+                                            if let Some(worker) = workers.get(id) {
+                                                let _ = worker.tx.send(task).await;
+                                            } else {
+                                                let _ = ctx.res_tx.send((
+                                                    identity,
+                                                    ApiResponse::error("Device not found or not registered").to_json_string(),
+                                                    is_req
+                                                )).await;
+                                            }
+                                        }
+                                    }
+                                }
                                 Err(e) => {
                                     error!("Invalid request: {} | Payload: {}", e, payload);
-                                    ApiResponse::error(format!("Invalid request: {}", e))
-                                        .to_json_string()
+                                    let _ = ctx.res_tx.send((
+                                        identity,
+                                        ApiResponse::error(format!("Invalid request: {}", e)).to_json_string(),
+                                        is_req
+                                    )).await;
                                 }
                             };
-                            let _ = tx.send((identity, res_payload, is_req)).await;
                         });
                     }
                     Err(e) => error!("ZMQ ROUTER recv error: {}", e),
@@ -450,109 +776,10 @@ async fn main() {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Shutdown signal received. Saving final state...");
-                ctx.save_state().await;
-                info!("Shutdown complete.");
+                info!("Shutdown signal received. Cleaning up...");
+                ctx.shutdown().await;
                 break;
             }
-        }
-    }
-}
-
-// --- Request Handler ---
-async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiResponse {
-    match req {
-        BridgeRequest::Add {
-            id,
-            key,
-            ip,
-            version,
-        } => ctx
-            .add_device(DeviceConfig {
-                id,
-                ip,
-                key,
-                version,
-            })
-            .await
-            .unwrap_or_else(ApiResponse::error),
-        BridgeRequest::Remove { id } => ctx
-            .remove_device(&id)
-            .await
-            .unwrap_or_else(ApiResponse::error),
-        BridgeRequest::Clear => ctx.clear_devices().await.unwrap_or_else(ApiResponse::error),
-        BridgeRequest::Status => ctx.get_manager_status().await,
-        BridgeRequest::DeviceStatus { id, cid } => {
-            info!("Device status: id={}, cid={:?}", id, cid);
-            match ctx.get_connected_device(&id).await {
-                Ok(dev) => {
-                    dev.status().await;
-                    ApiResponse::ok("device/status", id)
-                }
-                Err(e) => e,
-            }
-        }
-        BridgeRequest::SetDps { id, dps, cid } => {
-            info!("Device set_dps: id={}, dps={:?}, cid={:?}", id, dps, cid);
-            match ctx.get_connected_device(&id).await {
-                Ok(dev) => {
-                    dev.set_dps(Value::Object(dps)).await;
-                    ApiResponse::ok("device/set_dps", id)
-                }
-                Err(e) => e,
-            }
-        }
-        BridgeRequest::DeviceRequest { id, cmd, data, cid } => {
-            let command = match CommandType::from_u32(cmd) {
-                Some(c) => c,
-                None => return ApiResponse::error(format!("Invalid CommandType {}", cmd)),
-            };
-
-            info!(
-                "Device request: id={}, cmd={:?}, data={:?}, cid={:?}",
-                id, command, data, cid
-            );
-
-            match ctx.get_connected_device(&id).await {
-                Ok(dev) => {
-                    dev.request(command, data, cid).await;
-                    ApiResponse::ok(format!("device/{:?}", command).to_lowercase(), id)
-                }
-                Err(e) => e,
-            }
-        }
-        BridgeRequest::Scan => {
-            let ctx_scan = ctx.clone();
-            tokio::spawn(async move {
-                let scanner = Scanner::new().with_timeout(Duration::from_secs(18));
-                let stream = scanner.scan_stream();
-                tokio::pin!(stream);
-
-                while let Some(dev) = stream.next().await {
-                    let mut payload = serde_json::Map::new();
-                    payload.insert("id".to_string(), Value::String(dev.id.clone()));
-                    payload.insert("ip".to_string(), Value::String(dev.ip.clone()));
-                    if let Some(v) = &dev.version {
-                        payload.insert("version".to_string(), Value::String(v.to_string()));
-                    }
-                    if let Some(pk) = &dev.product_key {
-                        payload.insert("product_key".to_string(), Value::String(pk.to_string()));
-                    }
-
-                    ctx_scan
-                        .publish_event("scanner".to_string(), Value::Object(payload).to_string())
-                        .await;
-                }
-
-                ctx_scan
-                    .publish_event("scanner".to_string(), "{}".to_string())
-                    .await;
-            });
-
-            ApiResponse::ok("scan", "bridge").with_extra(
-                "message",
-                "Scan started. Results will be published to 'scanner' topic.".into(),
-            )
         }
     }
 }
