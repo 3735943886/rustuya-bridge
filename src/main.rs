@@ -237,6 +237,49 @@ impl BridgeContext {
         self.request_save();
         Ok(ApiResponse::ok("cleared", "manager"))
     }
+
+    /// Helper to get a connected device or return an error response.
+    async fn get_connected_device(&self, id: &str) -> Result<rustuya::Device, ApiResponse> {
+        let dev = self
+            .manager
+            .get(id)
+            .await
+            .ok_or_else(|| ApiResponse::error("Device not found"))?;
+
+        if !dev.is_connected() {
+            return Err(ApiResponse::error("Device is offline"));
+        }
+
+        Ok(dev)
+    }
+
+    /// Generates a status report of all registered devices.
+    async fn get_manager_status(&self) -> ApiResponse {
+        let devices_config = self.devices.read().await;
+        let connection_states = self.manager.list().await;
+
+        let mut devices_with_status = serde_json::Map::new();
+        for (id, config) in devices_config.iter() {
+            let mut device_val = serde_json::to_value(config).unwrap_or(Value::Null);
+            if let Some(obj) = device_val.as_object_mut() {
+                if let Some(info) = connection_states.iter().find(|d| d.id == *id) {
+                    obj.insert("connected".to_string(), Value::Bool(info.is_connected));
+                    obj.insert("ip".to_string(), Value::String(info.address.to_string()));
+                    obj.insert(
+                        "version".to_string(),
+                        Value::String(info.version.to_string()),
+                    );
+                } else {
+                    obj.insert("connected".to_string(), Value::Bool(false));
+                }
+            }
+            devices_with_status.insert(id.clone(), device_val);
+        }
+
+        ApiResponse::base(Status::Ok)
+            .with_extra("version", env!("CARGO_PKG_VERSION").into())
+            .with_extra("devices", Value::Object(devices_with_status))
+    }
 }
 
 /// Loads device state from the JSON file.
@@ -383,12 +426,13 @@ async fn main() {
                             };
 
                             let res_payload = match serde_json::from_str::<BridgeRequest>(&payload) {
-                                 Ok(req) => handle_request(ctx, req).await,
-                                 Err(e) => {
-                                     error!("Invalid request: {} | Payload: {}", e, payload);
-                                     ApiResponse::error(format!("Invalid request: {}", e)).to_json_string()
-                                 }
-                             };
+                                Ok(req) => handle_request(ctx, req).await.to_json_string(),
+                                Err(e) => {
+                                    error!("Invalid request: {} | Payload: {}", e, payload);
+                                    ApiResponse::error(format!("Invalid request: {}", e))
+                                        .to_json_string()
+                                }
+                            };
                             let _ = tx.send((identity, res_payload, is_req)).await;
                         });
                     }
@@ -416,8 +460,8 @@ async fn main() {
 }
 
 // --- Request Handler ---
-async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> String {
-    let response = match req {
+async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiResponse {
+    match req {
         BridgeRequest::Add {
             id,
             key,
@@ -437,44 +481,44 @@ async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> String {
             .await
             .unwrap_or_else(ApiResponse::error),
         BridgeRequest::Clear => ctx.clear_devices().await.unwrap_or_else(ApiResponse::error),
-        BridgeRequest::Status => {
-            let devices_config = ctx.devices.read().await;
-            let connection_states = ctx.manager.list().await;
-
-            let mut devices_with_status = serde_json::Map::new();
-            for (id, config) in devices_config.iter() {
-                let mut device_val = serde_json::to_value(config).unwrap_or(Value::Null);
-                if let Some(obj) = device_val.as_object_mut() {
-                    if let Some(info) = connection_states.iter().find(|d| d.id == *id) {
-                        obj.insert("connected".to_string(), Value::Bool(info.is_connected));
-                        obj.insert("ip".to_string(), Value::String(info.address.to_string()));
-                        obj.insert(
-                            "version".to_string(),
-                            Value::String(info.version.to_string()),
-                        );
-                    } else {
-                        obj.insert("connected".to_string(), Value::Bool(false));
-                    }
-                }
-                devices_with_status.insert(id.clone(), device_val);
-            }
-
-            ApiResponse::base(Status::Ok)
-                .with_extra("version", env!("CARGO_PKG_VERSION").into())
-                .with_extra("devices", Value::Object(devices_with_status))
-        }
+        BridgeRequest::Status => ctx.get_manager_status().await,
         BridgeRequest::DeviceStatus { id, cid } => {
-            handle_device_command(ctx, CommandType::DpQuery, id, None, cid).await
+            info!("Device status: id={}, cid={:?}", id, cid);
+            match ctx.get_connected_device(&id).await {
+                Ok(dev) => {
+                    dev.status().await;
+                    ApiResponse::ok("device/status", id)
+                }
+                Err(e) => e,
+            }
         }
         BridgeRequest::SetDps { id, dps, cid } => {
-            handle_device_command(ctx, CommandType::Control, id, Some(Value::Object(dps)), cid)
-                .await
+            info!("Device set_dps: id={}, dps={:?}, cid={:?}", id, dps, cid);
+            match ctx.get_connected_device(&id).await {
+                Ok(dev) => {
+                    dev.set_dps(Value::Object(dps)).await;
+                    ApiResponse::ok("device/set_dps", id)
+                }
+                Err(e) => e,
+            }
         }
         BridgeRequest::DeviceRequest { id, cmd, data, cid } => {
-            if let Some(command) = CommandType::from_u32(cmd) {
-                handle_device_command(ctx, command, id, data, cid).await
-            } else {
-                ApiResponse::error(format!("Invalid CommandType {}", cmd))
+            let command = match CommandType::from_u32(cmd) {
+                Some(c) => c,
+                None => return ApiResponse::error(format!("Invalid CommandType {}", cmd)),
+            };
+
+            info!(
+                "Device request: id={}, cmd={:?}, data={:?}, cid={:?}",
+                id, command, data, cid
+            );
+
+            match ctx.get_connected_device(&id).await {
+                Ok(dev) => {
+                    dev.request(command, data, cid).await;
+                    ApiResponse::ok(format!("device/{:?}", command).to_lowercase(), id)
+                }
+                Err(e) => e,
             }
         }
         BridgeRequest::Scan => {
@@ -510,33 +554,5 @@ async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> String {
                 "Scan started. Results will be published to 'scanner' topic.".into(),
             )
         }
-    };
-
-    response.to_json_string()
-}
-
-/// Helper for device-specific commands to reduce handle_request size.
-async fn handle_device_command(
-    ctx: Arc<BridgeContext>,
-    cmd: CommandType,
-    id: String,
-    data: Option<Value>,
-    cid: Option<String>,
-) -> ApiResponse {
-    info!(
-        "Device command: id={}, cmd={:?}, data={:?}, cid={:?}",
-        id, cmd, data, cid
-    );
-
-    let dev = match ctx.manager.get(&id).await {
-        Some(dev) => dev,
-        None => return ApiResponse::error("Device not found"),
-    };
-
-    if !dev.is_connected() {
-        return ApiResponse::error("Device is offline");
     }
-
-    dev.request(cmd, data, cid).await;
-    ApiResponse::ok(format!("device/{:?}", cmd).to_lowercase(), id)
 }
