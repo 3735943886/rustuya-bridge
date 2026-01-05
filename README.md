@@ -1,5 +1,10 @@
 # Rustuya Bridge
 
+[![Docker Publish](https://github.com/3735943886/rustuya-bridge/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/3735943886/rustuya-bridge/actions)
+[![Docker Image Version (latest semver)](https://img.shields.io/docker/v/3735943886/rustuya?sort=semver)](https://hub.docker.com/r/3735943886/rustuya)
+[![Docker Pulls](https://img.shields.io/docker/pulls/3735943886/rustuya)](https://hub.docker.com/r/3735943886/rustuya)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A ZMQ-based bridge server for managing Tuya devices via `rustuya`.
 
 ## How to Run
@@ -12,8 +17,22 @@ cargo run --release -- --command-addr tcp://0.0.0.0:37358 --event-addr tcp://0.0
 ### Docker Execution
 Run with **host network mode** to ensure Tuya device discovery works correctly:
 ```bash
-docker run -d --name rustuya --network host -v $(pwd)/data:/data 3735943886/rustuya
+docker run -d \
+  --name rustuya \
+  --network host \
+  -v $(pwd)/data:/data \
+  3735943886/rustuya
 ```
+
+## Configuration
+
+The bridge can be configured via command-line arguments or environment variables:
+
+| Argument | Environment Variable | Default | Description |
+|----------|----------------------|---------|-------------|
+| `--command-addr` | `ZMQ_COMMAND_ADDR` | `tcp://0.0.0.0:37358` | ZMQ ROUTER socket address for commands |
+| `--event-addr` | `ZMQ_EVENT_ADDR` | `tcp://0.0.0.0:37359` | ZMQ PUB socket address for events |
+| `--state-file` | `STATE_FILE` | `rustuya.json` | Path to the file where device configurations are stored |
 
 ## Python Example
 
@@ -99,6 +118,7 @@ if __name__ == "__main__":
 - `manager/status`: List devices and connection status.
 - `manager/add`: Add or modify a device configuration.
 - `manager/remove`: Remove a device.
+- `manager/clear`: Reset all devices from the manager.
 - `device/status`: Query DP status.
 - `device/set_dps`: Set DP values (requires `dps` object).
 - `device/request`: Send raw command (requires `cmd`, `data`).
