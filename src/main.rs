@@ -18,14 +18,53 @@ const DEFAULT_COMMAND_ADDR: &str = "tcp://0.0.0.0:37358";
 const DEFAULT_EVENT_ADDR: &str = "tcp://0.0.0.0:37359";
 const SAVE_DEBOUNCE_SECS: u64 = 30;
 const CHANNEL_CAPACITY: usize = 100;
-const AUTO_VALUE: &str = "Auto";
 
 // --- Types & Responses ---
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum BridgeRequest {
+    #[serde(rename = "manager/add")]
+    Add {
+        id: String,
+        key: String,
+        #[serde(default = "default_auto")]
+        ip: String,
+        #[serde(default = "default_auto")]
+        version: String,
+    },
+    #[serde(rename = "manager/remove")]
+    Remove { id: String },
+    #[serde(rename = "manager/clear")]
+    Clear,
+    #[serde(rename = "manager/status")]
+    Status,
+    #[serde(rename = "device/status")]
+    DeviceStatus { id: String, cid: Option<String> },
+    #[serde(rename = "device/set_dps")]
+    SetDps {
+        id: String,
+        dps: serde_json::Map<String, Value>,
+        cid: Option<String>,
+    },
+    #[serde(rename = "device/request")]
+    DeviceRequest {
+        id: String,
+        cmd: u32,
+        data: Option<Value>,
+        cid: Option<String>,
+    },
+    #[serde(rename = "scan")]
+    Scan,
+}
+
+fn default_auto() -> String {
+    "Auto".to_string()
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Status {
     Ok,
-    Warning,
     Error,
 }
 
@@ -38,8 +77,6 @@ struct ApiResponse {
     id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    warnings: Vec<String>,
     #[serde(flatten)]
     extra: HashMap<String, Value>,
 }
@@ -51,7 +88,6 @@ impl ApiResponse {
             action: None,
             id: None,
             error: None,
-            warnings: Vec::new(),
             extra: HashMap::new(),
         }
     }
@@ -69,23 +105,8 @@ impl ApiResponse {
         res
     }
 
-    fn warning(action: impl Into<String>, id: impl Into<String>, msg: String) -> Self {
-        let mut res = Self::ok(action, id);
-        res.status = Status::Warning;
-        res.warnings = vec![msg];
-        res
-    }
-
     fn with_extra(mut self, key: &str, value: Value) -> Self {
         self.extra.insert(key.to_string(), value);
-        self
-    }
-
-    fn with_warnings(mut self, warnings: Vec<String>) -> Self {
-        self.warnings.extend(warnings);
-        if !self.warnings.is_empty() && matches!(self.status, Status::Ok) {
-            self.status = Status::Warning;
-        }
         self
     }
 
@@ -179,6 +200,42 @@ impl BridgeContext {
         if let Err(e) = self.event_tx.send(msg).await {
             error!("Failed to queue ZMQ event: {}", e);
         }
+    }
+
+    // --- Atomic State Operations ---
+
+    async fn add_device(&self, config: DeviceConfig) -> Result<ApiResponse, String> {
+        let mut devices = self.devices.write().await;
+
+        self.manager
+            .add(&config.id, &config.ip, &config.key, config.version.as_str())
+            .await
+            .map_err(|e| format!("Manager error: {:?}", e))?;
+
+        let is_new = !devices.contains_key(&config.id);
+        devices.insert(config.id.clone(), config.clone());
+        self.request_save();
+
+        Ok(ApiResponse::ok(
+            if is_new { "added" } else { "modified" },
+            config.id,
+        ))
+    }
+
+    async fn remove_device(&self, id: &str) -> Result<ApiResponse, String> {
+        let mut devices = self.devices.write().await;
+        self.manager.remove(id).await;
+        devices.remove(id);
+        self.request_save();
+        Ok(ApiResponse::ok("removed", id))
+    }
+
+    async fn clear_devices(&self) -> Result<ApiResponse, String> {
+        let mut devices = self.devices.write().await;
+        self.manager.clear().await;
+        devices.clear();
+        self.request_save();
+        Ok(ApiResponse::ok("cleared", "manager"))
     }
 }
 
@@ -316,7 +373,22 @@ async fn main() {
                             // Detect REQ style: [Identity, Empty, Payload]
                             let is_req = msg.len() >= 3 && msg.get(1).map(|f| f.is_empty()).unwrap_or(false);
 
-                            let res_payload = handle_request(ctx, msg).await;
+                            let payload_idx = if is_req { 2 } else { 1 };
+                            let payload = match msg.get(payload_idx) {
+                                Some(p) => String::from_utf8_lossy(p),
+                                None => {
+                                    error!("Empty payload received");
+                                    return;
+                                }
+                            };
+
+                            let res_payload = match serde_json::from_str::<BridgeRequest>(&payload) {
+                                 Ok(req) => handle_request(ctx, req).await,
+                                 Err(e) => {
+                                     error!("Invalid request: {} | Payload: {}", e, payload);
+                                     ApiResponse::error(format!("Invalid request: {}", e)).to_json_string()
+                                 }
+                             };
                             let _ = tx.send((identity, res_payload, is_req)).await;
                         });
                     }
@@ -344,112 +416,28 @@ async fn main() {
 }
 
 // --- Request Handler ---
-async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
-    // In ROUTER mode:
-    // - From DEALER: [Identity, Payload]
-    // - From REQ:    [Identity, Empty, Payload]
-    let payload_idx = if msg.len() >= 3 && msg.get(1).map(|f| f.is_empty()).unwrap_or(false) {
-        2
-    } else {
-        1
-    };
-
-    let payload = match msg.get(payload_idx) {
-        Some(p) => String::from_utf8_lossy(p),
-        None => return ApiResponse::error("Empty message").to_json_string(),
-    };
-
-    let req: Value = match serde_json::from_str(&payload) {
-        Ok(v) => v,
-        Err(e) => return ApiResponse::error(format!("Invalid JSON: {}", e)).to_json_string(),
-    };
-
-    let action = req["action"].as_str().unwrap_or("").to_string();
-
-    // Track used keys and warnings
-    let mut used_keys = std::collections::HashSet::from(["action".to_string()]);
-    let mut warnings = Vec::new();
-
-    let response = match action.as_str() {
-        "manager/add" | "manager/remove" | "manager/clear" => {
-            let id = req["id"].as_str().unwrap_or("");
-            let key = req["key"].as_str().unwrap_or("");
-            let ip = req["ip"].as_str().unwrap_or(AUTO_VALUE);
-            let version = req["version"].as_str().unwrap_or(AUTO_VALUE);
-
-            used_keys.insert("id".to_string());
-            if action == "manager/add" {
-                used_keys.extend(["key", "ip", "version"].iter().map(|s| s.to_string()));
-            }
-
-            if action == "manager/clear" {
-                let mut devices = ctx.devices.write().await;
-                ctx.manager.clear().await;
-                devices.clear();
-                ctx.request_save();
-                return ApiResponse::ok("cleared", "manager").to_json_string();
-            }
-
-            if id.is_empty() {
-                return ApiResponse::error("Missing 'id'").to_json_string();
-            }
-
-            if action == "manager/remove" {
-                let mut devices = ctx.devices.write().await;
-                ctx.manager.remove(id).await;
-                devices.remove(id);
-                ctx.request_save();
-                ApiResponse::ok("removed", id)
-            } else {
-                let mut devices = ctx.devices.write().await;
-                let existing = devices.get(id);
-
-                if let Some(config) = existing {
-                    if config.ip == ip && config.key == key && config.version == version {
-                        ApiResponse::warning(
-                            "ignored",
-                            id,
-                            format!("Device {} already exists with same config. Ignored.", id),
-                        )
-                    } else {
-                        match ctx.manager.modify(id, ip, key, version).await {
-                            Ok(_) => {
-                                devices.insert(
-                                    id.to_string(),
-                                    DeviceConfig {
-                                        id: id.to_string(),
-                                        ip: ip.to_string(),
-                                        key: key.to_string(),
-                                        version: version.to_string(),
-                                    },
-                                );
-                                ctx.request_save();
-                                ApiResponse::ok("modified", id)
-                            }
-                            Err(e) => ApiResponse::error(format!("Manager error: {:?}", e)),
-                        }
-                    }
-                } else {
-                    match ctx.manager.add(id, ip, key, version).await {
-                        Ok(_) => {
-                            devices.insert(
-                                id.to_string(),
-                                DeviceConfig {
-                                    id: id.to_string(),
-                                    ip: ip.to_string(),
-                                    key: key.to_string(),
-                                    version: version.to_string(),
-                                },
-                            );
-                            ctx.request_save();
-                            ApiResponse::ok("added", id)
-                        }
-                        Err(e) => ApiResponse::error(format!("Manager error: {:?}", e)),
-                    }
-                }
-            }
-        }
-        "manager/status" => {
+async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> String {
+    let response = match req {
+        BridgeRequest::Add {
+            id,
+            key,
+            ip,
+            version,
+        } => ctx
+            .add_device(DeviceConfig {
+                id,
+                ip,
+                key,
+                version,
+            })
+            .await
+            .unwrap_or_else(ApiResponse::error),
+        BridgeRequest::Remove { id } => ctx
+            .remove_device(&id)
+            .await
+            .unwrap_or_else(ApiResponse::error),
+        BridgeRequest::Clear => ctx.clear_devices().await.unwrap_or_else(ApiResponse::error),
+        BridgeRequest::Status => {
             let devices_config = ctx.devices.read().await;
             let connection_states = ctx.manager.list().await;
 
@@ -459,7 +447,6 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
                 if let Some(obj) = device_val.as_object_mut() {
                     if let Some(info) = connection_states.iter().find(|d| d.id == *id) {
                         obj.insert("connected".to_string(), Value::Bool(info.is_connected));
-                        // Found values (actual IP/version) are used in response if available
                         obj.insert("ip".to_string(), Value::String(info.address.to_string()));
                         obj.insert(
                             "version".to_string(),
@@ -476,10 +463,21 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
                 .with_extra("version", env!("CARGO_PKG_VERSION").into())
                 .with_extra("devices", Value::Object(devices_with_status))
         }
-        "device/status" | "device/set_dps" | "device/request" => {
-            handle_device_command(ctx, &action, &req, &mut used_keys).await
+        BridgeRequest::DeviceStatus { id, cid } => {
+            handle_device_command(ctx, CommandType::DpQuery, id, None, cid).await
         }
-        "scan" => {
+        BridgeRequest::SetDps { id, dps, cid } => {
+            handle_device_command(ctx, CommandType::Control, id, Some(Value::Object(dps)), cid)
+                .await
+        }
+        BridgeRequest::DeviceRequest { id, cmd, data, cid } => {
+            if let Some(command) = CommandType::from_u32(cmd) {
+                handle_device_command(ctx, command, id, data, cid).await
+            } else {
+                ApiResponse::error(format!("Invalid CommandType {}", cmd))
+            }
+        }
+        BridgeRequest::Scan => {
             let ctx_scan = ctx.clone();
             tokio::spawn(async move {
                 let scanner = Scanner::new().with_timeout(Duration::from_secs(18));
@@ -502,7 +500,6 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
                         .await;
                 }
 
-                // Send empty payload to signal end of scan
                 ctx_scan
                     .publish_event("scanner".to_string(), "{}".to_string())
                     .await;
@@ -513,37 +510,25 @@ async fn handle_request(ctx: Arc<BridgeContext>, msg: ZmqMessage) -> String {
                 "Scan started. Results will be published to 'scanner' topic.".into(),
             )
         }
-        _ => ApiResponse::error(format!("Unknown action: {}", action)),
     };
 
-    // Detect unused keys
-    if let Some(obj) = req.as_object() {
-        for key in obj.keys() {
-            if !used_keys.contains(key) {
-                warnings.push(format!("Argument '{}' is not used", key));
-            }
-        }
-    }
-
-    response.with_warnings(warnings).to_json_string()
+    response.to_json_string()
 }
 
 /// Helper for device-specific commands to reduce handle_request size.
 async fn handle_device_command(
     ctx: Arc<BridgeContext>,
-    action: &str,
-    req: &Value,
-    used_keys: &mut std::collections::HashSet<String>,
+    cmd: CommandType,
+    id: String,
+    data: Option<Value>,
+    cid: Option<String>,
 ) -> ApiResponse {
-    let id = match req["id"].as_str() {
-        Some(id) => {
-            used_keys.insert("id".to_string());
-            id
-        }
-        None => return ApiResponse::error("Missing 'id'"),
-    };
+    info!(
+        "Device command: id={}, cmd={:?}, data={:?}, cid={:?}",
+        id, cmd, data, cid
+    );
 
-    let dev = match ctx.manager.get(id).await {
+    let dev = match ctx.manager.get(&id).await {
         Some(dev) => dev,
         None => return ApiResponse::error("Device not found"),
     };
@@ -552,48 +537,6 @@ async fn handle_device_command(
         return ApiResponse::error("Device is offline");
     }
 
-    let cid = req["cid"].as_str().map(|s| {
-        used_keys.insert("cid".to_string());
-        s.to_string()
-    });
-
-    match action {
-        "device/status" => {
-            dev.request(CommandType::DpQuery, None, cid).await;
-            ApiResponse::ok(action, id)
-        }
-        "device/set_dps" => {
-            if let Some(dps) = req["dps"].as_object() {
-                used_keys.insert("dps".to_string());
-                dev.request(CommandType::Control, Some(Value::Object(dps.clone())), cid)
-                    .await;
-                ApiResponse::ok(action, id)
-            } else {
-                ApiResponse::error("'dps' object required")
-            }
-        }
-        "device/request" => {
-            if let Some(cmd_val) = req["cmd"].as_u64() {
-                used_keys.insert("cmd".to_string());
-                if let Some(cmd) = CommandType::from_u32(cmd_val as u32) {
-                    let req_data = req["data"].clone();
-                    if !req_data.is_null() {
-                        used_keys.insert("data".to_string());
-                    }
-                    let data_opt = if req_data.is_null() {
-                        None
-                    } else {
-                        Some(req_data)
-                    };
-                    dev.request(cmd, data_opt, cid).await;
-                    ApiResponse::ok(action, id)
-                } else {
-                    ApiResponse::error(format!("Invalid CommandType {}", cmd_val))
-                }
-            } else {
-                ApiResponse::error("'cmd' (u32) required")
-            }
-        }
-        _ => unreachable!(),
-    }
+    dev.request(cmd, data, cid).await;
+    ApiResponse::ok(format!("device/{:?}", cmd).to_lowercase(), id)
 }
