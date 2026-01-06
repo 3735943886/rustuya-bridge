@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use clap::Parser;
 use futures_util::StreamExt;
 use log::{error, info};
@@ -111,8 +110,10 @@ impl ApiResponse {
     }
 
     fn to_json_string(&self) -> String {
-        serde_json::to_string(self)
-            .unwrap_or_else(|_| r#"{"status":"error","error":"Serialization failed"}"#.into())
+        serde_json::to_string(self).unwrap_or_else(|e| {
+            error!("Serialization failed: {}", e);
+            r#"{"status":"error","error":"Serialization failed"}"#.to_string()
+        })
     }
 }
 
@@ -207,10 +208,13 @@ impl BridgeContext {
     async fn add_device(&self, config: DeviceConfig) -> Result<ApiResponse, String> {
         let mut devices = self.devices.write().await;
 
-        self.manager
+        let dev = self
+            .manager
             .add(&config.id, &config.ip, &config.key, config.version.as_str())
             .await
             .map_err(|e| format!("Manager error: {:?}", e))?;
+
+        dev.set_nowait(true);
 
         let is_new = !devices.contains_key(&config.id);
         devices.insert(config.id.clone(), config.clone());
@@ -287,19 +291,20 @@ async fn load_state(path: &str) -> HashMap<String, DeviceConfig> {
     if !std::path::Path::new(path).exists() {
         return HashMap::new();
     }
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => match serde_json::from_str::<HashMap<String, DeviceConfig>>(&content) {
-            Ok(devices) => {
-                info!("Loaded {} devices from {}", devices.len(), path);
-                devices
-            }
-            Err(e) => {
-                error!("Failed to parse state file {}: {}", path, e);
-                HashMap::new()
-            }
-        },
+    let res = async {
+        let content = tokio::fs::read_to_string(path).await?;
+        let devices = serde_json::from_str::<HashMap<String, DeviceConfig>>(&content)?;
+        Ok::<_, Box<dyn std::error::Error>>(devices)
+    }
+    .await;
+
+    match res {
+        Ok(devices) => {
+            info!("Loaded {} devices from {}", devices.len(), path);
+            devices
+        }
         Err(e) => {
-            error!("Failed to read state file {}: {}", path, e);
+            error!("Failed to load state file {}: {}", path, e);
             HashMap::new()
         }
     }
@@ -307,22 +312,16 @@ async fn load_state(path: &str) -> HashMap<String, DeviceConfig> {
 
 // --- Main Entry Point ---
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let cli = Cli::parse();
 
     // 1. Initialize ZMQ Sockets
     let mut router_socket = RouterSocket::new();
-    router_socket
-        .bind(&cli.command_addr)
-        .await
-        .expect("Failed to bind ROUTER socket");
+    router_socket.bind(&cli.command_addr).await?;
 
     let mut pub_socket = PubSocket::new();
-    pub_socket
-        .bind(&cli.event_addr)
-        .await
-        .expect("Failed to bind PUB socket");
+    pub_socket.bind(&cli.event_addr).await?;
 
     let (event_tx, mut event_rx) = mpsc::channel::<ZmqMessage>(CHANNEL_CAPACITY);
     let (save_tx, mut save_rx) = mpsc::channel(1);
@@ -335,9 +334,12 @@ async fn main() {
     let rustuya_rx = manager.listener();
 
     for config in loaded_devices.values() {
-        let _ = manager
+        if let Ok(dev) = manager
             .add(&config.id, &config.ip, &config.key, config.version.as_str())
-            .await;
+            .await
+        {
+            dev.set_nowait(true);
+        }
     }
 
     let ctx = Arc::new(BridgeContext {
@@ -397,56 +399,46 @@ async fn main() {
     );
 
     // 4. Main Command Loop (ROUTER)
-    // Using a channel to handle responses asynchronously (Identity, Payload, is_req)
-    let (res_tx, mut res_rx) = mpsc::channel::<(Bytes, String, bool)>(CHANNEL_CAPACITY);
-
     loop {
         tokio::select! {
             req = router_socket.recv() => {
                 match req {
                     Ok(msg) => {
-                        let ctx = ctx.clone();
-                        let tx = res_tx.clone();
-                        tokio::spawn(async move {
-                            if msg.len() < 2 {
-                                error!("Invalid ROUTER message: expected at least 2 frames (Identity + Payload)");
-                                return;
+                        // REQ style: [Identity, Empty, Payload] (3 frames)
+                        // Dealer style: [Identity, Payload] (2 frames)
+                        let (identity, is_req, payload_bytes) = match (msg.get(0), msg.get(1), msg.get(2)) {
+                            (Some(id), Some(empty), Some(payload)) if empty.is_empty() => {
+                                (id.clone(), true, payload)
                             }
-                            let identity = msg.get(0).unwrap().clone();
-                            // Detect REQ style: [Identity, Empty, Payload]
-                            let is_req = msg.len() >= 3 && msg.get(1).map(|f| f.is_empty()).unwrap_or(false);
+                            (Some(id), Some(payload), _) if msg.len() >= 2 => {
+                                (id.clone(), false, payload)
+                            }
+                            _ => {
+                                error!("Invalid ROUTER message: expected at least 2 frames");
+                                continue;
+                            }
+                        };
 
-                            let payload_idx = if is_req { 2 } else { 1 };
-                            let payload = match msg.get(payload_idx) {
-                                Some(p) => String::from_utf8_lossy(p),
-                                None => {
-                                    error!("Empty payload received");
-                                    return;
-                                }
-                            };
+                        let payload = String::from_utf8_lossy(payload_bytes);
+                        let res_payload = match serde_json::from_str::<BridgeRequest>(&payload) {
+                            Ok(req) => handle_request(ctx.clone(), req).await.to_json_string(),
+                            Err(e) => {
+                                error!("Invalid request: {} | Payload: {}", e, payload);
+                                ApiResponse::error(format!("Invalid request: {}", e))
+                                    .to_json_string()
+                            }
+                        };
 
-                            let res_payload = match serde_json::from_str::<BridgeRequest>(&payload) {
-                                Ok(req) => handle_request(ctx, req).await.to_json_string(),
-                                Err(e) => {
-                                    error!("Invalid request: {} | Payload: {}", e, payload);
-                                    ApiResponse::error(format!("Invalid request: {}", e))
-                                        .to_json_string()
-                                }
-                            };
-                            let _ = tx.send((identity, res_payload, is_req)).await;
-                        });
+                        let mut res_msg = ZmqMessage::from(identity);
+                        if is_req {
+                            res_msg.push_back(vec![].into()); // Empty delimiter for REQ
+                        }
+                        res_msg.push_back(res_payload.into());
+                        if let Err(e) = router_socket.send(res_msg).await {
+                            error!("ZMQ ROUTER send error: {}", e);
+                        }
                     }
                     Err(e) => error!("ZMQ ROUTER recv error: {}", e),
-                }
-            }
-            Some((identity, res_payload, is_req)) = res_rx.recv() => {
-                let mut res_msg = ZmqMessage::from(identity);
-                if is_req {
-                    res_msg.push_back(vec![].into()); // Empty delimiter for REQ
-                }
-                res_msg.push_back(res_payload.into());
-                if let Err(e) = router_socket.send(res_msg).await {
-                    error!("ZMQ ROUTER send error: {}", e);
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -457,6 +449,7 @@ async fn main() {
             }
         }
     }
+    Ok(())
 }
 
 // --- Request Handler ---
@@ -482,36 +475,25 @@ async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiRespo
             .unwrap_or_else(ApiResponse::error),
         BridgeRequest::Clear => ctx.clear_devices().await.unwrap_or_else(ApiResponse::error),
         BridgeRequest::Status => ctx.get_manager_status().await,
-        BridgeRequest::DeviceStatus { id, cid } => {
-            info!("Device status: id={}, cid={:?}", id, cid);
-            match ctx.get_connected_device(&id).await {
-                Ok(dev) => {
-                    dev.status().await;
-                    ApiResponse::ok("device/status", id)
-                }
-                Err(e) => e,
+        BridgeRequest::DeviceStatus { id, cid } => match ctx.get_connected_device(&id).await {
+            Ok(dev) => {
+                dev.request(CommandType::DpQuery, None, cid).await;
+                ApiResponse::ok("device/status", id)
             }
-        }
-        BridgeRequest::SetDps { id, dps, cid } => {
-            info!("Device set_dps: id={}, dps={:?}, cid={:?}", id, dps, cid);
-            match ctx.get_connected_device(&id).await {
-                Ok(dev) => {
-                    dev.set_dps(Value::Object(dps)).await;
-                    ApiResponse::ok("device/set_dps", id)
-                }
-                Err(e) => e,
+            Err(e) => e,
+        },
+        BridgeRequest::SetDps { id, dps, cid } => match ctx.get_connected_device(&id).await {
+            Ok(dev) => {
+                dev.request(CommandType::Control, Some(Value::Object(dps)), cid)
+                    .await;
+                ApiResponse::ok("device/set_dps", id)
             }
-        }
+            Err(e) => e,
+        },
         BridgeRequest::DeviceRequest { id, cmd, data, cid } => {
-            let command = match CommandType::from_u32(cmd) {
-                Some(c) => c,
-                None => return ApiResponse::error(format!("Invalid CommandType {}", cmd)),
+            let Some(command) = CommandType::from_u32(cmd) else {
+                return ApiResponse::error(format!("Invalid CommandType {}", cmd));
             };
-
-            info!(
-                "Device request: id={}, cmd={:?}, data={:?}, cid={:?}",
-                id, command, data, cid
-            );
 
             match ctx.get_connected_device(&id).await {
                 Ok(dev) => {
