@@ -13,13 +13,17 @@ def listen_bridge():
     # SUB 소켓 생성
     socket = context.socket(zmq.SUB)
     
+    # 500ms 수신 타임아웃 설정 (Ctrl+C 처리를 위함)
+    socket.setsockopt(zmq.RCVTIMEO, 500)
+    
     try:
         # 브릿지 이벤트 주소에 연결
         socket.connect(EVENT_ADDR)
         
         # 모든 토픽 구독 (""은 모든 메시지를 의미)
         # 특정 장치만 보고 싶다면 장치 ID를 입력: socket.subscribe("device_id")
-        socket.subscribe("")
+        socket.subscribe("device")
+        socket.subscribe("scanner")
         
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Listening for bridge events on {EVENT_ADDR}...")
         print("Press Ctrl+C to stop.\n")
@@ -44,6 +48,9 @@ def listen_bridge():
                 print(f"PAYLOAD: {formatted_payload}")
                 print("-" * 50)
                 
+            except zmq.Again:
+                # 타임아웃 발생 시 다시 루프 (이 시점에 Ctrl+C 체크가 일어남)
+                continue
             except zmq.ZMQError as e:
                 print(f"ZMQ Error: {e}")
                 break
