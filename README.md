@@ -63,10 +63,13 @@ import zmq
 context = zmq.Context()
 socket = context.socket(zmq.SUB)
 socket.connect("tcp://127.0.0.1:37359")
-socket.subscribe("") # Subscribe to all devices
+socket.subscribe("device")  # Subscribe to all device events
+socket.subscribe("scanner") # Subscribe to scanner results
 
 while True:
     topic, payload = socket.recv_multipart()
+    # topic: "device" or "scanner"
+    # payload: JSON string (contains "id" for devices)
     print(f"[{topic.decode()}] {payload.decode()}")
 ```
 

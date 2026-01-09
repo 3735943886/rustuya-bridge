@@ -428,9 +428,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(event_res) = rustuya_rx.next() => {
                         match event_res {
                             Ok(event) => {
-                                if let Some(payload) = event.message.payload_as_string() {
+                                if let Some(payload_str) = event.message.payload_as_string() {
+                                    // Inject device ID into payload for consistent topic subscription
+                                    let mut payload: Value = serde_json::from_str(&payload_str)
+                                        .unwrap_or(Value::String(payload_str));
+                                    
+                                    if let Some(obj) = payload.as_object_mut() {
+                                        obj.insert("id".to_string(), Value::String(event.device_id.clone()));
+                                    }
+
                                     ctx_listener
-                                        .publish_event(event.device_id.clone(), payload)
+                                        .publish_event("device".to_string(), payload.to_string())
                                         .await;
                                 }
                             }
