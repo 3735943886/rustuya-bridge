@@ -30,100 +30,84 @@ The bridge can be configured via command-line arguments or environment variables
 
 | Argument | Environment Variable | Default | Description |
 |----------|----------------------|---------|-------------|
-| `--command-addr` | `ZMQ_COMMAND_ADDR` | `tcp://0.0.0.0:37358` | ZMQ ROUTER socket address for commands |
-| `--event-addr` | `ZMQ_EVENT_ADDR` | `tcp://0.0.0.0:37359` | ZMQ PUB socket address for events |
+| `--command-addr` | `ZMQ_COMMAND_ADDR` | `tcp://0.0.0.0:37358` | ZMQ **ROUTER** socket address for commands |
+| `--event-addr` | `ZMQ_EVENT_ADDR` | `tcp://0.0.0.0:37359` | ZMQ **PUB** socket address for events |
 | `--state-file` | `STATE_FILE` | `rustuya.json` | Path to the file where device configurations are stored |
 
-## Python Example
-
-### Sending Actions
-```python
-import zmq
-
-# Command Socket
-context = zmq.Context()
-socket = context.socket(zmq.REQ)
-socket.connect("tcp://127.0.0.1:37358")
-socket.setsockopt(zmq.RCVTIMEO, 2000) # 2s timeout
-
-def send_command(payload):
-    socket.send_json(payload)
-    return socket.recv_json()
-
-print(send_command({"action": "add", "id": "DEVICE_ID", "key": "DEVICE_KEY", "ip": "YOUR_DEVICE_IP", "version": "3.3"}))
-print(send_command({"action": "status"}))
-print(send_command({"action": "get", "id": "DEVICE_ID"}))
-```
-
-### Listening Events
-```python
-import zmq
-
-# Event Socket
-context = zmq.Context()
-socket = context.socket(zmq.SUB)
-socket.connect("tcp://127.0.0.1:37359")
-socket.subscribe("device")  # Subscribe to all device events
-socket.subscribe("scanner") # Subscribe to scanner results
-
-while True:
-    topic, payload = socket.recv_multipart()
-    # topic: "device" or "scanner"
-    # payload: JSON string (contains "id" for devices)
-    print(f"[{topic.decode()}] {payload.decode()}")
-```
-
-### Asynchronous
-```python
-import asyncio
-import zmq.asyncio
-
-async def main():
-    ctx = zmq.asyncio.Context()
-    
-    # 1. Command Socket (DEALER)
-    cmd_socket = ctx.socket(zmq.DEALER)
-    cmd_socket.connect("tcp://127.0.0.1:37358")
-    
-    # 2. Event Socket (SUB)
-    sub_socket = ctx.socket(zmq.SUB)
-    sub_socket.connect("tcp://127.0.0.1:37359")
-    sub_socket.subscribe("")
-
-    async def listen_events():
-        while True:
-            topic, payload = await sub_socket.recv_multipart()
-            print(f"[Event] {topic.decode()} -> {payload.decode()}")
-
-    async def listen_commands():
-        while True:
-            res = await cmd_socket.recv_json()
-            print(f"[Response] {res}")
-
-    # Run listeners in background
-    asyncio.create_task(listen_events())
-    asyncio.create_task(listen_commands())
-
-    # Send actions without blocking
-    await cmd_socket.send_json({"action": "add", "id": "DEVICE_ID", "key": "DEVICE_KEY", "ip": "YOUR_DEVICE_IP", "version": "3.3"})
-    await cmd_socket.send_json({"action": "status"})
-    await cmd_socket.send_json({"action": "get", "id": "DEVICE_ID"})
-    await cmd_socket.send_json({"action": "set", "id": "DEVICE_ID", "dps": {"1": True}})
-
-    # Wait for events/responses
-    await asyncio.sleep(1)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
 ## API Summary
-- `status`: List all devices and their connection status.
-- `add`: Add or update a device configuration.
-- `remove`: Remove a device by ID.
-- `clear`: Remove all devices.
-- `get`: Query current DP status of a device.
-- `set`: Set DP values (requires `dps` object).
-- `request`: Send a raw command (requires `cmd` byte and `data` object).
+
+| Action | Parameters | Description |
+| :--- | :--- | :--- |
+| `add` | `id`, `key`, `ip`?, `version`?, `name`? | Register a device. `name` is optional. |
+| `remove` | `id` or `name` | Unregister device(s) by ID or Name. Supports lists `[...]`. |
+| `clear` | - | Remove all devices. |
+| `status` | - | Get bridge and device status. |
+| `get` | `id` or `name`, `cid`? | Query device status. Supports lists `[...]`. |
+| `set` | `id` or `name`, `dps`, `cid`? | Set device state. Supports lists `[...]`. |
+| `request` | `id` or `name`, `cmd`, `data`?, `cid`? | Send raw command. Supports lists `[...]`. |
+| `sub_discover` | `id` or `name` | Trigger sub-device discovery (Gateways). |
+| `scan` | - | Scan for local devices (UDP 6666/6667). |
+
+### Target Selection Rules
+1. **ID Priority**: If both `id` and `name` are provided, `id` is used and `name` is ignored.
+2. **Lists Support**: Both `id` and `name` can be a single string or a list of strings.
+   - Example: `"id": ["dev1", "dev2"]`
+   - Example: `"name": ["kitchen", "living_room"]`
+
+## Usage Example (Rust)
+
+The bridge uses the `zeromq` crate for async communication. You can use any ZMQ-compatible client, but here is an example using Rust and `tokio`.
+
+**Cargo.toml**
+```toml
+[dependencies]
+zeromq = "0.3"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1.0"
+```
+
+**Client Implementation**
+```rust
+use zeromq::{ReqSocket, Socket, SocketRecv, SocketSend};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut socket = ReqSocket::new();
+    socket.connect("tcp://127.0.0.1:37358").await?;
+
+    // 1. Add devices with names
+    let add_cmd = serde_json::json!({
+        "action": "add",
+        "id": "DEV_ID_1",
+        "name": "living_room",
+        "key": "LOCAL_KEY",
+    });
+    socket.send(add_cmd.to_string().into()).await?;
+    let res = socket.recv().await?;
+    println!("Response: {:?}", res);
+
+    // 2. Control multiple devices by name or list
+    let set_cmd = serde_json::json!({
+        "action": "set",
+        "name": ["living_room", "kitchen"],
+        "dps": {"1": true}
+    });
+    socket.send(set_cmd.to_string().into()).await?;
+    
+    Ok(())
+}
+```
+
+### Async Communication
+The bridge supports fully asynchronous communication using the `zeromq` crate. 
+
+- **Bridge Side**: Built with `tokio` and `zeromq` for non-blocking I/O.
+- **Client Side**: You can use the async `zeromq` crate (requires an async runtime like `tokio` or `async-std`) or any synchronous ZMQ library (like `zmq` crate) depending on your needs.
+
 
 > **Note**: Add `"cid": "SUB_DEVICE_ID"` to `get`, `set`, or `request` for sub-device control.
+
+## Event Topics
+The bridge publishes events to the following topics:
+- `device`: DP status changes and responses from devices.
+- `scanner`: Results from the `scan` action. Returns an empty object `{}` when a scan cycle is finished.

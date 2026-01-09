@@ -20,10 +20,27 @@ const CHANNEL_CAPACITY: usize = 100;
 
 // --- Types & Responses ---
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SingleOrList {
+    Single(String),
+    List(Vec<String>),
+}
+
+impl SingleOrList {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Single(s) => vec![s],
+            Self::List(l) => l,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum BridgeRequest {
     Add {
         id: String,
+        name: Option<String>,
         key: String,
         #[serde(default = "default_auto")]
         ip: String,
@@ -31,28 +48,37 @@ enum BridgeRequest {
         version: String,
     },
     Remove {
-        id: String,
+        id: Option<SingleOrList>,
+        name: Option<SingleOrList>,
     },
     Clear,
     #[serde(rename = "status")]
     Status,
     #[serde(rename = "get")]
     Get {
-        id: String,
+        id: Option<SingleOrList>,
+        name: Option<SingleOrList>,
         cid: Option<String>,
     },
     #[serde(rename = "set")]
     Set {
-        id: String,
+        id: Option<SingleOrList>,
+        name: Option<SingleOrList>,
         dps: serde_json::Map<String, Value>,
         cid: Option<String>,
     },
     #[serde(rename = "request")]
     Request {
-        id: String,
+        id: Option<SingleOrList>,
+        name: Option<SingleOrList>,
         cmd: u32,
         data: Option<Value>,
         cid: Option<String>,
+    },
+    #[serde(rename = "sub_discover")]
+    SubDiscover {
+        id: Option<SingleOrList>,
+        name: Option<SingleOrList>,
     },
     Scan,
 }
@@ -138,6 +164,8 @@ struct Cli {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeviceConfig {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     ip: String,
     key: String,
     version: String,
@@ -148,6 +176,8 @@ struct BridgeContext {
     state_file: String,
     configs: RwLock<HashMap<String, DeviceConfig>>,
     instances: RwLock<HashMap<String, Device>>,
+    /// Fast lookup from name to device IDs
+    name_map: RwLock<HashMap<String, Vec<String>>>,
     save_tx: mpsc::Sender<()>,
     refresh_tx: mpsc::Sender<()>,
 }
@@ -201,6 +231,40 @@ impl BridgeContext {
         let _ = self.refresh_tx.try_send(());
     }
 
+    /// Finds devices by ID or Name. ID takes priority over Name.
+    /// Supports both single strings and lists of strings.
+    async fn find_device_ids(
+        &self,
+        id: Option<Vec<String>>,
+        name: Option<Vec<String>>,
+    ) -> Vec<String> {
+        // 1. Check ID priority
+        if let Some(ids) = id {
+            let configs = self.configs.read().await;
+            return ids
+                .into_iter()
+                .filter(|id_val| configs.contains_key(id_val))
+                .collect();
+        }
+
+        // 2. Check Name if no IDs provided
+        if let Some(names) = name {
+            let name_map = self.name_map.read().await;
+            let mut results = Vec::new();
+            for name_val in names {
+                if let Some(ids) = name_map.get(&name_val) {
+                    results.extend(ids.clone());
+                }
+            }
+            // Remove duplicates just in case multiple names point to same device
+            results.sort();
+            results.dedup();
+            return results;
+        }
+
+        vec![]
+    }
+
     /// Publishes an event to the ZMQ PUB socket.
     async fn publish_event(&self, topic: String, payload: String) {
         let mut msg = ZmqMessage::from(topic);
@@ -215,6 +279,31 @@ impl BridgeContext {
     async fn add_device(&self, config: DeviceConfig) -> Result<ApiResponse, String> {
         let mut configs = self.configs.write().await;
         let mut instances = self.instances.write().await;
+        let mut name_map = self.name_map.write().await;
+
+        // 1. Remove from name_map if it already exists with a different (or same) name
+        if let Some(old_cfg) = configs.get(&config.id)
+            && let Some(old_name) = &old_cfg.name
+            && let Some(ids) = name_map.get_mut(old_name)
+        {
+            ids.retain(|id| id != &config.id);
+            if ids.is_empty() {
+                name_map.remove(old_name);
+            }
+        }
+
+        // 2. Add to name_map if it has a name
+        if let Some(name) = &config.name {
+            name_map
+                .entry(name.clone())
+                .or_default()
+                .push(config.id.clone());
+        }
+
+        // 3. Stop and remove existing instance if it exists to ensure clean reconnection
+        if let Some(old_dev) = instances.remove(&config.id) {
+            old_dev.stop().await;
+        }
 
         let dev = DeviceBuilder::new(&config.id, config.key.as_bytes().to_vec())
             .address(&config.ip)
@@ -235,29 +324,51 @@ impl BridgeContext {
         ))
     }
 
-    async fn remove_device(&self, id: &str) -> Result<ApiResponse, String> {
+    async fn remove_device(
+        &self,
+        id: Option<Vec<String>>,
+        name: Option<Vec<String>>,
+    ) -> Result<ApiResponse, String> {
+        let targets = self.find_device_ids(id, name).await;
+        if targets.is_empty() {
+            return Err("No matching devices found".to_string());
+        }
+
         let mut configs = self.configs.write().await;
         let mut instances = self.instances.write().await;
+        let mut name_map = self.name_map.write().await;
 
-        if let Some(dev) = instances.remove(id) {
-            dev.stop().await;
+        for target_id in &targets {
+            if let Some(cfg) = configs.remove(target_id)
+                && let Some(n) = cfg.name
+                && let Some(ids) = name_map.get_mut(&n)
+            {
+                ids.retain(|id| id != target_id);
+                if ids.is_empty() {
+                    name_map.remove(&n);
+                }
+            }
+            if let Some(dev) = instances.remove(target_id) {
+                dev.stop().await;
+            }
         }
-        configs.remove(id);
 
         self.request_save();
         self.request_refresh();
-        Ok(ApiResponse::ok("removed", id))
+        Ok(ApiResponse::ok("removed", targets.join(",")))
     }
 
     async fn clear_devices(&self) -> Result<ApiResponse, String> {
         let mut configs = self.configs.write().await;
         let mut instances = self.instances.write().await;
+        let mut name_map = self.name_map.write().await;
 
         for dev in instances.values() {
             dev.stop().await;
         }
         instances.clear();
         configs.clear();
+        name_map.clear();
 
         self.request_save();
         self.request_refresh();
@@ -287,6 +398,9 @@ impl BridgeContext {
         for (id, config) in configs.iter() {
             let mut device_val = serde_json::to_value(config).unwrap_or(Value::Null);
             if let Some(obj) = device_val.as_object_mut() {
+                // Security: Don't leak the local key in the status response
+                obj.remove("key");
+
                 if let Some(dev) = instances.get(id) {
                     obj.insert("connected".to_string(), Value::Bool(dev.is_connected()));
                     obj.insert("ip".to_string(), Value::String(dev.address()));
@@ -350,8 +464,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Load State and Initialize Devices
     let loaded_configs = load_state(&cli.state_file).await;
     let mut instances = HashMap::new();
+    let mut name_map: HashMap<String, Vec<String>> = HashMap::new();
 
     for config in loaded_configs.values() {
+        if let Some(name) = &config.name {
+            name_map
+                .entry(name.clone())
+                .or_default()
+                .push(config.id.clone());
+        }
+
         let dev = DeviceBuilder::new(&config.id, config.key.as_bytes().to_vec())
             .address(&config.ip)
             .version(config.version.as_str())
@@ -367,6 +489,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_file: cli.state_file,
         configs: RwLock::new(loaded_configs),
         instances: RwLock::new(instances),
+        name_map: RwLock::new(name_map),
         save_tx,
         refresh_tx,
     });
@@ -432,7 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // Inject device ID into payload for consistent topic subscription
                                     let mut payload: Value = serde_json::from_str(&payload_str)
                                         .unwrap_or(Value::String(payload_str));
-                                    
+
                                     if let Some(obj) = payload.as_object_mut() {
                                         obj.insert("id".to_string(), Value::String(event.device_id.clone()));
                                     }
@@ -518,52 +641,101 @@ async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiRespo
     match req {
         BridgeRequest::Add {
             id,
+            name,
             key,
             ip,
             version,
         } => ctx
             .add_device(DeviceConfig {
                 id,
+                name,
                 ip,
                 key,
                 version,
             })
             .await
             .unwrap_or_else(ApiResponse::error),
-        BridgeRequest::Remove { id } => ctx
-            .remove_device(&id)
+        BridgeRequest::Remove { id, name } => ctx
+            .remove_device(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
             .await
             .unwrap_or_else(ApiResponse::error),
         BridgeRequest::Clear => ctx.clear_devices().await.unwrap_or_else(ApiResponse::error),
         BridgeRequest::Status => ctx.get_bridge_status().await,
-        BridgeRequest::Get { id, cid } => match ctx.get_connected_device(&id).await {
-            Ok(dev) => {
-                let _ = dev.request(CommandType::DpQuery, None, cid).await;
-                ApiResponse::ok("get", id)
+        BridgeRequest::Get { id, name, cid } => {
+            let targets = ctx
+                .find_device_ids(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
+                .await;
+            if targets.is_empty() {
+                return ApiResponse::error("No matching devices found");
             }
-            Err(e) => e,
-        },
-        BridgeRequest::Set { id, dps, cid } => match ctx.get_connected_device(&id).await {
-            Ok(dev) => {
-                let _ = dev
-                    .request(CommandType::Control, Some(Value::Object(dps)), cid)
-                    .await;
-                ApiResponse::ok("set", id)
+
+            for target_id in &targets {
+                if let Ok(dev) = ctx.get_connected_device(target_id).await {
+                    let _ = dev.request(CommandType::DpQuery, None, cid.clone()).await;
+                }
             }
-            Err(e) => e,
-        },
-        BridgeRequest::Request { id, cmd, data, cid } => {
+            ApiResponse::ok("get", targets.join(","))
+        }
+        BridgeRequest::Set { id, name, dps, cid } => {
+            let targets = ctx
+                .find_device_ids(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
+                .await;
+            if targets.is_empty() {
+                return ApiResponse::error("No matching devices found");
+            }
+
+            for target_id in &targets {
+                if let Ok(dev) = ctx.get_connected_device(target_id).await {
+                    let _ = dev
+                        .request(
+                            CommandType::Control,
+                            Some(Value::Object(dps.clone())),
+                            cid.clone(),
+                        )
+                        .await;
+                }
+            }
+            ApiResponse::ok("set", targets.join(","))
+        }
+        BridgeRequest::Request {
+            id,
+            name,
+            cmd,
+            data,
+            cid,
+        } => {
             let Some(command) = CommandType::from_u32(cmd) else {
                 return ApiResponse::error(format!("Invalid CommandType {}", cmd));
             };
 
-            match ctx.get_connected_device(&id).await {
-                Ok(dev) => {
-                    let _ = dev.request(command, data, cid).await;
-                    ApiResponse::ok(format!("{:?}", command).to_lowercase(), id)
-                }
-                Err(e) => e,
+            let targets = ctx
+                .find_device_ids(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
+                .await;
+            if targets.is_empty() {
+                return ApiResponse::error("No matching devices found");
             }
+
+            for target_id in &targets {
+                if let Ok(dev) = ctx.get_connected_device(target_id).await {
+                    let _ = dev.request(command, data.clone(), cid.clone()).await;
+                }
+            }
+            ApiResponse::ok(format!("{:?}", command).to_lowercase(), targets.join(","))
+        }
+        BridgeRequest::SubDiscover { id, name } => {
+            let targets = ctx
+                .find_device_ids(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
+                .await;
+            if targets.is_empty() {
+                return ApiResponse::error("No matching devices found");
+            }
+
+            for target_id in &targets {
+                if let Ok(dev) = ctx.get_connected_device(target_id).await {
+                    let _ = dev.sub_discover().await;
+                }
+            }
+            ApiResponse::ok("sub_discover", targets.join(","))
         }
         BridgeRequest::Scan => {
             let ctx_scan = ctx.clone();
