@@ -2,7 +2,7 @@ use clap::Parser;
 use futures_util::StreamExt;
 use log::{error, info};
 use rustuya::protocol::CommandType;
-use rustuya::{Manager, Scanner};
+use rustuya::{Device, DeviceBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -22,7 +22,6 @@ const CHANNEL_CAPACITY: usize = 100;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum BridgeRequest {
-    #[serde(rename = "manager/add")]
     Add {
         id: String,
         key: String,
@@ -31,28 +30,30 @@ enum BridgeRequest {
         #[serde(default = "default_auto")]
         version: String,
     },
-    #[serde(rename = "manager/remove")]
-    Remove { id: String },
-    #[serde(rename = "manager/clear")]
+    Remove {
+        id: String,
+    },
     Clear,
-    #[serde(rename = "manager/status")]
+    #[serde(rename = "status")]
     Status,
-    #[serde(rename = "device/status")]
-    DeviceStatus { id: String, cid: Option<String> },
-    #[serde(rename = "device/set_dps")]
-    SetDps {
+    #[serde(rename = "get")]
+    Get {
+        id: String,
+        cid: Option<String>,
+    },
+    #[serde(rename = "set")]
+    Set {
         id: String,
         dps: serde_json::Map<String, Value>,
         cid: Option<String>,
     },
-    #[serde(rename = "device/request")]
-    DeviceRequest {
+    #[serde(rename = "request")]
+    Request {
         id: String,
         cmd: u32,
         data: Option<Value>,
         cid: Option<String>,
     },
-    #[serde(rename = "scan")]
     Scan,
 }
 
@@ -143,11 +144,12 @@ struct DeviceConfig {
 }
 
 struct BridgeContext {
-    manager: Manager,
     event_tx: mpsc::Sender<ZmqMessage>,
     state_file: String,
-    devices: RwLock<HashMap<String, DeviceConfig>>,
+    configs: RwLock<HashMap<String, DeviceConfig>>,
+    instances: RwLock<HashMap<String, Device>>,
     save_tx: mpsc::Sender<()>,
+    refresh_tx: mpsc::Sender<()>,
 }
 
 // --- Implementation ---
@@ -155,8 +157,8 @@ impl BridgeContext {
     /// Atomically saves the current device state to a JSON file.
     async fn save_state(&self) {
         let json = {
-            let devices = self.devices.read().await;
-            match serde_json::to_string_pretty(&*devices) {
+            let configs = self.configs.read().await;
+            match serde_json::to_string_pretty(&*configs) {
                 Ok(j) => j,
                 Err(e) => {
                     error!("Failed to serialize devices: {}", e);
@@ -194,6 +196,11 @@ impl BridgeContext {
         let _ = self.save_tx.try_send(());
     }
 
+    /// Triggers a refresh of the unified listener.
+    fn request_refresh(&self) {
+        let _ = self.refresh_tx.try_send(());
+    }
+
     /// Publishes an event to the ZMQ PUB socket.
     async fn publish_event(&self, topic: String, payload: String) {
         let mut msg = ZmqMessage::from(topic);
@@ -206,19 +213,21 @@ impl BridgeContext {
     // --- Atomic State Operations ---
 
     async fn add_device(&self, config: DeviceConfig) -> Result<ApiResponse, String> {
-        let mut devices = self.devices.write().await;
+        let mut configs = self.configs.write().await;
+        let mut instances = self.instances.write().await;
 
-        let dev = self
-            .manager
-            .add(&config.id, &config.ip, &config.key, config.version.as_str())
-            .await
-            .map_err(|e| format!("Manager error: {:?}", e))?;
+        let dev = DeviceBuilder::new(&config.id, config.key.as_bytes().to_vec())
+            .address(&config.ip)
+            .version(config.version.as_str())
+            .nowait(true)
+            .run();
 
-        dev.set_nowait(true);
+        let is_new = !configs.contains_key(&config.id);
+        configs.insert(config.id.clone(), config.clone());
+        instances.insert(config.id.clone(), dev);
 
-        let is_new = !devices.contains_key(&config.id);
-        devices.insert(config.id.clone(), config.clone());
         self.request_save();
+        self.request_refresh();
 
         Ok(ApiResponse::ok(
             if is_new { "added" } else { "modified" },
@@ -227,51 +236,63 @@ impl BridgeContext {
     }
 
     async fn remove_device(&self, id: &str) -> Result<ApiResponse, String> {
-        let mut devices = self.devices.write().await;
-        self.manager.remove(id).await;
-        devices.remove(id);
+        let mut configs = self.configs.write().await;
+        let mut instances = self.instances.write().await;
+
+        if let Some(dev) = instances.remove(id) {
+            dev.stop().await;
+        }
+        configs.remove(id);
+
         self.request_save();
+        self.request_refresh();
         Ok(ApiResponse::ok("removed", id))
     }
 
     async fn clear_devices(&self) -> Result<ApiResponse, String> {
-        let mut devices = self.devices.write().await;
-        self.manager.clear().await;
-        devices.clear();
+        let mut configs = self.configs.write().await;
+        let mut instances = self.instances.write().await;
+
+        for dev in instances.values() {
+            dev.stop().await;
+        }
+        instances.clear();
+        configs.clear();
+
         self.request_save();
-        Ok(ApiResponse::ok("cleared", "manager"))
+        self.request_refresh();
+        Ok(ApiResponse::ok("cleared", "bridge"))
     }
 
     /// Helper to get a connected device or return an error response.
-    async fn get_connected_device(&self, id: &str) -> Result<rustuya::Device, ApiResponse> {
-        let dev = self
-            .manager
+    async fn get_connected_device(&self, id: &str) -> Result<Device, ApiResponse> {
+        let instances = self.instances.read().await;
+        let dev = instances
             .get(id)
-            .await
             .ok_or_else(|| ApiResponse::error("Device not found"))?;
 
         if !dev.is_connected() {
             return Err(ApiResponse::error("Device is offline"));
         }
 
-        Ok(dev)
+        Ok(dev.clone())
     }
 
     /// Generates a status report of all registered devices.
-    async fn get_manager_status(&self) -> ApiResponse {
-        let devices_config = self.devices.read().await;
-        let connection_states = self.manager.list().await;
+    async fn get_bridge_status(&self) -> ApiResponse {
+        let configs = self.configs.read().await;
+        let instances = self.instances.read().await;
 
         let mut devices_with_status = serde_json::Map::new();
-        for (id, config) in devices_config.iter() {
+        for (id, config) in configs.iter() {
             let mut device_val = serde_json::to_value(config).unwrap_or(Value::Null);
             if let Some(obj) = device_val.as_object_mut() {
-                if let Some(info) = connection_states.iter().find(|d| d.id == *id) {
-                    obj.insert("connected".to_string(), Value::Bool(info.is_connected));
-                    obj.insert("ip".to_string(), Value::String(info.address.to_string()));
+                if let Some(dev) = instances.get(id) {
+                    obj.insert("connected".to_string(), Value::Bool(dev.is_connected()));
+                    obj.insert("ip".to_string(), Value::String(dev.address()));
                     obj.insert(
                         "version".to_string(),
-                        Value::String(info.version.to_string()),
+                        Value::String(dev.version().to_string()),
                     );
                 } else {
                     obj.insert("connected".to_string(), Value::Bool(false));
@@ -280,7 +301,7 @@ impl BridgeContext {
             devices_with_status.insert(id.clone(), device_val);
         }
 
-        ApiResponse::base(Status::Ok)
+        ApiResponse::ok("status", "bridge")
             .with_extra("version", env!("CARGO_PKG_VERSION").into())
             .with_extra("devices", Value::Object(devices_with_status))
     }
@@ -326,28 +347,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, mut event_rx) = mpsc::channel::<ZmqMessage>(CHANNEL_CAPACITY);
     let (save_tx, mut save_rx) = mpsc::channel(1);
 
-    // 2. Load State and Initialize Manager
-    let loaded_devices = load_state(&cli.state_file).await;
-    let manager = Manager::new();
+    // 2. Load State and Initialize Devices
+    let loaded_configs = load_state(&cli.state_file).await;
+    let mut instances = HashMap::new();
 
-    // Create listener BEFORE adding devices to capture initial events (connection, etc.)
-    let rustuya_rx = manager.listener();
-
-    for config in loaded_devices.values() {
-        if let Ok(dev) = manager
-            .add(&config.id, &config.ip, &config.key, config.version.as_str())
-            .await
-        {
-            dev.set_nowait(true);
-        }
+    for config in loaded_configs.values() {
+        let dev = DeviceBuilder::new(&config.id, config.key.as_bytes().to_vec())
+            .address(&config.ip)
+            .version(config.version.as_str())
+            .nowait(true)
+            .run();
+        instances.insert(config.id.clone(), dev);
     }
 
+    let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
+
     let ctx = Arc::new(BridgeContext {
-        manager,
         event_tx,
         state_file: cli.state_file,
-        devices: RwLock::new(loaded_devices),
+        configs: RwLock::new(loaded_configs),
+        instances: RwLock::new(instances),
         save_tx,
+        refresh_tx,
     });
 
     // 3. Spawn Background Tasks
@@ -380,15 +401,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 3.3 Rustuya Manager Event Listener
+    // 3.3 Unified Device Event Listener
     let ctx_listener = ctx.clone();
     tokio::spawn(async move {
-        tokio::pin!(rustuya_rx);
-        while let Some(event) = rustuya_rx.next().await {
-            if let Some(payload) = event.message.payload_as_string() {
-                ctx_listener
-                    .publish_event(format!("device/{}", event.device_id), payload)
-                    .await;
+        loop {
+            let devices: Vec<Device> = ctx_listener
+                .instances
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect();
+
+            if devices.is_empty() {
+                // Wait for devices to be added
+                if refresh_rx.recv().await.is_none() {
+                    break;
+                }
+                continue;
+            }
+
+            let mut rustuya_rx = rustuya::device::unified_listener(devices);
+
+            loop {
+                tokio::select! {
+                    Some(event_res) = rustuya_rx.next() => {
+                        match event_res {
+                            Ok(event) => {
+                                if let Some(payload) = event.message.payload_as_string() {
+                                    ctx_listener
+                                        .publish_event(event.device_id.clone(), payload)
+                                        .await;
+                                }
+                            }
+                            Err(e) => error!("Rustuya event error: {}", e),
+                        }
+                    }
+                    _ = refresh_rx.recv() => {
+                        // Restart listener with updated device list
+                        break;
+                    }
+                }
             }
         }
     });
@@ -474,31 +527,32 @@ async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiRespo
             .await
             .unwrap_or_else(ApiResponse::error),
         BridgeRequest::Clear => ctx.clear_devices().await.unwrap_or_else(ApiResponse::error),
-        BridgeRequest::Status => ctx.get_manager_status().await,
-        BridgeRequest::DeviceStatus { id, cid } => match ctx.get_connected_device(&id).await {
+        BridgeRequest::Status => ctx.get_bridge_status().await,
+        BridgeRequest::Get { id, cid } => match ctx.get_connected_device(&id).await {
             Ok(dev) => {
-                dev.request(CommandType::DpQuery, None, cid).await;
-                ApiResponse::ok("device/status", id)
+                let _ = dev.request(CommandType::DpQuery, None, cid).await;
+                ApiResponse::ok("get", id)
             }
             Err(e) => e,
         },
-        BridgeRequest::SetDps { id, dps, cid } => match ctx.get_connected_device(&id).await {
+        BridgeRequest::Set { id, dps, cid } => match ctx.get_connected_device(&id).await {
             Ok(dev) => {
-                dev.request(CommandType::Control, Some(Value::Object(dps)), cid)
+                let _ = dev
+                    .request(CommandType::Control, Some(Value::Object(dps)), cid)
                     .await;
-                ApiResponse::ok("device/set_dps", id)
+                ApiResponse::ok("set", id)
             }
             Err(e) => e,
         },
-        BridgeRequest::DeviceRequest { id, cmd, data, cid } => {
+        BridgeRequest::Request { id, cmd, data, cid } => {
             let Some(command) = CommandType::from_u32(cmd) else {
                 return ApiResponse::error(format!("Invalid CommandType {}", cmd));
             };
 
             match ctx.get_connected_device(&id).await {
                 Ok(dev) => {
-                    dev.request(command, data, cid).await;
-                    ApiResponse::ok(format!("device/{:?}", command).to_lowercase(), id)
+                    let _ = dev.request(command, data, cid).await;
+                    ApiResponse::ok(format!("{:?}", command).to_lowercase(), id)
                 }
                 Err(e) => e,
             }
@@ -506,8 +560,7 @@ async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiRespo
         BridgeRequest::Scan => {
             let ctx_scan = ctx.clone();
             tokio::spawn(async move {
-                let scanner = Scanner::new().with_timeout(Duration::from_secs(18));
-                let stream = scanner.scan_stream();
+                let stream = rustuya::Scanner::scan_stream();
                 tokio::pin!(stream);
 
                 while let Some(dev) = stream.next().await {
@@ -515,10 +568,11 @@ async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiRespo
                     payload.insert("id".to_string(), Value::String(dev.id.clone()));
                     payload.insert("ip".to_string(), Value::String(dev.ip.clone()));
                     if let Some(v) = &dev.version {
-                        payload.insert("version".to_string(), Value::String(v.to_string()));
+                        payload
+                            .insert("version".to_string(), Value::String(v.as_str().to_string()));
                     }
                     if let Some(pk) = &dev.product_key {
-                        payload.insert("product_key".to_string(), Value::String(pk.to_string()));
+                        payload.insert("product_key".to_string(), Value::String(pk.clone()));
                     }
 
                     ctx_scan

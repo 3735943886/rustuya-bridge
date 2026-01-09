@@ -50,9 +50,9 @@ def send_command(payload):
     socket.send_json(payload)
     return socket.recv_json()
 
-print(send_command({"action": "manager/add", "id": "DEVICE_ID", "key": "DEVICE_KEY"}))
-print(send_command({"action": "manager/status"}))
-print(send_command({"action": "device/status", "id": "DEVICE_ID"}))
+print(send_command({"action": "add", "id": "DEVICE_ID", "key": "DEVICE_KEY", "ip": "YOUR_DEVICE_IP", "version": "3.3"}))
+print(send_command({"action": "status"}))
+print(send_command({"action": "get", "id": "DEVICE_ID"}))
 ```
 
 ### Listening Events
@@ -102,10 +102,10 @@ async def main():
     asyncio.create_task(listen_commands())
 
     # Send actions without blocking
-    await cmd_socket.send_json({"action": "manager/add", "id": "DEVICE_ID", "key": "DEVICE_KEY"})
-    await cmd_socket.send_json({"action": "manager/status"})
-    await cmd_socket.send_json({"action": "device/status", "id": "DEVICE_ID"})
-    await cmd_socket.send_json({"action": "device/set_dps", "id": "DEVICE_ID", "dps": {"1": True}})
+    await cmd_socket.send_json({"action": "add", "id": "DEVICE_ID", "key": "DEVICE_KEY", "ip": "YOUR_DEVICE_IP", "version": "3.3"})
+    await cmd_socket.send_json({"action": "status"})
+    await cmd_socket.send_json({"action": "get", "id": "DEVICE_ID"})
+    await cmd_socket.send_json({"action": "set", "id": "DEVICE_ID", "dps": {"1": True}})
 
     # Wait for events/responses
     await asyncio.sleep(1)
@@ -115,12 +115,12 @@ if __name__ == "__main__":
 ```
 
 ## API Summary
-- `manager/status`: List devices and connection status.
-- `manager/add`: Add or modify a device configuration.
-- `manager/remove`: Remove a device.
-- `manager/clear`: Reset all devices from the manager.
-- `device/status`: Query DP status.
-- `device/set_dps`: Set DP values (requires `dps` object).
-- `device/request`: Send raw command (requires `cmd`, `data`).
+- `status`: List all devices and their connection status.
+- `add`: Add or update a device configuration.
+- `remove`: Remove a device by ID.
+- `clear`: Remove all devices.
+- `get`: Query current DP status of a device.
+- `set`: Set DP values (requires `dps` object).
+- `request`: Send a raw command (requires `cmd` byte and `data` object).
 
-> **Note**: Add `"cid": "SUB_DEVICE_ID"` to any `device/` action for sub-device control.
+> **Note**: Add `"cid": "SUB_DEVICE_ID"` to `get`, `set`, or `request` for sub-device control.
