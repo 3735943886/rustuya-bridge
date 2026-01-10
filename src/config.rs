@@ -1,0 +1,180 @@
+use anyhow::{Context as _, Result};
+use clap::Parser;
+use log::{error, info};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+pub const DEFAULT_STATE_FILE: &str = "rustuya.json";
+pub const DEFAULT_SAVE_DEBOUNCE_SECS: u64 = 30;
+
+#[derive(Parser, Debug, Serialize, Deserialize, Clone)]
+#[command(author, version, about, long_about = None)]
+pub struct Cli {
+    /// Config file path (JSON)
+    #[arg(short = 'C', long, env = "CONFIG")]
+    pub config: Option<String>,
+
+    /// MQTT Broker address (e.g., tcp://localhost:1883)
+    #[arg(short = 'm', long, env = "MQTT_BROKER")]
+    pub mqtt_broker: Option<String>,
+
+    /// MQTT Root topic (used as prefix for command/event topics)
+    #[arg(long, env = "MQTT_ROOT_TOPIC")]
+    pub mqtt_root_topic: Option<String>,
+
+    /// MQTT Command topic (defaults to {root}/command)
+    #[arg(long, env = "MQTT_COMMAND_TOPIC")]
+    pub mqtt_command_topic: Option<String>,
+
+    /// MQTT Event topic (defaults to {root_topic}/event)
+    #[arg(long, env = "MQTT_EVENT_TOPIC")]
+    pub mqtt_event_topic: Option<String>,
+
+    /// MQTT Client ID
+    #[arg(long, env = "MQTT_CLIENT_ID")]
+    pub mqtt_client_id: Option<String>,
+
+    /// MQTT Topic template for device events (active push)
+    #[arg(long, env = "MQTT_TOPIC_TEMPLATE")]
+    pub mqtt_topic_template: Option<String>,
+
+    /// MQTT Topic template for command responses (passive)
+    #[arg(long, env = "MQTT_PASSIVE_TOPIC_TEMPLATE")]
+    pub mqtt_passive_topic_template: Option<String>,
+
+    /// MQTT Topic template for messages/errors
+    #[arg(long, env = "MQTT_MESSAGE_TOPIC_TEMPLATE")]
+    pub mqtt_message_topic_template: Option<String>,
+
+    /// MQTT Payload template for device events (e.g. "{\"val\": {value}}")
+    #[arg(long, env = "MQTT_PAYLOAD_TEMPLATE")]
+    pub mqtt_payload_template: Option<String>,
+
+    /// State file path to persist registered devices
+    #[arg(short = 's', long, env = "STATE_FILE")]
+    pub state_file: Option<String>,
+
+    /// Seconds to wait before saving state file (debounce)
+    #[arg(long, env = "SAVE_DEBOUNCE_SECS")]
+    pub save_debounce_secs: Option<u64>,
+}
+
+impl Cli {
+    pub async fn load() -> Result<Self> {
+        let mut cli = Self::parse();
+
+        if let Some(config_path) = cli.config.clone() {
+            let content = tokio::fs::read_to_string(&config_path)
+                .await
+                .with_context(|| format!("Failed to read config file: {}", config_path))?;
+            let file_cli: Cli = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse config file: {}", config_path))?;
+            cli.merge(file_cli);
+            info!("Merged configuration from {}", config_path);
+        }
+
+        Ok(cli)
+    }
+
+    fn merge(&mut self, other: Cli) {
+        if self.mqtt_broker.is_none() {
+            self.mqtt_broker = other.mqtt_broker;
+        }
+        if self.mqtt_root_topic.is_none() {
+            self.mqtt_root_topic = other.mqtt_root_topic;
+        }
+        if self.mqtt_command_topic.is_none() {
+            self.mqtt_command_topic = other.mqtt_command_topic;
+        }
+        if self.mqtt_event_topic.is_none() {
+            self.mqtt_event_topic = other.mqtt_event_topic;
+        }
+        if self.mqtt_client_id.is_none() {
+            self.mqtt_client_id = other.mqtt_client_id;
+        }
+        if self.mqtt_topic_template.is_none() {
+            self.mqtt_topic_template = other.mqtt_topic_template;
+        }
+        if self.mqtt_passive_topic_template.is_none() {
+            self.mqtt_passive_topic_template = other.mqtt_passive_topic_template;
+        }
+        if self.mqtt_message_topic_template.is_none() {
+            self.mqtt_message_topic_template = other.mqtt_message_topic_template;
+        }
+        if self.mqtt_payload_template.is_none() {
+            self.mqtt_payload_template = other.mqtt_payload_template;
+        }
+        if self.state_file.is_none() {
+            self.state_file = other.state_file;
+        }
+        if self.save_debounce_secs.is_none() {
+            self.save_debounce_secs = other.save_debounce_secs;
+        }
+    }
+
+    pub fn get_mqtt_topics(&self) -> (String, String) {
+        let root_topic = self.mqtt_root_topic.as_deref().unwrap_or("rustuya");
+        let mqtt_command_topic = self
+            .mqtt_command_topic
+            .as_deref()
+            .map(|t| t.replace("{root}", root_topic))
+            .unwrap_or_else(|| format!("{}/command", root_topic));
+        let mqtt_event_topic = self
+            .mqtt_event_topic
+            .as_deref()
+            .map(|t| t.replace("{root}", root_topic))
+            .unwrap_or_else(|| format!("{}/event", root_topic));
+        (mqtt_command_topic, mqtt_event_topic)
+    }
+
+    pub fn get_state_file(&self) -> String {
+        self.state_file
+            .as_deref()
+            .unwrap_or(DEFAULT_STATE_FILE)
+            .to_string()
+    }
+
+    pub fn get_save_debounce_secs(&self) -> u64 {
+        self.save_debounce_secs
+            .unwrap_or(DEFAULT_SAVE_DEBOUNCE_SECS)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceConfig {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub ip: String,
+    pub key: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+}
+
+pub async fn load_state(path: &str) -> HashMap<String, DeviceConfig> {
+    let path_obj = Path::new(path);
+    if !path_obj.exists() {
+        return HashMap::new();
+    }
+
+    match tokio::fs::read_to_string(path_obj).await {
+        Ok(content) => match serde_json::from_str::<HashMap<String, DeviceConfig>>(&content) {
+            Ok(devices) => {
+                info!("Loaded {} devices from {:?}", devices.len(), path);
+                devices
+            }
+            Err(e) => {
+                error!("Failed to parse state file {:?}: {}", path, e);
+                HashMap::new()
+            }
+        },
+        Err(e) => {
+            error!("Failed to read state file {:?}: {}", path, e);
+            HashMap::new()
+        }
+    }
+}

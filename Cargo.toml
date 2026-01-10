@@ -13,8 +13,12 @@ rustuya = { version = "0.2.0", path = "../rustuya" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
-zeromq = "0.4"
+rumqttc = "0.24"
 bytes = "1.0"
+regex = "1.11"
+anyhow = "1.0"
+thiserror = "2.0"
+url = "2.5"
 
 [profile.release]
 opt-level = 3
