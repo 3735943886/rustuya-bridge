@@ -4,7 +4,7 @@ use log::{error, info};
 use regex::Regex;
 use rustuya::{Device, DeviceBuilder};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,11 +14,21 @@ use crate::config::{Cli, DeviceConfig, load_state};
 use crate::error::BridgeError;
 use crate::types::{ApiResponse, BridgeRequest};
 
-pub const CHANNEL_CAPACITY: usize = 100;
+pub const MQTT_CHANNEL_CAPACITY: usize = 100;
+pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
+pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
+
+#[derive(Debug, Clone)]
+pub struct MqttMessage {
+    pub topic: String,
+    pub payload: String,
+    pub retain: bool,
+}
 
 pub struct BridgeContext {
-    pub mqtt_tx: Option<mpsc::Sender<(String, String)>>, // (topic, payload)
+    pub mqtt_tx: Option<mpsc::Sender<MqttMessage>>,
     pub mqtt_event_topic: String,
+    pub mqtt_retain: bool,
     pub mqtt_topic_template: Option<String>,
     pub mqtt_passive_topic_template: Option<String>,
     pub mqtt_message_topic_template: Option<String>,
@@ -31,6 +41,8 @@ pub struct BridgeContext {
     pub cid_map: RwLock<HashMap<(String, String), String>>,
     /// Mapping from name to device IDs
     pub name_map: RwLock<HashMap<String, Vec<String>>>,
+    /// Published topics per device (for clearing retained messages)
+    pub published_topics: RwLock<HashMap<String, HashSet<String>>>,
     pub save_tx: mpsc::Sender<()>,
     pub refresh_tx: mpsc::Sender<()>,
 }
@@ -78,13 +90,14 @@ impl BridgeContext {
         cli: &Cli,
     ) -> (
         Arc<Self>,
-        mpsc::Receiver<(String, String)>,
+        mpsc::Receiver<MqttMessage>,
         mpsc::Receiver<()>,
         mpsc::Receiver<()>,
     ) {
         let (_mqtt_command_topic, mqtt_event_topic) = cli.get_mqtt_topics();
         let state_file = cli.get_state_file();
         let save_debounce_secs = cli.get_save_debounce_secs();
+        let mqtt_retain = cli.get_mqtt_retain();
 
         let initial_configs = load_state(&state_file).await;
         let mut initial_instances = HashMap::new();
@@ -114,7 +127,7 @@ impl BridgeContext {
         }
 
         let (mqtt_tx_sender, mqtt_tx_receiver) =
-            mpsc::channel::<(String, String)>(CHANNEL_CAPACITY);
+            mpsc::channel::<MqttMessage>(MQTT_CHANNEL_CAPACITY);
         let (save_tx, save_rx) = mpsc::channel::<()>(1);
         let (refresh_tx, refresh_rx) = mpsc::channel::<()>(1);
 
@@ -125,6 +138,7 @@ impl BridgeContext {
                 None
             },
             mqtt_event_topic,
+            mqtt_retain,
             mqtt_topic_template: cli.mqtt_topic_template.clone(),
             mqtt_passive_topic_template: cli.mqtt_passive_topic_template.clone(),
             mqtt_message_topic_template: cli.mqtt_message_topic_template.clone(),
@@ -135,6 +149,7 @@ impl BridgeContext {
             instances: RwLock::new(initial_instances),
             cid_map: RwLock::new(initial_cid_map),
             name_map: RwLock::new(initial_name_map),
+            published_topics: RwLock::new(HashMap::new()),
             save_tx,
             refresh_tx,
         });
@@ -224,7 +239,7 @@ impl BridgeContext {
     pub async fn spawn_mqtt_task(
         self: Arc<Self>,
         cli: &Cli,
-        mut mqtt_tx_receiver: mpsc::Receiver<(String, String)>,
+        mut mqtt_tx_receiver: mpsc::Receiver<MqttMessage>,
     ) -> Result<()> {
         let broker_url = match &cli.mqtt_broker {
             Some(url) => url,
@@ -233,28 +248,35 @@ impl BridgeContext {
 
         let (mqtt_command_topic, _) = cli.get_mqtt_topics();
         let client_id = cli.mqtt_client_id.as_deref().unwrap_or("rustuya-bridge");
-        let mqtt_options = if broker_url.starts_with("mqtt://") || broker_url.starts_with("tcp://")
-        {
-            let url = url::Url::parse(broker_url)?;
-            let host = url.host_str().unwrap_or("localhost");
-            let port = url.port().unwrap_or(1883);
-            rumqttc::MqttOptions::new(client_id, host, port)
-        } else {
-            anyhow::bail!("Invalid broker URL: {}", broker_url);
-        };
+        let mut mqtt_options =
+            if broker_url.starts_with("mqtt://") || broker_url.starts_with("tcp://") {
+                let url = url::Url::parse(broker_url)?;
+                let host = url.host_str().unwrap_or("localhost");
+                let port = url.port().unwrap_or(1883);
+                rumqttc::MqttOptions::new(client_id, host, port)
+            } else {
+                anyhow::bail!("Invalid broker URL: {}", broker_url);
+            };
+        mqtt_options.set_keep_alive(Duration::from_secs(5));
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
         let sub_topic = tpl_to_wildcard(&mqtt_command_topic);
-        client
-            .subscribe(&sub_topic, rumqttc::QoS::AtLeastOnce)
-            .await?;
-        info!("Subscribed to: {}", sub_topic);
 
         tokio::spawn(async move {
+            let mut retry_delay = INITIAL_RETRY_DELAY_SECS;
             loop {
                 tokio::select! {
                     notification = eventloop.poll() => {
                         match notification {
+                            Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
+                                info!("Connected to MQTT broker");
+                                retry_delay = INITIAL_RETRY_DELAY_SECS; // Reset on success
+                                if let Err(e) = client.subscribe(&sub_topic, rumqttc::QoS::AtLeastOnce).await {
+                                    error!("Initial subscription failed: {}", e);
+                                } else {
+                                    info!("Subscribed to: {}", sub_topic);
+                                }
+                            }
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
                                 let topic = p.topic;
                                 let payload = String::from_utf8_lossy(&p.payload).to_string();
@@ -267,14 +289,15 @@ impl BridgeContext {
                                 }
                             }
                             Err(e) => {
-                                error!("MQTT Error: {}", e);
-                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                error!("MQTT Error: {}. Retrying in {}s...", e, retry_delay);
+                                tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+                                retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY_SECS);
                             }
                             _ => {}
                         }
                     }
-                    Some((topic, payload)) = mqtt_tx_receiver.recv() => {
-                        if let Err(e) = client.publish(topic, rumqttc::QoS::AtLeastOnce, false, payload).await {
+                    Some(msg) = mqtt_tx_receiver.recv() => {
+                        if let Err(e) = client.publish(msg.topic, rumqttc::QoS::AtLeastOnce, msg.retain, msg.payload).await {
                             error!("Publish failed: {}", e);
                         }
                     }
@@ -406,6 +429,11 @@ impl BridgeContext {
         let payload_str = payload_obj.to_string();
 
         if let Some(tx) = &self.mqtt_tx {
+            // Check if device still exists before publishing to avoid race conditions during removal
+            if !self.configs.read().await.contains_key(&id) {
+                return;
+            }
+
             let mut templates = Vec::new();
 
             // Always publish to default event topic
@@ -448,7 +476,18 @@ impl BridgeContext {
             }
 
             for (topic, payload) in templates {
-                let _ = tx.send((topic, payload)).await;
+                if self.mqtt_retain {
+                    let mut topics = self.published_topics.write().await;
+                    topics.entry(id.clone()).or_default().insert(topic.clone());
+                }
+
+                let _ = tx
+                    .send(MqttMessage {
+                        topic,
+                        payload,
+                        retain: self.mqtt_retain,
+                    })
+                    .await;
             }
         }
     }
@@ -463,7 +502,31 @@ impl BridgeContext {
             } else {
                 format!("{}/scanner", self.mqtt_event_topic.replace("/event", ""))
             };
-            let _ = tx.send((topic, payload.to_string())).await;
+            let _ = tx
+                .send(MqttMessage {
+                    topic: topic.clone(),
+                    payload: payload.to_string(),
+                    retain: false, // Scanner events usually don't need retain
+                })
+                .await;
+        }
+    }
+
+    /// Clears all retained messages for a device
+    pub async fn clear_retained_messages(&self, id: &str) {
+        if let Some(tx) = &self.mqtt_tx {
+            let mut published = self.published_topics.write().await;
+            if let Some(topics) = published.remove(id) {
+                for topic in topics {
+                    let _ = tx
+                        .send(MqttMessage {
+                            topic,
+                            payload: "".to_string(), // Empty payload clears retain
+                            retain: true,
+                        })
+                        .await;
+                }
+            }
         }
     }
 
@@ -568,6 +631,8 @@ impl BridgeContext {
                 }
             }
             instances.remove(target_id);
+            // Clear retained messages AFTER removing from configs to ensure no new events are published
+            self.clear_retained_messages(target_id).await;
         }
 
         self.request_save();
@@ -582,10 +647,17 @@ impl BridgeContext {
         let mut cid_map = self.cid_map.write().await;
         let mut name_map = self.name_map.write().await;
 
+        let ids: Vec<String> = configs.keys().cloned().collect();
+
         configs.clear();
         instances.clear();
         cid_map.clear();
         name_map.clear();
+
+        // Clear all retained messages after clearing configs
+        for id in ids {
+            self.clear_retained_messages(&id).await;
+        }
 
         self.request_save();
         self.request_refresh();

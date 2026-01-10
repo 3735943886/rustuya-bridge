@@ -13,6 +13,9 @@ use log::info;
 async fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
+    // Maximize file descriptor limit for better performance
+    rustuya::runtime::maximize_fd_limit()?;
+
     let cli = Cli::load().await?;
     let (ctx, mqtt_tx_rx, save_rx, refresh_rx) = BridgeContext::new(&cli).await;
 

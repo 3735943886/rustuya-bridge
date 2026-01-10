@@ -51,6 +51,10 @@ pub struct Cli {
     #[arg(long, env = "MQTT_PAYLOAD_TEMPLATE")]
     pub mqtt_payload_template: Option<String>,
 
+    /// MQTT Retain flag for device status updates
+    #[arg(long, env = "MQTT_RETAIN")]
+    pub mqtt_retain: Option<bool>,
+
     /// State file path to persist registered devices
     #[arg(short = 's', long, env = "STATE_FILE")]
     pub state_file: Option<String>,
@@ -105,6 +109,9 @@ impl Cli {
         if self.mqtt_payload_template.is_none() {
             self.mqtt_payload_template = other.mqtt_payload_template;
         }
+        if self.mqtt_retain.is_none() {
+            self.mqtt_retain = other.mqtt_retain;
+        }
         if self.state_file.is_none() {
             self.state_file = other.state_file;
         }
@@ -138,6 +145,10 @@ impl Cli {
     pub fn get_save_debounce_secs(&self) -> u64 {
         self.save_debounce_secs
             .unwrap_or(DEFAULT_SAVE_DEBOUNCE_SECS)
+    }
+
+    pub fn get_mqtt_retain(&self) -> bool {
+        self.mqtt_retain.unwrap_or(false)
     }
 }
 
