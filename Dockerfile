@@ -31,10 +31,8 @@ WORKDIR /app
 # Copy the binary from the builder stage
 COPY --from=builder /bin/rustuya-bridge /app/rustuya-bridge
 
-EXPOSE 37358 37359
-ENV ZMQ_COMMAND_ADDR="tcp://0.0.0.0:37358"
-ENV ZMQ_EVENT_ADDR="tcp://0.0.0.0:37359"
 ENV STATE_FILE="/data/rustuya.json"
+ENV CONFIG="/data/config.json"
 RUN mkdir /data
 
 ENTRYPOINT ["/app/rustuya-bridge"]
