@@ -37,6 +37,16 @@ struct TopicVars<'a> {
     dps_str: Option<&'a str>,
 }
 
+#[derive(Default)]
+pub struct BridgeState {
+    pub configs: HashMap<String, DeviceConfig>,
+    pub instances: HashMap<String, Device>,
+    /// Mapping from (parent_id, cid) to sub-device ID
+    pub cid_map: HashMap<(String, String), String>,
+    /// Mapping from name to device IDs
+    pub name_map: HashMap<String, Vec<String>>,
+}
+
 pub struct BridgeContext {
     pub mqtt_tx: Option<mpsc::Sender<MqttMessage>>,
     pub mqtt_event_topic: String,
@@ -47,12 +57,7 @@ pub struct BridgeContext {
     pub mqtt_scanner_topic: Option<String>,
     pub state_file: String,
     pub save_debounce_secs: u64,
-    pub configs: RwLock<HashMap<String, DeviceConfig>>,
-    pub instances: RwLock<HashMap<String, Device>>,
-    /// Mapping from (parent_id, cid) to sub-device ID
-    pub cid_map: RwLock<HashMap<(String, String), String>>,
-    /// Mapping from name to device IDs
-    pub name_map: RwLock<HashMap<String, Vec<String>>>,
+    pub state: RwLock<BridgeState>,
     /// Published topics per device (for clearing retained messages)
     pub published_topics: RwLock<HashMap<String, HashSet<String>>>,
     pub save_tx: mpsc::Sender<()>,
@@ -146,10 +151,12 @@ impl BridgeContext {
             mqtt_scanner_topic: cli.mqtt_scanner_topic.clone(),
             state_file: cli.get_state_file(),
             save_debounce_secs: cli.get_save_debounce_secs(),
-            configs: RwLock::new(initial_configs),
-            instances: RwLock::new(initial_instances),
-            cid_map: RwLock::new(initial_cid_map),
-            name_map: RwLock::new(initial_name_map),
+            state: RwLock::new(BridgeState {
+                configs: initial_configs,
+                instances: initial_instances,
+                cid_map: initial_cid_map,
+                name_map: initial_name_map,
+            }),
             published_topics: RwLock::new(HashMap::new()),
             save_tx,
             refresh_tx,
@@ -176,8 +183,8 @@ impl BridgeContext {
         tokio::spawn(async move {
             loop {
                 let instances = {
-                    let inst = self.instances.read().await;
-                    inst.values().cloned().collect::<Vec<_>>()
+                    let state = self.state.read().await;
+                    state.instances.values().cloned().collect::<Vec<_>>()
                 };
 
                 if instances.is_empty() {
@@ -196,7 +203,7 @@ impl BridgeContext {
                                 let payload_str = event.message.payload_as_string().unwrap();
                                 trace!("Raw event from {}: {}", event.device_id, payload_str);
                                 let payload: Value = serde_json::from_str(&payload_str).unwrap_or(Value::String(payload_str.clone()));
-                                let (target_id, name, cid) = self.resolve_event_target(&event.device_id, &payload).await;
+                                let (target_id, name, cid, exists) = self.resolve_event_target(&event.device_id, &payload).await;
 
                                 // Check for 'dps' at root or inside 'data' (for sub-devices/gateways)
                                 let payload_obj = payload.as_object();
@@ -226,7 +233,7 @@ impl BridgeContext {
                                     obj.insert("cid".to_string(), Value::String(c.clone()));
                                 }
 
-                                self.publish_device_event(target_id, name, cid, dps, is_passive).await;
+                                self.publish_device_event(target_id, name, cid, dps, is_passive, exists).await;
                             }
                         }
                         _ = refresh_rx.recv() => break, // Refresh listener on device changes
@@ -241,7 +248,7 @@ impl BridgeContext {
         &self,
         parent_id: &str,
         payload: &Value,
-    ) -> (String, Option<String>, Option<String>) {
+    ) -> (String, Option<String>, Option<String>, bool) {
         // Extract CID (sub-device) from payload
         let cid = payload
             .as_object()
@@ -256,12 +263,12 @@ impl BridgeContext {
             .and_then(|c| c.as_str())
             .map(|s| s.to_string());
 
-        let configs = self.configs.read().await;
-        let cid_map = self.cid_map.read().await;
+        let state = self.state.read().await;
 
         // Use sub-device info if CID is registered, else fall back to parent
         let target_id = if let Some(c) = &cid {
-            cid_map
+            state
+                .cid_map
                 .get(&(parent_id.to_string(), c.clone()))
                 .cloned()
                 .unwrap_or_else(|| parent_id.to_string())
@@ -269,9 +276,11 @@ impl BridgeContext {
             parent_id.to_string()
         };
 
-        let name = configs.get(&target_id).and_then(|c| c.name.clone());
+        let cfg = state.configs.get(&target_id);
+        let name = cfg.and_then(|c| c.name.clone());
+        let exists = cfg.is_some();
 
-        (target_id, name, cid)
+        (target_id, name, cid, exists)
     }
 
     /// Starts MQTT task for command processing and event publishing
@@ -457,8 +466,8 @@ impl BridgeContext {
     /// Atomically saves device configuration to state file
     pub async fn save_state(&self) -> Result<()> {
         let json = {
-            let configs = self.configs.read().await;
-            serde_json::to_string_pretty(&*configs)?
+            let state = self.state.read().await;
+            serde_json::to_string_pretty(&state.configs)?
         };
 
         let path = Path::new(&self.state_file);
@@ -496,21 +505,21 @@ impl BridgeContext {
         id: Option<Vec<String>>,
         name: Option<Vec<String>>,
     ) -> Vec<String> {
+        let state = self.state.read().await;
+
         // 1. Match by ID
         if let Some(ids) = id {
-            let configs = self.configs.read().await;
             return ids
                 .into_iter()
-                .filter(|id_val| configs.contains_key(id_val))
+                .filter(|id_val| state.configs.contains_key(id_val))
                 .collect();
         }
 
         // 2. Match by Name
         if let Some(names) = name {
-            let name_map = self.name_map.read().await;
             let mut results = Vec::new();
             for name_val in names {
-                if let Some(ids) = name_map.get(&name_val) {
+                if let Some(ids) = state.name_map.get(&name_val) {
                     results.extend(ids.clone());
                 }
             }
@@ -625,6 +634,7 @@ impl BridgeContext {
         cid: Option<String>,
         dps: Value,
         is_passive: bool,
+        exists: bool,
     ) {
         if dps.is_null() || dps.as_str().is_some_and(|s| s.is_empty()) {
             return;
@@ -634,7 +644,7 @@ impl BridgeContext {
 
         if let Some(tx) = &self.mqtt_tx {
             // Check if device still exists before publishing to avoid race conditions during removal
-            if !self.configs.read().await.contains_key(&id) {
+            if !exists {
                 return;
             }
 
@@ -649,12 +659,15 @@ impl BridgeContext {
                 return;
             }
 
-            for (topic, payload) in templates {
-                if self.mqtt_retain {
-                    let mut topics = self.published_topics.write().await;
-                    topics.entry(id.clone()).or_default().insert(topic.clone());
+            if self.mqtt_retain {
+                let mut topics = self.published_topics.write().await;
+                let device_topics = topics.entry(id.clone()).or_default();
+                for (topic, _) in &templates {
+                    device_topics.insert(topic.clone());
                 }
+            }
 
+            for (topic, payload) in templates {
                 let _ = tx
                     .send(MqttMessage {
                         topic,
@@ -880,25 +893,27 @@ impl BridgeContext {
         let name = cfg.name.clone();
 
         {
-            let mut configs = self.configs.write().await;
-            let mut instances = self.instances.write().await;
-            let mut cid_map = self.cid_map.write().await;
-            let mut name_map = self.name_map.write().await;
+            let mut state = self.state.write().await;
 
             // Clean up old mappings if device already exists
-            if let Some(old_cfg) = configs.get(&id) {
-                if let Some(old_name) = &old_cfg.name
-                    && let Some(ids) = name_map.get_mut(old_name)
+            let old_mapping = state
+                .configs
+                .get(&id)
+                .map(|cfg| (cfg.name.clone(), cfg.cid.clone(), cfg.parent_id.clone()));
+
+            if let Some((old_name, old_cid, old_parent)) = old_mapping {
+                if let Some(n) = old_name
+                    && let Some(ids) = state.name_map.get_mut(&n)
                 {
                     ids.retain(|x| x != &id);
                     if ids.is_empty() {
-                        name_map.remove(old_name);
+                        state.name_map.remove(&n);
                     }
                 }
-                if let Some(old_cid) = &old_cfg.cid
-                    && let Some(old_parent) = &old_cfg.parent_id
+                if let Some(cid) = old_cid
+                    && let Some(parent) = old_parent
                 {
-                    cid_map.remove(&(old_parent.clone(), old_cid.clone()));
+                    state.cid_map.remove(&(parent, cid));
                 }
             }
 
@@ -906,8 +921,10 @@ impl BridgeContext {
                 && let Some(parent_id) = &cfg.parent_id
             {
                 // Register as sub-device
-                cid_map.insert((parent_id.clone(), cid.clone()), id.clone());
-                instances.remove(&id);
+                state
+                    .cid_map
+                    .insert((parent_id.clone(), cid.clone()), id.clone());
+                state.instances.remove(&id);
             } else if let Some(key) = &cfg.key {
                 // Register as direct device
                 let dev = DeviceBuilder::new(&id, key.as_bytes().to_vec())
@@ -915,7 +932,7 @@ impl BridgeContext {
                     .version(cfg.version.as_deref().unwrap_or("Auto"))
                     .nowait(true)
                     .run();
-                instances.insert(id.clone(), dev);
+                state.instances.insert(id.clone(), dev);
             } else {
                 return Err(BridgeError::InvalidRequest(
                     "Device must have either (cid & parent_id) for sub-device or (key) for direct device"
@@ -923,9 +940,9 @@ impl BridgeContext {
                 ));
             }
 
-            configs.insert(id.clone(), cfg);
+            state.configs.insert(id.clone(), cfg);
             if let Some(n) = name {
-                name_map.entry(n).or_default().push(id.clone());
+                state.name_map.entry(n).or_default().push(id.clone());
             }
         }
 
@@ -945,8 +962,9 @@ impl BridgeContext {
 
         // Cascade removal to sub-devices
         {
-            let configs = self.configs.read().await;
-            let sub_targets: Vec<String> = configs
+            let state = self.state.read().await;
+            let sub_targets: Vec<String> = state
+                .configs
                 .iter()
                 .filter_map(|(sub_id, cfg)| {
                     cfg.parent_id
@@ -960,28 +978,25 @@ impl BridgeContext {
         targets.dedup();
 
         {
-            let mut configs = self.configs.write().await;
-            let mut instances = self.instances.write().await;
-            let mut cid_map = self.cid_map.write().await;
-            let mut name_map = self.name_map.write().await;
+            let mut state = self.state.write().await;
 
             for target_id in &targets {
-                if let Some(cfg) = configs.remove(target_id) {
+                if let Some(cfg) = state.configs.remove(target_id) {
                     if let Some(n) = cfg.name
-                        && let Some(ids) = name_map.get_mut(&n)
+                        && let Some(ids) = state.name_map.get_mut(&n)
                     {
                         ids.retain(|x| x != target_id);
                         if ids.is_empty() {
-                            name_map.remove(&n);
+                            state.name_map.remove(&n);
                         }
                     }
                     if let Some(cid) = cfg.cid
                         && let Some(parent_id) = cfg.parent_id
                     {
-                        cid_map.remove(&(parent_id, cid));
+                        state.cid_map.remove(&(parent_id, cid));
                     }
                 }
-                instances.remove(target_id);
+                state.instances.remove(target_id);
             }
         }
 
@@ -999,17 +1014,14 @@ impl BridgeContext {
     /// Clears all devices and configurations
     pub async fn clear_devices(&self) -> Result<ApiResponse, BridgeError> {
         let ids: Vec<String> = {
-            let mut configs = self.configs.write().await;
-            let mut instances = self.instances.write().await;
-            let mut cid_map = self.cid_map.write().await;
-            let mut name_map = self.name_map.write().await;
+            let mut state = self.state.write().await;
 
-            let ids = configs.keys().cloned().collect();
+            let ids = state.configs.keys().cloned().collect();
 
-            configs.clear();
-            instances.clear();
-            cid_map.clear();
-            name_map.clear();
+            state.configs.clear();
+            state.instances.clear();
+            state.cid_map.clear();
+            state.name_map.clear();
             ids
         };
 
@@ -1026,16 +1038,16 @@ impl BridgeContext {
 
     /// Returns current bridge status and registered devices
     pub async fn get_bridge_status(&self) -> ApiResponse {
-        let configs = self.configs.read().await;
-        let instances = self.instances.read().await;
+        let state = self.state.read().await;
 
-        let devices: Vec<Value> = configs
+        let devices: Vec<Value> = state
+            .configs
             .values()
             .map(|cfg| {
                 serde_json::to_value(cfg)
                     .map(|mut dev_val| {
                         if let Some(obj) = dev_val.as_object_mut() {
-                            let status = self.determine_device_status(cfg, &instances);
+                            let status = self.determine_device_status(cfg, &state.instances);
                             obj.insert("status".to_string(), Value::String(status));
                         }
                         dev_val
@@ -1091,25 +1103,23 @@ impl BridgeContext {
         if request_cid.is_some() {
             return request_cid;
         }
-        let configs = self.configs.read().await;
-        configs.get(id).and_then(|c| c.cid.clone())
+        let state = self.state.read().await;
+        state.configs.get(id).and_then(|c| c.cid.clone())
     }
 
     /// Gets a connected device instance, supporting sub-devices via parent
     pub async fn get_connected_device(&self, id: &str) -> Result<Device, BridgeError> {
-        // Lock configs first, then instances to maintain global order (configs -> instances)
-        let configs = self.configs.read().await;
-        let instances = self.instances.read().await;
+        let state = self.state.read().await;
 
-        if let Some(dev) = instances.get(id) {
+        if let Some(dev) = state.instances.get(id) {
             return Ok(dev.clone());
         }
 
         // Try lookup via parent for sub-devices
-        if let Some(cfg) = configs.get(id)
+        if let Some(cfg) = state.configs.get(id)
             && let Some(parent_id) = &cfg.parent_id
         {
-            if let Some(parent_dev) = instances.get(parent_id) {
+            if let Some(parent_dev) = state.instances.get(parent_id) {
                 return Ok(parent_dev.clone());
             } else {
                 return Err(BridgeError::DeviceNotFound(format!(
