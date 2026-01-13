@@ -275,7 +275,7 @@ impl BridgeContext {
     }
 
     /// Starts MQTT task for command processing and event publishing
-    pub async fn spawn_mqtt_task(
+    pub fn spawn_mqtt_task(
         self: Arc<Self>,
         cli: &Cli,
         mut mqtt_tx_receiver: mpsc::Receiver<MqttMessage>,
@@ -818,8 +818,12 @@ impl BridgeContext {
     /// Clears all retained messages for a device
     pub async fn clear_retained_messages(&self, id: &str) {
         if let Some(tx) = &self.mqtt_tx {
-            let mut published = self.published_topics.write().await;
-            if let Some(topics) = published.remove(id) {
+            let topics = {
+                let mut published = self.published_topics.write().await;
+                published.remove(id)
+            };
+
+            if let Some(topics) = topics {
                 for topic in topics {
                     let _ = tx
                         .send(MqttMessage {
@@ -978,9 +982,12 @@ impl BridgeContext {
                     }
                 }
                 instances.remove(target_id);
-                // Clear retained messages AFTER removing from configs to ensure no new events are published
-                self.clear_retained_messages(target_id).await;
             }
+        }
+
+        // Clear retained messages AFTER dropping all bridge locks
+        for target_id in &targets {
+            self.clear_retained_messages(target_id).await;
         }
 
         info!("Devices removed: {}", targets.join(", "));
@@ -1090,13 +1097,15 @@ impl BridgeContext {
 
     /// Gets a connected device instance, supporting sub-devices via parent
     pub async fn get_connected_device(&self, id: &str) -> Result<Device, BridgeError> {
+        // Lock configs first, then instances to maintain global order (configs -> instances)
+        let configs = self.configs.read().await;
         let instances = self.instances.read().await;
+
         if let Some(dev) = instances.get(id) {
             return Ok(dev.clone());
         }
 
         // Try lookup via parent for sub-devices
-        let configs = self.configs.read().await;
         if let Some(cfg) = configs.get(id)
             && let Some(parent_id) = &cfg.parent_id
         {

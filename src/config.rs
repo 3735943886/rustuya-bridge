@@ -62,6 +62,10 @@ pub struct Cli {
     /// Seconds to wait before saving state file (debounce)
     #[arg(long, env = "SAVE_DEBOUNCE_SECS")]
     pub save_debounce_secs: Option<u64>,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(short = 'l', long, env = "LOG_LEVEL")]
+    pub log_level: Option<String>,
 }
 
 impl Cli {
@@ -73,27 +77,24 @@ impl Cli {
             if path.exists() {
                 let content = tokio::fs::read_to_string(path)
                     .await
-                    .with_context(|| format!("Failed to read config file: {}", config_path))?;
-                let file_cli: Cli = serde_json::from_str(&content)
-                    .with_context(|| format!("Failed to parse config file: {}", config_path))?;
+                    .with_context(|| format!("Failed to read config file: {config_path}"))?;
+                let file_cli: Self = serde_json::from_str(&content)
+                    .with_context(|| format!("Failed to parse config file: {config_path}"))?;
                 cli.merge(file_cli);
-                info!("Merged configuration from {}", config_path);
+                info!("Merged configuration from {config_path}");
             } else if std::env::var("CONFIG").is_ok_and(|v| v == config_path) {
                 // If it came from ENV and doesn't exist, just skip it without error
-                info!(
-                    "Config file {} not found, skipping (using defaults/env)",
-                    config_path
-                );
+                info!("Config file {config_path} not found, skipping (using defaults/env)");
             } else {
                 // If it was explicitly provided via CLI, it should probably be an error
-                anyhow::bail!("Config file not found: {}", config_path);
+                anyhow::bail!("Config file not found: {config_path}");
             }
         }
 
         Ok(cli)
     }
 
-    fn merge(&mut self, other: Cli) {
+    fn merge(&mut self, other: Self) {
         let Self {
             config: _,
             mqtt_broker,
@@ -108,6 +109,7 @@ impl Cli {
             mqtt_retain,
             state_file,
             save_debounce_secs,
+            log_level,
         } = other;
 
         macro_rules! merge_field {
@@ -130,20 +132,19 @@ impl Cli {
         merge_field!(mqtt_retain);
         merge_field!(state_file);
         merge_field!(save_debounce_secs);
+        merge_field!(log_level);
     }
 
     pub fn get_mqtt_topics(&self) -> (String, String) {
         let root_topic = self.mqtt_root_topic.as_deref().unwrap_or("rustuya");
-        let mqtt_command_topic = self
-            .mqtt_command_topic
-            .as_deref()
-            .map(|t| t.replace("{root}", root_topic))
-            .unwrap_or_else(|| format!("{}/command", root_topic));
-        let mqtt_event_topic = self
-            .mqtt_event_topic
-            .as_deref()
-            .map(|t| t.replace("{root}", root_topic))
-            .unwrap_or_else(|| format!("{}/event/{{type}}", root_topic));
+        let mqtt_command_topic = self.mqtt_command_topic.as_deref().map_or_else(
+            || format!("{root_topic}/command"),
+            |t| t.replace("{root}", root_topic),
+        );
+        let mqtt_event_topic = self.mqtt_event_topic.as_deref().map_or_else(
+            || format!("{root_topic}/event/{{type}}"),
+            |t| t.replace("{root}", root_topic),
+        );
         (mqtt_command_topic, mqtt_event_topic)
     }
 
@@ -204,11 +205,9 @@ pub struct DeviceConfig {
     pub parent_id: Option<String>,
 }
 
+#[allow(clippy::ref_option)]
 fn is_empty_option(opt: &Option<String>) -> bool {
-    match opt {
-        Some(s) => s.is_empty() || s == "Auto",
-        None => true,
-    }
+    opt.as_ref().is_none_or(|s| s.is_empty() || s == "Auto")
 }
 
 pub async fn load_state(path: &str) -> HashMap<String, DeviceConfig> {
@@ -230,9 +229,9 @@ pub async fn load_state(path: &str) -> HashMap<String, DeviceConfig> {
 
         let devices = match format {
             StateFormat::Map(mut map) => {
-                for (k, v) in map.iter_mut() {
+                for (k, v) in &mut map {
                     if v.id.is_empty() {
-                        v.id = k.clone();
+                        v.id.clone_from(k);
                     }
                 }
                 map
@@ -248,11 +247,11 @@ pub async fn load_state(path: &str) -> HashMap<String, DeviceConfig> {
 
     match devices_res {
         Ok(devices) => {
-            info!("Loaded {} devices from {:?}", devices.len(), path);
+            info!("Loaded {} devices from {path:?}", devices.len());
             devices
         }
         Err(e) => {
-            error!("Failed to load state file {:?}: {}", path, e);
+            error!("Failed to load state file {path:?}: {e}");
             HashMap::new()
         }
     }

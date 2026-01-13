@@ -74,7 +74,7 @@ pub enum BridgeRequest {
 }
 
 impl BridgeRequest {
-    pub fn action_name(&self) -> &str {
+    pub const fn action_name(&self) -> &str {
         match self {
             Self::Add { .. } => "add",
             Self::Remove { .. } => "remove",

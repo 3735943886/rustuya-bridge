@@ -5,13 +5,13 @@ use std::sync::Arc;
 use crate::bridge::BridgeContext;
 use crate::config::DeviceConfig;
 use crate::error::BridgeError;
-use crate::types::{ApiResponse, BridgeRequest};
+use crate::types::{ApiResponse, BridgeRequest, SingleOrList};
 use futures_util::StreamExt;
 
 /// Main entry point for processing bridge requests
 pub async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiResponse {
     let action = req.action_name().to_string();
-    let id = req.target_id().map(|s| s.to_string());
+    let id = req.target_id().map(ToString::to_string);
 
     match handle_request_inner(ctx, req).await {
         Ok(res) => res,
@@ -51,14 +51,20 @@ async fn handle_request_inner(
             .await
         }
         BridgeRequest::Remove { id, name } => {
-            ctx.remove_device(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
-                .await
+            ctx.remove_device(
+                id.map(SingleOrList::into_vec),
+                name.map(SingleOrList::into_vec),
+            )
+            .await
         }
         BridgeRequest::Clear => ctx.clear_devices().await,
         BridgeRequest::Status => Ok(ctx.get_bridge_status().await),
         BridgeRequest::Get { id, name, cid } => {
             let targets = ctx
-                .get_targets(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
+                .get_targets(
+                    id.map(SingleOrList::into_vec),
+                    name.map(SingleOrList::into_vec),
+                )
                 .await?;
             for target_id in &targets {
                 let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
@@ -70,7 +76,10 @@ async fn handle_request_inner(
         }
         BridgeRequest::Set { id, name, dps, cid } => {
             let targets = ctx
-                .get_targets(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
+                .get_targets(
+                    id.map(SingleOrList::into_vec),
+                    name.map(SingleOrList::into_vec),
+                )
                 .await?;
             for target_id in &targets {
                 let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
@@ -95,7 +104,10 @@ async fn handle_request_inner(
         } => {
             let command = CommandType::from_u32(cmd).ok_or(BridgeError::InvalidCommand(cmd))?;
             let targets = ctx
-                .get_targets(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
+                .get_targets(
+                    id.map(SingleOrList::into_vec),
+                    name.map(SingleOrList::into_vec),
+                )
                 .await?;
             for target_id in &targets {
                 let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
@@ -104,13 +116,16 @@ async fn handle_request_inner(
                 }
             }
             Ok(ApiResponse::ok(
-                format!("{:?}", command).to_lowercase(),
+                format!("{command:?}").to_lowercase(),
                 targets.join(","),
             ))
         }
         BridgeRequest::SubDiscover { id, name } => {
             let targets = ctx
-                .get_targets(id.map(|s| s.into_vec()), name.map(|s| s.into_vec()))
+                .get_targets(
+                    id.map(SingleOrList::into_vec),
+                    name.map(SingleOrList::into_vec),
+                )
                 .await?;
             for target_id in &targets {
                 if let Ok(dev) = ctx.get_connected_device(target_id).await {
