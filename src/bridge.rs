@@ -25,6 +25,18 @@ pub struct MqttMessage {
     pub retain: bool,
 }
 
+#[derive(Default)]
+struct TopicVars<'a> {
+    id: &'a str,
+    name: Option<&'a str>,
+    cid: Option<&'a str>,
+    level: Option<&'a str>,
+    event_type: Option<&'a str>,
+    dp: Option<&'a str>,
+    val: Option<&'a Value>,
+    dps_str: Option<&'a str>,
+}
+
 pub struct BridgeContext {
     pub mqtt_tx: Option<mpsc::Sender<MqttMessage>>,
     pub mqtt_event_topic: String,
@@ -521,28 +533,26 @@ impl BridgeContext {
     ) -> Vec<(String, String)> {
         let dps_str = dps.to_string();
         let event_type = if is_passive { "passive" } else { "active" };
-        let root_topic = self.mqtt_event_topic.replace("/event", "");
 
-        let replace_vars = |s: &str, dp: Option<&str>, val: Option<&Value>| {
-            let mut res = s
-                .replace("{id}", id)
-                .replace("{name}", name.unwrap_or(""))
-                .replace("{cid}", cid.unwrap_or(""))
-                .replace("{type}", event_type)
-                .replace("{root}", &root_topic);
-            if let Some(d) = dp {
-                res = res.replace("{dp}", d);
-            }
-            if let Some(v) = val {
-                res = res.replace("{value}", &v.to_string());
-            }
-            res = res.replace("{dps}", &dps_str);
-            res
+        let replace_vars_local = |s: &str, dp: Option<&str>, val: Option<&Value>| {
+            self.replace_vars(
+                s,
+                TopicVars {
+                    id,
+                    name,
+                    cid,
+                    event_type: Some(event_type),
+                    dp,
+                    val,
+                    dps_str: Some(&dps_str),
+                    ..Default::default()
+                },
+            )
         };
 
         // Default payload: if no template, merge id/name into dps (backward compatibility/default)
         let default_payload = if let Some(tpl) = &self.mqtt_payload_template {
-            replace_vars(tpl, None, None)
+            replace_vars_local(tpl, None, None)
         } else {
             let mut payload_obj = dps.clone();
             if let Some(obj) = payload_obj.as_object_mut() {
@@ -561,7 +571,7 @@ impl BridgeContext {
         let default_topic = self.mqtt_event_topic.replace("{type}", event_type);
 
         if let Some(tpl) = &self.mqtt_topic_template {
-            let extra_topic = replace_vars(tpl, None, None);
+            let extra_topic = replace_vars_local(tpl, None, None);
 
             if tpl.contains("{dp}") || tpl.contains("{value}") {
                 // If template is per-DP, we still want the main event topic
@@ -569,11 +579,11 @@ impl BridgeContext {
 
                 if let Some(dps_obj) = dps.as_object() {
                     for (dp, val) in dps_obj {
-                        let topic = replace_vars(tpl, Some(dp), None);
+                        let topic = replace_vars_local(tpl, Some(dp), None);
                         let payload = self
                             .mqtt_payload_template
                             .as_ref()
-                            .map(|p_tpl| replace_vars(p_tpl, Some(dp), Some(val)))
+                            .map(|p_tpl| replace_vars_local(p_tpl, Some(dp), Some(val)))
                             .unwrap_or_else(|| val.to_string());
                         templates.push((topic, payload));
                     }
@@ -583,7 +593,7 @@ impl BridgeContext {
                 let payload = self
                     .mqtt_payload_template
                     .as_ref()
-                    .map(|p_tpl| replace_vars(p_tpl, None, None))
+                    .map(|p_tpl| replace_vars_local(p_tpl, None, None))
                     .unwrap_or_else(|| {
                         let mut p_obj = dps.clone();
                         if let Some(obj) = p_obj.as_object_mut() {
@@ -666,19 +676,24 @@ impl BridgeContext {
         mut payload: Value,
     ) {
         if let Some(tx) = &self.mqtt_tx {
-            let root_topic = self
-                .mqtt_event_topic
-                .replace("/{type}", "")
-                .replace("/event", "")
-                .trim_end_matches('/')
-                .to_string();
             let topic = if let Some(tpl) = &self.mqtt_message_topic_template {
-                tpl.replace("{level}", level)
-                    .replace("{id}", id)
-                    .replace("{name}", name.unwrap_or(""))
-                    .replace("{cid}", cid.unwrap_or(""))
-                    .replace("{root}", &root_topic)
+                self.replace_vars(
+                    tpl,
+                    TopicVars {
+                        id,
+                        name,
+                        cid,
+                        level: Some(level),
+                        ..Default::default()
+                    },
+                )
             } else {
+                let root_topic = self
+                    .mqtt_event_topic
+                    .replace("/{type}", "")
+                    .replace("/event", "")
+                    .trim_end_matches('/')
+                    .to_string();
                 format!("{}/{}/{}", root_topic, level, id)
             };
 
@@ -709,17 +724,50 @@ impl BridgeContext {
             crate::types::Status::Error => "error",
         };
         let id = response.id.as_deref().unwrap_or("bridge");
-        let name = if id == "bridge" { Some("bridge") } else { None };
+        let name = (id == "bridge").then_some("bridge");
 
-        let payload = serde_json::to_value(&response).unwrap_or_else(|_| {
-            serde_json::json!({
-                "status": "error",
-                "error": "Failed to serialize response"
-            })
-        });
+        match serde_json::to_value(&response) {
+            Ok(payload) => {
+                self.publish_device_message(id, name, None, level, payload)
+                    .await;
+            }
+            Err(e) => {
+                error!("Failed to serialize ApiResponse: {}", e);
+            }
+        }
+    }
 
-        self.publish_device_message(id, name, None, level, payload)
-            .await;
+    /// Helper to replace template variables in a string
+    fn replace_vars(&self, template: &str, vars: TopicVars) -> String {
+        let root_topic = self
+            .mqtt_event_topic
+            .replace("/{type}", "")
+            .replace("/event", "")
+            .trim_end_matches('/')
+            .to_string();
+
+        let mut res = template
+            .replace("{root}", &root_topic)
+            .replace("{id}", vars.id)
+            .replace("{name}", vars.name.unwrap_or(""))
+            .replace("{cid}", vars.cid.unwrap_or(""));
+
+        if let Some(l) = vars.level {
+            res = res.replace("{level}", l);
+        }
+        if let Some(t) = vars.event_type {
+            res = res.replace("{type}", t);
+        }
+        if let Some(d) = vars.dp {
+            res = res.replace("{dp}", d);
+        }
+        if let Some(v) = vars.val {
+            res = res.replace("{value}", &v.to_string());
+        }
+        if let Some(ds) = vars.dps_str {
+            res = res.replace("{dps}", ds);
+        }
+        res
     }
 
     /// Publishes bridge-level messages (e.g. scanner results)
@@ -729,21 +777,32 @@ impl BridgeContext {
         }
         debug!("Scanner Event: {}", payload);
         if let Some(tx) = &self.mqtt_tx {
-            let root_topic = self
-                .mqtt_event_topic
-                .replace("/{type}", "")
-                .replace("/event", "")
-                .trim_end_matches('/')
-                .to_string();
             let topic = if let Some(topic) = &self.mqtt_scanner_topic {
-                topic.replace("{root}", &root_topic)
+                self.replace_vars(
+                    topic,
+                    TopicVars {
+                        id: "bridge",
+                        name: Some("bridge"),
+                        ..Default::default()
+                    },
+                )
             } else if let Some(tpl) = &self.mqtt_message_topic_template {
-                tpl.replace("{level}", "scanner")
-                    .replace("{id}", "bridge")
-                    .replace("{name}", "bridge")
-                    .replace("{cid}", "")
-                    .replace("{root}", &root_topic)
+                self.replace_vars(
+                    tpl,
+                    TopicVars {
+                        id: "bridge",
+                        name: Some("bridge"),
+                        level: Some("scanner"),
+                        ..Default::default()
+                    },
+                )
             } else {
+                let root_topic = self
+                    .mqtt_event_topic
+                    .replace("/{type}", "")
+                    .replace("/event", "")
+                    .trim_end_matches('/')
+                    .to_string();
                 format!("{}/scanner", root_topic)
             };
             let _ = tx
@@ -966,13 +1025,17 @@ impl BridgeContext {
         let devices: Vec<Value> = configs
             .values()
             .map(|cfg| {
-                let mut dev_val = serde_json::to_value(cfg).unwrap();
-                if let Some(obj) = dev_val.as_object_mut() {
-                    let status = self.determine_device_status(cfg, &instances);
-                    obj.insert("status".to_string(), Value::String(status));
-                }
-                dev_val
+                serde_json::to_value(cfg)
+                    .map(|mut dev_val| {
+                        if let Some(obj) = dev_val.as_object_mut() {
+                            let status = self.determine_device_status(cfg, &instances);
+                            obj.insert("status".to_string(), Value::String(status));
+                        }
+                        dev_val
+                    })
+                    .unwrap_or_else(|_| Value::Null)
             })
+            .filter(|v| !v.is_null())
             .collect();
 
         ApiResponse::ok("status", "bridge").with_extra("devices", Value::Array(devices))

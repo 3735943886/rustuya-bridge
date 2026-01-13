@@ -73,6 +73,29 @@ pub enum BridgeRequest {
     Scan,
 }
 
+impl BridgeRequest {
+    pub fn action_name(&self) -> &str {
+        match self {
+            Self::Add { .. } => "add",
+            Self::Remove { .. } => "remove",
+            Self::Clear => "clear",
+            Self::Status => "status",
+            Self::Get { .. } => "get",
+            Self::Set { .. } => "set",
+            Self::Request { .. } => "request",
+            Self::SubDiscover { .. } => "sub_discover",
+            Self::Scan => "scan",
+        }
+    }
+
+    pub fn target_id(&self) -> Option<&str> {
+        match self {
+            Self::Add { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -114,8 +137,18 @@ impl ApiResponse {
         }
     }
 
-    pub fn with_extra(mut self, key: &str, value: Value) -> Self {
-        self.extra.insert(key.to_string(), value);
+    pub fn with_extra(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.extra.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    pub fn with_action(mut self, action: impl Into<String>) -> Self {
+        self.action = Some(action.into());
         self
     }
 }

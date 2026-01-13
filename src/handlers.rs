@@ -10,9 +10,18 @@ use futures_util::StreamExt;
 
 /// Main entry point for processing bridge requests
 pub async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiResponse {
+    let action = req.action_name().to_string();
+    let id = req.target_id().map(|s| s.to_string());
+
     match handle_request_inner(ctx, req).await {
         Ok(res) => res,
-        Err(e) => ApiResponse::error(e),
+        Err(e) => {
+            let mut res = ApiResponse::error(e).with_action(action);
+            if let Some(id) = id {
+                res = res.with_id(id);
+            }
+            res
+        }
     }
 }
 
@@ -139,7 +148,7 @@ async fn handle_request_inner(
 
             Ok(ApiResponse::ok("scan", "bridge").with_extra(
                 "message",
-                "Scan started. Results will be published to 'scanner' topic.".into(),
+                "Scan started. Results will be published to 'scanner' topic.",
             ))
         }
     }

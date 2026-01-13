@@ -31,6 +31,7 @@ WORKDIR /app
 # Copy the binary from the builder stage
 COPY --from=builder /bin/rustuya-bridge /app/rustuya-bridge
 
+ENV MQTT_BROKER="mqtt://localhost:1883"
 ENV STATE_FILE="/data/rustuya.json"
 ENV CONFIG="/data/config.json"
 RUN mkdir /data
