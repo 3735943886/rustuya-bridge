@@ -314,7 +314,8 @@ impl BridgeContext {
                                 for req in requests {
                                     let ctx_h = self.clone();
                                     tokio::spawn(async move {
-                                        crate::handlers::handle_request(ctx_h, req).await;
+                                        let res = crate::handlers::handle_request(ctx_h.clone(), req).await;
+                                        ctx_h.publish_api_response(res).await;
                                     });
                                 }
                             }
@@ -668,7 +669,9 @@ impl BridgeContext {
             let root_topic = self
                 .mqtt_event_topic
                 .replace("/{type}", "")
-                .replace("/event", "");
+                .replace("/event", "")
+                .trim_end_matches('/')
+                .to_string();
             let topic = if let Some(tpl) = &self.mqtt_message_topic_template {
                 tpl.replace("{level}", level)
                     .replace("{id}", id)
@@ -699,6 +702,26 @@ impl BridgeContext {
         }
     }
 
+    /// Publishes an ApiResponse to the appropriate topic
+    pub async fn publish_api_response(&self, response: ApiResponse) {
+        let level = match response.status {
+            crate::types::Status::Ok => "response",
+            crate::types::Status::Error => "error",
+        };
+        let id = response.id.as_deref().unwrap_or("bridge");
+        let name = if id == "bridge" { Some("bridge") } else { None };
+
+        let payload = serde_json::to_value(&response).unwrap_or_else(|_| {
+            serde_json::json!({
+                "status": "error",
+                "error": "Failed to serialize response"
+            })
+        });
+
+        self.publish_device_message(id, name, None, level, payload)
+            .await;
+    }
+
     /// Publishes bridge-level messages (e.g. scanner results)
     pub async fn publish_scanner_event(&self, payload: Value) {
         if payload.is_null() || payload.as_str().is_some_and(|s| s.is_empty()) {
@@ -709,7 +732,9 @@ impl BridgeContext {
             let root_topic = self
                 .mqtt_event_topic
                 .replace("/{type}", "")
-                .replace("/event", "");
+                .replace("/event", "")
+                .trim_end_matches('/')
+                .to_string();
             let topic = if let Some(topic) = &self.mqtt_scanner_topic {
                 topic.replace("{root}", &root_topic)
             } else if let Some(tpl) = &self.mqtt_message_topic_template {
@@ -717,8 +742,9 @@ impl BridgeContext {
                     .replace("{id}", "bridge")
                     .replace("{name}", "bridge")
                     .replace("{cid}", "")
+                    .replace("{root}", &root_topic)
             } else {
-                format!("{}/scanner", self.mqtt_event_topic.replace("/event", ""))
+                format!("{}/scanner", root_topic)
             };
             let _ = tx
                 .send(MqttMessage {

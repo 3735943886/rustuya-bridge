@@ -143,7 +143,7 @@ impl Cli {
             .mqtt_event_topic
             .as_deref()
             .map(|t| t.replace("{root}", root_topic))
-            .unwrap_or_else(|| format!("{}/event", root_topic));
+            .unwrap_or_else(|| format!("{}/event/{{type}}", root_topic));
         (mqtt_command_topic, mqtt_event_topic)
     }
 

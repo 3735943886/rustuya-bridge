@@ -35,11 +35,11 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-broker`, `-m` | `MQTT_BROKER` | - | MQTT Broker address (e.g., `mqtt://user:pass@localhost:1883`) |
 | `--mqtt-root-topic` | `MQTT_ROOT_TOPIC` | `rustuya` | MQTT root topic prefix |
 | `--mqtt-command-topic`| `MQTT_COMMAND_TOPIC` | `{root}/command` | MQTT topic for commands |
-| `--mqtt-event-topic` | `MQTT_EVENT_TOPIC` | `{root}/device/{type}` | MQTT topic for events |
+| `--mqtt-event-topic` | `MQTT_EVENT_TOPIC` | `{root}/event/{type}` | MQTT topic for events |
 | `--mqtt-scanner-topic` | `MQTT_SCANNER_TOPIC` | `{root}/scanner` | MQTT topic for scanner results |
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
 | `--mqtt-topic-template` | `MQTT_TOPIC_TEMPLATE` | | MQTT topic template for active status (e.g., `tuya/{id}/state`) |
-| `--mqtt-message-topic-template` | `MQTT_MESSAGE_TOPIC_TEMPLATE` | | MQTT topic template for errors/logs (e.g., `tuya/logs/{level}`) |
+| `--mqtt-message-topic-template` | `MQTT_MESSAGE_TOPIC_TEMPLATE` | | MQTT topic template for errors/responses (e.g., `tuya/logs/{level}`) |
 | `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | | MQTT payload template (e.g., `{"val": {value}}`) |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device configurations are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
@@ -68,19 +68,27 @@ cargo run -- --config config.json
 - **Events**: Device events are published to the `mqtt-event-topic`.
   - **Active**: Published when the payload contains `dps` data (e.g., state changes).
   - **Passive**: Published when the payload contains no `dps` data (e.g., state reports).
-- **Messages**: Errors and logs (containing `errorCode` or `errorMsg`) are published to `mqtt-message-topic-template`.
+- **Responses/Errors**: Command results and errors are published to `mqtt-message-topic-template`.
+  - **Success**: Published with `{level}` set to `response`.
+  - **Error**: Published with `{level}` set to `error`.
 - **Scanner**: Results are published to `mqtt-scanner-topic`.
 
 ### Examples (MQTT)
 
 You can interact with the bridge using any MQTT client (e.g., `mosquitto_pub/sub`).
 
-By default, the command topic is `rustuya/command` and events are published under `rustuya/device/#`.
+By default, the command topic is `rustuya/command` and events are published under `rustuya/event/#`.
 
 #### Monitor Events
 Before running the commands below, you might want to open a new terminal and subscribe to all topics:
 ```bash
 mosquitto_sub -h localhost -t "rustuya/#" -v
+```
+
+#### Monitor Responses
+Subscribe specifically to command responses:
+```bash
+mosquitto_sub -h localhost -t "rustuya/response/#" -v
 ```
 
 #### Register a WiFi Device
@@ -136,19 +144,19 @@ MQTT topics and payloads can be fully customized using templates.
 
 #### Publishing Templates
 - **Topic Template (`--mqtt-topic-template`)**: Used for device status updates.
-- **Message Topic (`--mqtt-message-topic-template`)**: Used for errors and logs.
+- **Message Topic (`--mqtt-message-topic-template`)**: Used for errors and responses.
 
 **Variables:**
 - `{root}`: MQTT root topic prefix
-- `{id}`: Device ID
-- `{name}`: Device Name
+- `{id}`: Device ID (or `bridge` for bridge-level responses)
+- `{name}`: Device Name (or `bridge` for bridge-level responses)
 - `{cid}`: Sub-device CID (if applicable, otherwise empty)
 - `{type}`: `active` or `passive` (only for event topic)
 - `{dp}`: Data Point ID (only in single DP mode)
 - `{value}`: Data Point Value (only in single DP mode)
 - `{dps}`: JSON string of all Data Points
 - `{timestamp}`: Unix timestamp
-- `{level}`: Message level (only for message topic)
+- `{level}`: `response` or `error` (only for message topic)
 
 #### Command Topic Matching
 If `--mqtt-command-topic` contains variables like `{id}`, the bridge will automatically extract them from the incoming topic.
