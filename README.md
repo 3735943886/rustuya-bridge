@@ -5,7 +5,7 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/3735943886/rustuya)](https://hub.docker.com/r/3735943886/rustuya)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An MQTT-based bridge server for managing Tuya devices via `rustuya`.
+An MQTT-based bridge server for managing Tuya devices via [`rustuya`](https://github.com/3735943886/rustuya).
 
 ## How to Run
 
@@ -38,8 +38,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-event-topic` | `MQTT_EVENT_TOPIC` | `{root}/event/{type}` | MQTT topic for events |
 | `--mqtt-scanner-topic` | `MQTT_SCANNER_TOPIC` | `{root}/scanner` | MQTT topic for scanner results |
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
-| `--mqtt-topic-template` | `MQTT_TOPIC_TEMPLATE` | | MQTT topic template for active status (e.g., `tuya/{id}/state`) |
-| `--mqtt-message-topic-template` | `MQTT_MESSAGE_TOPIC_TEMPLATE` | | MQTT topic template for errors/responses (e.g., `tuya/logs/{level}`) |
+| `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
 | `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | | MQTT payload template (e.g., `{"val": {value}}`) |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device configurations are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
@@ -52,7 +51,7 @@ A JSON file can be used to manage all settings. Command-line arguments take prio
 {
   "mqtt_broker": "mqtt://localhost:1883",
   "mqtt_root_topic": "myhome/tuya",
-  "mqtt_topic_template": "tuya/{name}/{dp}/state",
+  "mqtt_event_topic": "tuya/{name}/{dp}/state",
   "mqtt_payload_template": "{value}",
   "save_debounce_secs": 10
 }
@@ -68,7 +67,7 @@ cargo run -- --config config.json
 - **Events**: Device events are published to the `mqtt-event-topic`.
   - **Active**: Published when the payload contains `dps` data (e.g., state changes).
   - **Passive**: Published when the payload contains no `dps` data (e.g., state reports).
-- **Responses/Errors**: Command results and errors are published to `mqtt-message-topic-template`.
+- **Responses/Errors**: Command results and errors are published to `mqtt-message-topic`.
   - **Success**: Published with `{level}` set to `response`.
   - **Error**: Published with `{level}` set to `error`.
 - **Scanner**: Results are published to `mqtt-scanner-topic`.
@@ -143,8 +142,8 @@ mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "clear"}'
 MQTT topics and payloads can be fully customized using templates.
 
 #### Publishing Templates
-- **Topic Template (`--mqtt-topic-template`)**: Used for device status updates.
-- **Message Topic (`--mqtt-message-topic-template`)**: Used for errors and responses.
+- **Topic Template (`--mqtt-event-topic`)**: Used for device status updates.
+- **Message Topic (`--mqtt-message-topic`)**: Used for errors and responses.
 
 **Variables:**
 - `{root}`: MQTT root topic prefix
@@ -195,5 +194,5 @@ If `--mqtt-command-topic` contains variables like `{id}`, the bridge will automa
 ## Event Topics
 The bridge publishes events to the following MQTT topics:
 - `mqtt-event-topic`: Device status changes (Active/Passive).
-- `mqtt-message-topic-template`: Errors and logs.
+- `mqtt-message-topic`: Errors and logs.
 - `mqtt-scanner-topic`: Results from the `scan` action. Returns an empty object `{}` when a scan cycle is finished.

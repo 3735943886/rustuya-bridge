@@ -51,8 +51,7 @@ pub struct BridgeContext {
     pub mqtt_tx: Option<mpsc::Sender<MqttMessage>>,
     pub mqtt_event_topic: String,
     pub mqtt_retain: bool,
-    pub mqtt_topic_template: Option<String>,
-    pub mqtt_message_topic_template: Option<String>,
+    pub mqtt_message_topic: Option<String>,
     pub mqtt_payload_template: Option<String>,
     pub mqtt_scanner_topic: Option<String>,
     pub state_file: String,
@@ -145,8 +144,7 @@ impl BridgeContext {
             mqtt_tx: cli.mqtt_broker.is_some().then_some(mqtt_tx_sender),
             mqtt_event_topic,
             mqtt_retain: cli.get_mqtt_retain(),
-            mqtt_topic_template: cli.mqtt_topic_template.clone(),
-            mqtt_message_topic_template: cli.mqtt_message_topic_template.clone(),
+            mqtt_message_topic: cli.mqtt_message_topic.clone(),
             mqtt_payload_template: cli.mqtt_payload_template.clone(),
             mqtt_scanner_topic: cli.mqtt_scanner_topic.clone(),
             state_file: cli.get_state_file(),
@@ -559,68 +557,38 @@ impl BridgeContext {
             )
         };
 
-        // Default payload: if no template, merge id/name into dps (backward compatibility/default)
-        let default_payload = if let Some(tpl) = &self.mqtt_payload_template {
-            replace_vars_local(tpl, None, None)
-        } else {
-            let mut payload_obj = dps.clone();
-            if let Some(obj) = payload_obj.as_object_mut() {
-                obj.insert("id".to_string(), id.into());
-                if let Some(n) = name {
-                    obj.insert("name".to_string(), n.into());
-                }
-            }
-            payload_obj.to_string()
-        };
-
         let mut templates = Vec::new();
+        let tpl = &self.mqtt_event_topic;
 
-        // Only add default topic if mqtt_topic_template is NOT present,
-        // or if it is present but evaluates to a different topic.
-        let default_topic = self.mqtt_event_topic.replace("{type}", event_type);
-
-        if let Some(tpl) = &self.mqtt_topic_template {
-            let extra_topic = replace_vars_local(tpl, None, None);
-
-            if tpl.contains("{dp}") || tpl.contains("{value}") {
-                // If template is per-DP, we still want the main event topic
-                templates.push((default_topic, default_payload));
-
-                if let Some(dps_obj) = dps.as_object() {
-                    for (dp, val) in dps_obj {
-                        let topic = replace_vars_local(tpl, Some(dp), None);
-                        let payload = self
-                            .mqtt_payload_template
-                            .as_ref()
-                            .map(|p_tpl| replace_vars_local(p_tpl, Some(dp), Some(val)))
-                            .unwrap_or_else(|| val.to_string());
-                        templates.push((topic, payload));
-                    }
+        if tpl.contains("{dp}") || tpl.contains("{value}") {
+            if let Some(dps_obj) = dps.as_object() {
+                for (dp, val) in dps_obj {
+                    let topic = replace_vars_local(tpl, Some(dp), None);
+                    let payload = self
+                        .mqtt_payload_template
+                        .as_ref()
+                        .map(|p_tpl| replace_vars_local(p_tpl, Some(dp), Some(val)))
+                        .unwrap_or_else(|| val.to_string());
+                    templates.push((topic, payload));
                 }
-            } else {
-                // If it's a general template
-                let payload = self
-                    .mqtt_payload_template
-                    .as_ref()
-                    .map(|p_tpl| replace_vars_local(p_tpl, None, None))
-                    .unwrap_or_else(|| {
-                        let mut p_obj = dps.clone();
-                        if let Some(obj) = p_obj.as_object_mut() {
-                            obj.insert("id".to_string(), id.into());
-                            obj.insert("name".to_string(), name.into());
-                        }
-                        p_obj.to_string()
-                    });
-
-                // Avoid duplicate if topics are the same
-                if extra_topic != default_topic {
-                    templates.push((default_topic, default_payload));
-                }
-                templates.push((extra_topic, payload));
             }
         } else {
-            // No extra template, just use default
-            templates.push((default_topic, default_payload));
+            let topic = replace_vars_local(tpl, None, None);
+            let payload = self
+                .mqtt_payload_template
+                .as_ref()
+                .map(|p_tpl| replace_vars_local(p_tpl, None, None))
+                .unwrap_or_else(|| {
+                    let mut payload_obj = dps.clone();
+                    if let Some(obj) = payload_obj.as_object_mut() {
+                        obj.insert("id".to_string(), id.into());
+                        if let Some(n) = name {
+                            obj.insert("name".to_string(), n.into());
+                        }
+                    }
+                    payload_obj.to_string()
+                });
+            templates.push((topic, payload));
         }
 
         templates
@@ -689,7 +657,7 @@ impl BridgeContext {
         mut payload: Value,
     ) {
         if let Some(tx) = &self.mqtt_tx {
-            let topic = if let Some(tpl) = &self.mqtt_message_topic_template {
+            let topic = if let Some(tpl) = &self.mqtt_message_topic {
                 self.replace_vars(
                     tpl,
                     TopicVars {
@@ -799,7 +767,7 @@ impl BridgeContext {
                         ..Default::default()
                     },
                 )
-            } else if let Some(tpl) = &self.mqtt_message_topic_template {
+            } else if let Some(tpl) = &self.mqtt_message_topic {
                 self.replace_vars(
                     tpl,
                     TopicVars {

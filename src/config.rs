@@ -35,13 +35,9 @@ pub struct Cli {
     #[arg(long, env = "MQTT_CLIENT_ID")]
     pub mqtt_client_id: Option<String>,
 
-    /// MQTT Topic template for device events
-    #[arg(long, env = "MQTT_TOPIC_TEMPLATE")]
-    pub mqtt_topic_template: Option<String>,
-
     /// MQTT Topic template for messages/errors
-    #[arg(long, env = "MQTT_MESSAGE_TOPIC_TEMPLATE")]
-    pub mqtt_message_topic_template: Option<String>,
+    #[arg(long, env = "MQTT_MESSAGE_TOPIC")]
+    pub mqtt_message_topic: Option<String>,
 
     /// MQTT Payload template for device events (e.g. "{\"val\": {value}}")
     #[arg(long, env = "MQTT_PAYLOAD_TEMPLATE")]
@@ -102,8 +98,7 @@ impl Cli {
             mqtt_command_topic,
             mqtt_event_topic,
             mqtt_client_id,
-            mqtt_topic_template,
-            mqtt_message_topic_template,
+            mqtt_message_topic,
             mqtt_payload_template,
             mqtt_scanner_topic,
             mqtt_retain,
@@ -125,8 +120,7 @@ impl Cli {
         merge_field!(mqtt_command_topic);
         merge_field!(mqtt_event_topic);
         merge_field!(mqtt_client_id);
-        merge_field!(mqtt_topic_template);
-        merge_field!(mqtt_message_topic_template);
+        merge_field!(mqtt_message_topic);
         merge_field!(mqtt_payload_template);
         merge_field!(mqtt_scanner_topic);
         merge_field!(mqtt_retain);
