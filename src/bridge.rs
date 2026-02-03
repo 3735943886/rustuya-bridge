@@ -223,7 +223,23 @@ impl BridgeContext {
                                     .and_then(|do_| do_.get("dps"));
 
                                 let is_passive = root_dps.is_none() && data_dps.is_none();
-                                let mut dps = root_dps.or(data_dps).cloned().unwrap_or(payload);
+                                let mut dps = root_dps.or(data_dps).cloned().unwrap_or_else(|| {
+                                    if let Some(obj) = payload.as_object()
+                                        && let Some(data) = obj.get("data") {
+                                        let mut data_val = data.clone();
+                                        if let Some(data_obj) = data_val.as_object_mut()
+                                            && let Some(inner) = data_obj.get("data").cloned()
+                                            && let Some(inner_obj) = inner.as_object() {
+                                            for (k, v) in inner_obj {
+                                                data_obj.entry(k.clone()).or_insert(v.clone());
+                                            }
+                                            data_obj.remove("data");
+                                        }
+                                        data_val
+                                    } else {
+                                        payload.clone()
+                                    }
+                                });
 
                                 // If target is parent (gateway) but CID was present, include CID in dps for visibility
                                 if target_id == event.device_id && let Some(c) = &cid
