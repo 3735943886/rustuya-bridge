@@ -1,8 +1,10 @@
 use rustuya::protocol::CommandType;
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::time::{Duration, timeout};
 
 use crate::bridge::BridgeContext;
+use crate::bridge::REQUEST_TIMEOUT_SECS;
 use crate::config::DeviceConfig;
 use crate::error::BridgeError;
 use crate::types::{ApiResponse, BridgeRequest, SingleOrList};
@@ -68,8 +70,18 @@ async fn handle_request_inner(
                 .await?;
             for target_id in &targets {
                 let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
-                if let Ok(dev) = ctx.get_connected_device(target_id).await {
-                    let _ = dev.request(CommandType::DpQuery, None, actual_cid).await;
+                if let Ok(dev) = ctx.get_connected_device(target_id).await
+                    && timeout(
+                        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                        dev.request(CommandType::DpQuery, None, actual_cid),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return Err(BridgeError::Timeout(format!(
+                        "get timeout for {}",
+                        target_id
+                    )));
                 }
             }
             Ok(ApiResponse::ok("get", targets.join(",")))
@@ -83,14 +95,22 @@ async fn handle_request_inner(
                 .await?;
             for target_id in &targets {
                 let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
-                if let Ok(dev) = ctx.get_connected_device(target_id).await {
-                    let _ = dev
-                        .request(
+                if let Ok(dev) = ctx.get_connected_device(target_id).await
+                    && timeout(
+                        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                        dev.request(
                             CommandType::Control,
                             Some(Value::Object(dps.clone())),
                             actual_cid,
-                        )
-                        .await;
+                        ),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return Err(BridgeError::Timeout(format!(
+                        "set timeout for {}",
+                        target_id
+                    )));
                 }
             }
             Ok(ApiResponse::ok("set", targets.join(",")))
@@ -111,8 +131,18 @@ async fn handle_request_inner(
                 .await?;
             for target_id in &targets {
                 let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
-                if let Ok(dev) = ctx.get_connected_device(target_id).await {
-                    let _ = dev.request(command, data.clone(), actual_cid).await;
+                if let Ok(dev) = ctx.get_connected_device(target_id).await
+                    && timeout(
+                        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                        dev.request(command, data.clone(), actual_cid),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return Err(BridgeError::Timeout(format!(
+                        "request timeout for {}",
+                        target_id
+                    )));
                 }
             }
             Ok(ApiResponse::ok(
@@ -128,8 +158,18 @@ async fn handle_request_inner(
                 )
                 .await?;
             for target_id in &targets {
-                if let Ok(dev) = ctx.get_connected_device(target_id).await {
-                    let _ = dev.sub_discover().await;
+                if let Ok(dev) = ctx.get_connected_device(target_id).await
+                    && timeout(
+                        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                        dev.sub_discover(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return Err(BridgeError::Timeout(format!(
+                        "sub_discover timeout for {}",
+                        target_id
+                    )));
                 }
             }
             Ok(ApiResponse::ok("sub_discover", targets.join(",")))
