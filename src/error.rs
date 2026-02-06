@@ -14,4 +14,6 @@ pub enum BridgeError {
     IoError(#[from] std::io::Error),
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+    #[error("Timeout: {0}")]
+    Timeout(String),
 }

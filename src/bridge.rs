@@ -1,6 +1,6 @@
 use anyhow::Result;
 use futures_util::StreamExt;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use regex::Regex;
 use rustuya::{Device, DeviceBuilder};
 use serde_json::Value;
@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
+use tokio::time::Instant;
 
 use crate::config::{Cli, DeviceConfig, load_state};
 use crate::error::BridgeError;
@@ -17,6 +18,8 @@ use crate::types::{ApiResponse, BridgeRequest};
 pub const MQTT_CHANNEL_CAPACITY: usize = 100;
 pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
+pub const LISTENER_TIMEOUT_SECS: u64 = 300;
+pub const REQUEST_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Clone)]
 pub struct MqttMessage {
@@ -196,12 +199,14 @@ impl BridgeContext {
                 debug!("Started unified listener for {} devices", instances.len());
                 loop {
                     tokio::select! {
-                        Some(event_res) = stream.next() => {
-                            if let Ok(event) = event_res {
-                                let payload_str = event.message.payload_as_string().unwrap();
-                                trace!("Raw event from {}: {}", event.device_id, payload_str);
-                                let payload: Value = serde_json::from_str(&payload_str).unwrap_or(Value::String(payload_str.clone()));
-                                let (target_id, name, cid, exists) = self.resolve_event_target(&event.device_id, &payload).await;
+                        res = tokio::time::timeout(Duration::from_secs(LISTENER_TIMEOUT_SECS), stream.next()) => {
+                            match res {
+                                Ok(Some(event_res)) => {
+                                    if let Ok(event) = event_res {
+                                        let payload_str = event.message.payload_as_string().unwrap();
+                                        trace!("Raw event from {}: {}", event.device_id, payload_str);
+                                        let payload: Value = serde_json::from_str(&payload_str).unwrap_or(Value::String(payload_str.clone()));
+                                        let (target_id, name, cid, exists) = self.resolve_event_target(&event.device_id, &payload).await;
 
                                 // Check for 'dps' at root or inside 'data' (for sub-devices/gateways)
                                 let payload_obj = payload.as_object();
@@ -247,7 +252,32 @@ impl BridgeContext {
                                     obj.insert("cid".to_string(), Value::String(c.clone()));
                                 }
 
-                                self.publish_device_event(target_id, name, cid, dps, is_passive, exists).await;
+                                        self.publish_device_event(target_id, name, cid, dps, is_passive, exists).await;
+                                    }
+                                }
+                                Ok(None) => {
+                                    warn!("Device listener stream ended");
+                                    break;
+                                }
+                                Err(_) => {
+                                    warn!("Device listener timeout after {}s", LISTENER_TIMEOUT_SECS);
+                                    let mut payload = serde_json::Map::new();
+                                    payload.insert(
+                                        "message".to_string(),
+                                        Value::String(format!(
+                                            "listener timeout after {}s",
+                                            LISTENER_TIMEOUT_SECS
+                                        )),
+                                    );
+                                    self.publish_device_message(
+                                        "bridge",
+                                        Some("bridge"),
+                                        None,
+                                        "error",
+                                        Value::Object(payload),
+                                    )
+                                    .await;
+                                }
                             }
                         }
                         _ = refresh_rx.recv() => break, // Refresh listener on device changes
@@ -317,9 +347,19 @@ impl BridgeContext {
 
         tokio::spawn(async move {
             let mut retry_delay = INITIAL_RETRY_DELAY_SECS;
+            let mut next_retry: Option<Instant> = None;
             loop {
                 tokio::select! {
-                    notification = eventloop.poll() => {
+                    _ = async {
+                        if let Some(deadline) = next_retry {
+                            tokio::time::sleep_until(deadline).await;
+                        } else {
+                            futures_util::future::pending::<()>().await;
+                        }
+                    } => {
+                        next_retry = None;
+                    }
+                    notification = eventloop.poll(), if next_retry.is_none() => {
                         match notification {
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
                                 info!("Connected to MQTT broker");
@@ -356,7 +396,7 @@ impl BridgeContext {
                             }
                             Err(e) => {
                                 error!("MQTT Error: {}. Retrying in {}s...", e, retry_delay);
-                                tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+                                next_retry = Some(Instant::now() + Duration::from_secs(retry_delay));
                                 retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY_SECS);
                             }
                             _ => {}
@@ -373,6 +413,16 @@ impl BridgeContext {
         });
 
         Ok(())
+    }
+
+    async fn try_send_mqtt(&self, msg: MqttMessage) {
+        if let Some(tx) = &self.mqtt_tx
+            && tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
+                .await
+                .is_err()
+        {
+            warn!("MQTT queue full, dropping message");
+        }
     }
 
     /// Creates MQTT options from broker URL
@@ -626,7 +676,7 @@ impl BridgeContext {
 
         debug!("Device Event: [{}] {}", id, dps);
 
-        if let Some(tx) = &self.mqtt_tx {
+        if self.mqtt_tx.is_some() {
             // Check if device still exists before publishing to avoid race conditions during removal
             if !exists {
                 return;
@@ -652,13 +702,12 @@ impl BridgeContext {
             }
 
             for (topic, payload) in templates {
-                let _ = tx
-                    .send(MqttMessage {
-                        topic,
-                        payload,
-                        retain: self.mqtt_retain,
-                    })
-                    .await;
+                self.try_send_mqtt(MqttMessage {
+                    topic,
+                    payload,
+                    retain: self.mqtt_retain,
+                })
+                .await;
             }
         }
     }
@@ -672,7 +721,7 @@ impl BridgeContext {
         level: &str,
         mut payload: Value,
     ) {
-        if let Some(tx) = &self.mqtt_tx {
+        if self.mqtt_tx.is_some() {
             let topic = if let Some(tpl) = &self.mqtt_message_topic {
                 self.replace_vars(
                     tpl,
@@ -704,13 +753,12 @@ impl BridgeContext {
                 }
             }
 
-            let _ = tx
-                .send(MqttMessage {
-                    topic,
-                    payload: payload.to_string(),
-                    retain: false,
-                })
-                .await;
+            self.try_send_mqtt(MqttMessage {
+                topic,
+                payload: payload.to_string(),
+                retain: false,
+            })
+            .await;
         }
     }
 
@@ -773,7 +821,7 @@ impl BridgeContext {
             return;
         }
         debug!("Scanner Event: {}", payload);
-        if let Some(tx) = &self.mqtt_tx {
+        if self.mqtt_tx.is_some() {
             let topic = if let Some(topic) = &self.mqtt_scanner_topic {
                 self.replace_vars(
                     topic,
@@ -802,19 +850,18 @@ impl BridgeContext {
                     .to_string();
                 format!("{}/scanner", root_topic)
             };
-            let _ = tx
-                .send(MqttMessage {
-                    topic: topic.clone(),
-                    payload: payload.to_string(),
-                    retain: false, // Scanner events usually don't need retain
-                })
-                .await;
+            self.try_send_mqtt(MqttMessage {
+                topic: topic.clone(),
+                payload: payload.to_string(),
+                retain: false,
+            })
+            .await;
         }
     }
 
     /// Clears all retained messages for a device
     pub async fn clear_retained_messages(&self, id: &str) {
-        if let Some(tx) = &self.mqtt_tx {
+        if self.mqtt_tx.is_some() {
             let topics = {
                 let mut published = self.published_topics.write().await;
                 published.remove(id)
@@ -822,13 +869,12 @@ impl BridgeContext {
 
             if let Some(topics) = topics {
                 for topic in topics {
-                    let _ = tx
-                        .send(MqttMessage {
-                            topic,
-                            payload: "".to_string(), // Empty payload clears retain
-                            retain: true,
-                        })
-                        .await;
+                    self.try_send_mqtt(MqttMessage {
+                        topic,
+                        payload: "".to_string(),
+                        retain: true,
+                    })
+                    .await;
                 }
             }
         }
