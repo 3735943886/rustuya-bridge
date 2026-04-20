@@ -40,7 +40,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
 | `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
 | `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | | MQTT payload template (e.g., `{"val": {value}}`) |
-| `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device configurations are stored |
+| `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
 
 ### Configuration File
