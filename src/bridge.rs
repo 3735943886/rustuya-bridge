@@ -1070,24 +1070,18 @@ impl BridgeContext {
     pub async fn get_bridge_status(&self) -> ApiResponse {
         let state = self.state.read().await;
 
-        let devices: Vec<Value> = state
-            .configs
-            .values()
-            .map(|cfg| {
-                serde_json::to_value(cfg)
-                    .map(|mut dev_val| {
-                        if let Some(obj) = dev_val.as_object_mut() {
-                            let status = self.determine_device_status(cfg, &state.instances);
-                            obj.insert("status".to_string(), Value::String(status));
-                        }
-                        dev_val
-                    })
-                    .unwrap_or_else(|_| Value::Null)
-            })
-            .filter(|v| !v.is_null())
-            .collect();
+        let mut devices = serde_json::Map::new();
+        for (id, cfg) in &state.configs {
+            if let Ok(mut dev_val) = serde_json::to_value(cfg) {
+                if let Some(obj) = dev_val.as_object_mut() {
+                    let status = self.determine_device_status(cfg, &state.instances);
+                    obj.insert("status".to_string(), Value::String(status));
+                }
+                devices.insert(id.clone(), dev_val);
+            }
+        }
 
-        ApiResponse::ok("status", "bridge").with_extra("devices", Value::Array(devices))
+        ApiResponse::ok("status", "bridge").with_extra("devices", Value::Object(devices))
     }
 
     fn determine_device_status(

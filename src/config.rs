@@ -161,7 +161,7 @@ impl Cli {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceConfig {
-    #[serde(alias = "devId", alias = "device_id", default, skip_serializing)]
+    #[serde(alias = "devId", alias = "device_id", default)]
     pub id: String,
     #[serde(skip_serializing_if = "is_empty_option")]
     pub name: Option<String>,
