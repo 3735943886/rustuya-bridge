@@ -78,12 +78,22 @@ impl Cli {
                     .with_context(|| format!("Failed to parse config file: {config_path}"))?;
                 cli.merge(file_cli);
                 info!("Merged configuration from {config_path}");
-            } else if std::env::var("CONFIG").is_ok_and(|v| v == config_path) {
-                // If it came from ENV and doesn't exist, just skip it without error
-                info!("Config file {config_path} not found, skipping (using defaults/env)");
             } else {
-                // If it was explicitly provided via CLI, it should probably be an error
-                anyhow::bail!("Config file not found: {config_path}");
+                info!("Config file {config_path} not found, creating a new one from current settings");
+                
+                // Fill defaults so the saved JSON has meaningful values instead of just nulls
+                cli.fill_defaults();
+                
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await.ok();
+                }
+                
+                let content = serde_json::to_string_pretty(&cli)
+                    .with_context(|| "Failed to serialize configuration")?;
+                tokio::fs::write(path, content)
+                    .await
+                    .with_context(|| format!("Failed to write config file: {config_path}"))?;
+                info!("Saved configuration to {config_path}");
             }
         }
 
@@ -156,6 +166,27 @@ impl Cli {
 
     pub fn get_mqtt_retain(&self) -> bool {
         self.mqtt_retain.unwrap_or(false)
+    }
+
+    pub fn fill_defaults(&mut self) {
+        if self.mqtt_root_topic.is_none() {
+            self.mqtt_root_topic = Some("rustuya".to_string());
+        }
+        if self.mqtt_command_topic.is_none() {
+            self.mqtt_command_topic = Some("{root}/command".to_string());
+        }
+        if self.mqtt_event_topic.is_none() {
+            self.mqtt_event_topic = Some("{root}/event/{type}".to_string());
+        }
+        if self.state_file.is_none() {
+            self.state_file = Some(DEFAULT_STATE_FILE.to_string());
+        }
+        if self.save_debounce_secs.is_none() {
+            self.save_debounce_secs = Some(DEFAULT_SAVE_DEBOUNCE_SECS);
+        }
+        if self.mqtt_retain.is_none() {
+            self.mqtt_retain = Some(false);
+        }
     }
 }
 
