@@ -28,6 +28,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/git/db \
 FROM debian:trixie-slim
 WORKDIR /app
 
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y tzdata ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy the binary from the builder stage
 COPY --from=builder /bin/rustuya-bridge /app/rustuya-bridge
 
