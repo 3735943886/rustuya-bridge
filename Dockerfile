@@ -11,7 +11,7 @@ RUN apt-get update && \
     apt-get install -y clang lld && \
     xx-apt-get install -y gcc g++ libc6-dev
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 RUN mkdir src
 COPY src ./src
 
