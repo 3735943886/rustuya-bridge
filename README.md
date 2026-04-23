@@ -20,7 +20,7 @@ Run with **host network mode** to ensure Tuya device discovery works correctly:
 docker run -d \
   --name rustuya \
   --network host \
-  -e MQTT_BROKER=mqtt://mqtt-broker:1883 \
+  -e MQTT_BROKER=mqtt://localhost:1883 \
   -v $(pwd)/data:/data \
   3735943886/rustuya
 ```
