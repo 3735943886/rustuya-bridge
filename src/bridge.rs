@@ -260,23 +260,7 @@ impl BridgeContext {
                                     break;
                                 }
                                 Err(_) => {
-                                    warn!("Device listener timeout after {}s", LISTENER_TIMEOUT_SECS);
-                                    let mut payload = serde_json::Map::new();
-                                    payload.insert(
-                                        "message".to_string(),
-                                        Value::String(format!(
-                                            "listener timeout after {}s",
-                                            LISTENER_TIMEOUT_SECS
-                                        )),
-                                    );
-                                    self.publish_device_message(
-                                        "bridge",
-                                        Some("bridge"),
-                                        None,
-                                        "error",
-                                        Value::Object(payload),
-                                    )
-                                    .await;
+                                    info!("Device listener timeout after {}s (no events received)", LISTENER_TIMEOUT_SECS);
                                 }
                             }
                         }
