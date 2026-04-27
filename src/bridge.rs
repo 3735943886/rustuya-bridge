@@ -423,10 +423,7 @@ impl BridgeContext {
     }
 
     pub async fn publish_bridge_config(&self, cli: &crate::config::Cli, clear: bool) {
-        let topic = format!(
-            "{}/bridge/config",
-            cli.mqtt_root_topic.as_deref().unwrap_or("rustuya")
-        );
+        let topic = "rustuya/bridge/config".to_string();
         let payload = if clear {
             String::new()
         } else {
