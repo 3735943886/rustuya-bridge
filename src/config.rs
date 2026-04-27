@@ -79,15 +79,17 @@ impl Cli {
                 cli.merge(file_cli);
                 info!("Merged configuration from {config_path}");
             } else {
-                info!("Config file {config_path} not found, creating a new one from current settings");
-                
+                info!(
+                    "Config file {config_path} not found, creating a new one from current settings"
+                );
+
                 // Fill defaults so the saved JSON has meaningful values instead of just nulls
                 cli.fill_defaults();
-                
+
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent).await.ok();
                 }
-                
+
                 let content = serde_json::to_string_pretty(&cli)
                     .with_context(|| "Failed to serialize configuration")?;
                 tokio::fs::write(path, content)

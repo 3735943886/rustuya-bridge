@@ -49,14 +49,14 @@ async fn main() -> Result<()> {
     }
 
     info!("Shutting down...");
-    
+
     // Publish clearing message and gracefully flush/close MQTT
     ctx.publish_bridge_config(&cli, true).await;
     ctx.shutdown_mqtt().await;
     if let Some(handle) = mqtt_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
     }
-    
+
     let _ = ctx.save_state().await;
     Ok(())
 }

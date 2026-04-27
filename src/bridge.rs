@@ -324,10 +324,10 @@ impl BridgeContext {
         self: Arc<Self>,
         cli: &Cli,
         mut mqtt_tx_receiver: mpsc::Receiver<Option<MqttMessage>>,
-    ) -> Result<tokio::task::JoinHandle<()>> {
+    ) -> Result<Option<tokio::task::JoinHandle<()>>> {
         let broker_url = match &cli.mqtt_broker {
             Some(url) => url,
-            None => return Ok(()),
+            None => return Ok(None),
         };
 
         let (mqtt_command_topic, _) = cli.get_mqtt_topics();
@@ -406,7 +406,7 @@ impl BridgeContext {
                                 debug!("MQTT shutdown signal received, flushing and disconnecting...");
                                 let _ = client.disconnect().await;
                                 loop {
-                                    if let Err(_) = eventloop.poll().await {
+                                    if eventloop.poll().await.is_err() {
                                         break;
                                     }
                                 }
@@ -419,11 +419,14 @@ impl BridgeContext {
             }
         });
 
-        Ok(handle)
+        Ok(Some(handle))
     }
 
     pub async fn publish_bridge_config(&self, cli: &crate::config::Cli, clear: bool) {
-        let topic = format!("{}/bridge/config", cli.mqtt_root_topic.as_deref().unwrap_or("rustuya"));
+        let topic = format!(
+            "{}/bridge/config",
+            cli.mqtt_root_topic.as_deref().unwrap_or("rustuya")
+        );
         let payload = if clear {
             String::new()
         } else {
@@ -433,7 +436,8 @@ impl BridgeContext {
             topic,
             payload,
             retain: true,
-        })).await;
+        }))
+        .await;
     }
 
     pub async fn shutdown_mqtt(&self) {
@@ -877,11 +881,11 @@ impl BridgeContext {
                     .to_string();
                 format!("{}/scanner", root_topic)
             };
-            self.try_send_mqtt(MqttMessage {
+            self.try_send_mqtt(Some(MqttMessage {
                 topic: topic.clone(),
                 payload: payload.to_string(),
                 retain: false,
-            })
+            }))
             .await;
         }
     }
@@ -896,11 +900,11 @@ impl BridgeContext {
 
             if let Some(topics) = topics {
                 for topic in topics {
-                    self.try_send_mqtt(MqttMessage {
+                    self.try_send_mqtt(Some(MqttMessage {
                         topic,
                         payload: "".to_string(),
                         retain: true,
-                    })
+                    }))
                     .await;
                 }
             }
