@@ -657,31 +657,16 @@ impl BridgeContext {
         if tpl.contains("{dp}") || tpl.contains("{value}") {
             if let Some(dps_obj) = dps.as_object() {
                 for (dp, val) in dps_obj {
-                    let topic = replace_vars_local(tpl, Some(dp), None);
-                    let payload = self
-                        .mqtt_payload_template
-                        .as_ref()
-                        .map(|p_tpl| replace_vars_local(p_tpl, Some(dp), Some(val)))
-                        .unwrap_or_else(|| val.to_string());
+                    let topic = replace_vars_local(tpl, Some(dp), Some(val));
+                    let p_tpl = self.mqtt_payload_template.as_deref().unwrap_or("{value}");
+                    let payload = replace_vars_local(p_tpl, Some(dp), Some(val));
                     templates.push((topic, payload));
                 }
             }
         } else {
             let topic = replace_vars_local(tpl, None, None);
-            let payload = self
-                .mqtt_payload_template
-                .as_ref()
-                .map(|p_tpl| replace_vars_local(p_tpl, None, None))
-                .unwrap_or_else(|| {
-                    let mut payload_obj = dps.clone();
-                    if let Some(obj) = payload_obj.as_object_mut() {
-                        obj.insert("id".to_string(), id.into());
-                        if let Some(n) = name {
-                            obj.insert("name".to_string(), n.into());
-                        }
-                    }
-                    payload_obj.to_string()
-                });
+            let p_tpl = self.mqtt_payload_template.as_deref().unwrap_or("{value}");
+            let payload = replace_vars_local(p_tpl, None, None);
             templates.push((topic, payload));
         }
 
@@ -750,26 +735,16 @@ impl BridgeContext {
         mut payload: Value,
     ) {
         if self.mqtt_tx.is_some() {
-            let topic = if let Some(tpl) = &self.mqtt_message_topic {
-                self.replace_vars(
-                    tpl,
-                    TopicVars {
-                        id,
-                        name,
-                        cid,
-                        level: Some(level),
-                        ..Default::default()
-                    },
-                )
-            } else {
-                let root_topic = self
-                    .mqtt_event_topic
-                    .replace("/{type}", "")
-                    .replace("/event", "")
-                    .trim_end_matches('/')
-                    .to_string();
-                format!("{}/{}/{}", root_topic, level, id)
-            };
+            let topic = self.replace_vars(
+                &self.mqtt_message_topic.clone().unwrap_or_default(),
+                TopicVars {
+                    id,
+                    name,
+                    cid,
+                    level: Some(level),
+                    ..Default::default()
+                },
+            );
 
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("id".to_string(), id.into());
@@ -836,10 +811,20 @@ impl BridgeContext {
         }
         if let Some(v) = vars.val {
             res = res.replace("{value}", &v.to_string());
+        } else if let Some(ds) = vars.dps_str {
+            res = res.replace("{value}", ds);
         }
         if let Some(ds) = vars.dps_str {
             res = res.replace("{dps}", ds);
         }
+        res = res.replace(
+            "{timestamp}",
+            &std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+        );
         res
     }
 
@@ -859,9 +844,9 @@ impl BridgeContext {
                         ..Default::default()
                     },
                 )
-            } else if let Some(tpl) = &self.mqtt_message_topic {
+            } else {
                 self.replace_vars(
-                    tpl,
+                    &self.mqtt_message_topic.clone().unwrap_or_default(),
                     TopicVars {
                         id: "bridge",
                         name: Some("bridge"),
@@ -869,14 +854,6 @@ impl BridgeContext {
                         ..Default::default()
                     },
                 )
-            } else {
-                let root_topic = self
-                    .mqtt_event_topic
-                    .replace("/{type}", "")
-                    .replace("/event", "")
-                    .trim_end_matches('/')
-                    .to_string();
-                format!("{}/scanner", root_topic)
             };
             self.try_send_mqtt(Some(MqttMessage {
                 topic: topic.clone(),

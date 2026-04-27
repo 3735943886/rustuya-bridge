@@ -7,6 +7,8 @@ use std::path::Path;
 
 pub const DEFAULT_STATE_FILE: &str = "rustuya.json";
 pub const DEFAULT_SAVE_DEBOUNCE_SECS: u64 = 30;
+pub const DEFAULT_MQTT_MESSAGE_TOPIC: &str = "{root}/{level}/{id}";
+pub const DEFAULT_MQTT_PAYLOAD_TEMPLATE: &str = "{value}";
 
 #[derive(Parser, Debug, Serialize, Deserialize, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -35,11 +37,11 @@ pub struct Cli {
     #[arg(long, env = "MQTT_CLIENT_ID")]
     pub mqtt_client_id: Option<String>,
 
-    /// MQTT Topic template for messages/errors
+    /// MQTT Topic template for messages/errors (defaults to {root}/{level}/{id})
     #[arg(long, env = "MQTT_MESSAGE_TOPIC")]
     pub mqtt_message_topic: Option<String>,
 
-    /// MQTT Payload template for device events (e.g. "{\"val\": {value}}")
+    /// MQTT Payload template for device events (e.g. "{\"val\": {value}}", defaults to {value})
     #[arg(long, env = "MQTT_PAYLOAD_TEMPLATE")]
     pub mqtt_payload_template: Option<String>,
 
@@ -99,6 +101,7 @@ impl Cli {
             }
         }
 
+        cli.fill_defaults();
         Ok(cli)
     }
 
@@ -188,6 +191,12 @@ impl Cli {
         }
         if self.mqtt_retain.is_none() {
             self.mqtt_retain = Some(false);
+        }
+        if self.mqtt_message_topic.is_none() {
+            self.mqtt_message_topic = Some(DEFAULT_MQTT_MESSAGE_TOPIC.to_string());
+        }
+        if self.mqtt_payload_template.is_none() {
+            self.mqtt_payload_template = Some(DEFAULT_MQTT_PAYLOAD_TEMPLATE.to_string());
         }
     }
 }
