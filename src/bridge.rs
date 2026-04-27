@@ -51,7 +51,7 @@ pub struct BridgeState {
 }
 
 pub struct BridgeContext {
-    pub mqtt_tx: Option<mpsc::Sender<MqttMessage>>,
+    pub mqtt_tx: Option<mpsc::Sender<Option<MqttMessage>>>,
     pub mqtt_event_topic: String,
     pub mqtt_retain: bool,
     pub mqtt_message_topic: Option<String>,
@@ -104,7 +104,7 @@ impl BridgeContext {
         cli: &Cli,
     ) -> (
         Arc<Self>,
-        mpsc::Receiver<MqttMessage>,
+        mpsc::Receiver<Option<MqttMessage>>,
         mpsc::Receiver<()>,
         mpsc::Receiver<()>,
     ) {
@@ -323,8 +323,8 @@ impl BridgeContext {
     pub fn spawn_mqtt_task(
         self: Arc<Self>,
         cli: &Cli,
-        mut mqtt_tx_receiver: mpsc::Receiver<MqttMessage>,
-    ) -> Result<()> {
+        mut mqtt_tx_receiver: mpsc::Receiver<Option<MqttMessage>>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
         let broker_url = match &cli.mqtt_broker {
             Some(url) => url,
             None => return Ok(()),
@@ -337,7 +337,7 @@ impl BridgeContext {
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
         let sub_topic = tpl_to_wildcard(&mqtt_command_topic);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut retry_delay = INITIAL_RETRY_DELAY_SECS;
             let mut next_retry: Option<Instant> = None;
             loop {
@@ -394,20 +394,55 @@ impl BridgeContext {
                             _ => {}
                         }
                     }
-                    Some(msg) = mqtt_tx_receiver.recv() => {
-                        debug!("MQTT Publish: [{}] {}", msg.topic, msg.payload);
-                        if let Err(e) = client.publish(msg.topic, rumqttc::QoS::AtLeastOnce, msg.retain, msg.payload).await {
-                            error!("Publish failed: {}", e);
+                    msg_opt = mqtt_tx_receiver.recv() => {
+                        match msg_opt {
+                            Some(Some(msg)) => {
+                                debug!("MQTT Publish: [{}] {}", msg.topic, msg.payload);
+                                if let Err(e) = client.publish(msg.topic, rumqttc::QoS::AtLeastOnce, msg.retain, msg.payload).await {
+                                    error!("Publish failed: {}", e);
+                                }
+                            }
+                            Some(None) | None => {
+                                debug!("MQTT shutdown signal received, flushing and disconnecting...");
+                                let _ = client.disconnect().await;
+                                loop {
+                                    if let Err(_) = eventloop.poll().await {
+                                        break;
+                                    }
+                                }
+                                debug!("MQTT eventloop terminated");
+                                return;
+                            }
                         }
                     }
                 }
             }
         });
 
-        Ok(())
+        Ok(handle)
     }
 
-    async fn try_send_mqtt(&self, msg: MqttMessage) {
+    pub async fn publish_bridge_config(&self, cli: &crate::config::Cli, clear: bool) {
+        let topic = format!("{}/bridge/config", cli.mqtt_root_topic.as_deref().unwrap_or("rustuya"));
+        let payload = if clear {
+            String::new()
+        } else {
+            serde_json::to_string(cli).unwrap_or_else(|_| "{}".to_string())
+        };
+        self.try_send_mqtt(Some(MqttMessage {
+            topic,
+            payload,
+            retain: true,
+        })).await;
+    }
+
+    pub async fn shutdown_mqtt(&self) {
+        if let Some(tx) = &self.mqtt_tx {
+            let _ = tokio::time::timeout(Duration::from_millis(500), tx.send(None)).await;
+        }
+    }
+
+    async fn try_send_mqtt(&self, msg: Option<MqttMessage>) {
         if let Some(tx) = &self.mqtt_tx
             && tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
                 .await
@@ -694,11 +729,11 @@ impl BridgeContext {
             }
 
             for (topic, payload) in templates {
-                self.try_send_mqtt(MqttMessage {
+                self.try_send_mqtt(Some(MqttMessage {
                     topic,
                     payload,
                     retain: self.mqtt_retain,
-                })
+                }))
                 .await;
             }
         }
@@ -745,11 +780,11 @@ impl BridgeContext {
                 }
             }
 
-            self.try_send_mqtt(MqttMessage {
+            self.try_send_mqtt(Some(MqttMessage {
                 topic,
                 payload: payload.to_string(),
                 retain: false,
-            })
+            }))
             .await;
         }
     }
