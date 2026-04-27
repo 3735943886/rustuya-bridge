@@ -49,6 +49,7 @@ async fn handle_request_inner(
                 version,
                 cid,
                 parent_id,
+                last_error_code: None,
             })
             .await
         }

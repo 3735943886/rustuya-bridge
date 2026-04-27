@@ -228,6 +228,9 @@ pub struct DeviceConfig {
         alias = "gatewayId"
     )]
     pub parent_id: Option<String>,
+    /// Last error code received from the device. Not persisted to state file.
+    #[serde(skip)]
+    pub last_error_code: Option<u32>,
 }
 
 #[allow(clippy::ref_option)]

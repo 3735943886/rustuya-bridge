@@ -218,6 +218,14 @@ impl BridgeContext {
                                     } else {
                                         info!("Device {} reported error: {}", target_id, payload);
                                     }
+                                    // Update last_error_code in device config
+                                    let error_code = payload.get("errorCode").and_then(|v| v.as_u64()).map(|v| v as u32);
+                                    if let Some(code) = error_code {
+                                        let mut state = self.state.write().await;
+                                        if let Some(cfg) = state.configs.get_mut(&target_id) {
+                                            cfg.last_error_code = Some(code);
+                                        }
+                                    }
                                     self.publish_device_message(&target_id, name.as_deref(), cid.as_deref(), "error", payload).await;
                                     continue;
                                 }
@@ -1065,7 +1073,9 @@ impl BridgeContext {
             }
         }
 
-        ApiResponse::ok("status", "bridge").with_extra("devices", Value::Object(devices))
+        let mut resp = ApiResponse::ok("status", "");
+        resp.id = None;
+        resp.with_extra("devices", Value::Object(devices))
     }
 
     fn determine_device_status(
@@ -1074,6 +1084,7 @@ impl BridgeContext {
         instances: &HashMap<String, Device>,
     ) -> String {
         if cfg.cid.is_some() {
+            // Sub-device: check if parent instance exists
             cfg.parent_id
                 .as_ref()
                 .map(|p_id| {
@@ -1086,7 +1097,12 @@ impl BridgeContext {
                 .unwrap_or("invalid subdevice")
                 .to_string()
         } else if instances.contains_key(&cfg.id) {
-            "online".to_string()
+            // Direct device: use last_error_code if present, else "online"
+            if let Some(code) = cfg.last_error_code {
+                code.to_string()
+            } else {
+                "online".to_string()
+            }
         } else {
             "offline".to_string()
         }
