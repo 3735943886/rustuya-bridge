@@ -9,6 +9,9 @@ pub const DEFAULT_STATE_FILE: &str = "rustuya.json";
 pub const DEFAULT_SAVE_DEBOUNCE_SECS: u64 = 30;
 pub const DEFAULT_MQTT_MESSAGE_TOPIC: &str = "{root}/{level}/{id}";
 pub const DEFAULT_MQTT_PAYLOAD_TEMPLATE: &str = "{value}";
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+pub const DEFAULT_MQTT_CLIENT_ID: &str = "rustuya-bridge";
+pub const DEFAULT_MQTT_SCANNER_TOPIC: &str = "{root}/scanner";
 
 #[derive(Parser, Debug, Serialize, Deserialize, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -197,6 +200,15 @@ impl Cli {
         }
         if self.mqtt_payload_template.is_none() {
             self.mqtt_payload_template = Some(DEFAULT_MQTT_PAYLOAD_TEMPLATE.to_string());
+        }
+        if self.log_level.is_none() {
+            self.log_level = Some(DEFAULT_LOG_LEVEL.to_string());
+        }
+        if self.mqtt_client_id.is_none() {
+            self.mqtt_client_id = Some(DEFAULT_MQTT_CLIENT_ID.to_string());
+        }
+        if self.mqtt_scanner_topic.is_none() {
+            self.mqtt_scanner_topic = Some(DEFAULT_MQTT_SCANNER_TOPIC.to_string());
         }
     }
 }

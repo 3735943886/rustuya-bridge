@@ -14,7 +14,10 @@ async fn main() -> Result<()> {
     let cli = Cli::load().await?;
 
     // Initialize logger from config (CLI/Env/JSON)
-    let log_level = cli.log_level.as_deref().unwrap_or("info");
+    let log_level = cli
+        .log_level
+        .as_deref()
+        .unwrap_or(crate::config::DEFAULT_LOG_LEVEL);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
     // Maximize file descriptor limit for better performance
