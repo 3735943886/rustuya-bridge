@@ -52,6 +52,7 @@ pub struct BridgeState {
 
 pub struct BridgeContext {
     pub mqtt_tx: Option<mpsc::Sender<Option<MqttMessage>>>,
+    pub mqtt_root_topic: String,
     pub mqtt_event_topic: String,
     pub mqtt_retain: bool,
     pub mqtt_message_topic: Option<String>,
@@ -145,6 +146,10 @@ impl BridgeContext {
 
         let ctx = Arc::new(Self {
             mqtt_tx: cli.mqtt_broker.is_some().then_some(mqtt_tx_sender),
+            mqtt_root_topic: cli
+                .mqtt_root_topic
+                .clone()
+                .unwrap_or_else(|| crate::config::DEFAULT_MQTT_ROOT_TOPIC.to_string()),
             mqtt_event_topic,
             mqtt_retain: cli.get_mqtt_retain(),
             mqtt_message_topic: cli.mqtt_message_topic.clone(),
@@ -787,15 +792,8 @@ impl BridgeContext {
 
     /// Helper to replace template variables in a string
     fn replace_vars(&self, template: &str, vars: TopicVars) -> String {
-        let root_topic = self
-            .mqtt_event_topic
-            .replace("/{type}", "")
-            .replace("/event", "")
-            .trim_end_matches('/')
-            .to_string();
-
         let mut res = template
-            .replace("{root}", &root_topic)
+            .replace("{root}", &self.mqtt_root_topic)
             .replace("{id}", vars.id)
             .replace("{name}", vars.name.unwrap_or(""))
             .replace("{cid}", vars.cid.unwrap_or(""));
