@@ -7,6 +7,9 @@ use std::path::Path;
 
 pub const DEFAULT_STATE_FILE: &str = "rustuya.json";
 pub const DEFAULT_SAVE_DEBOUNCE_SECS: u64 = 30;
+pub const DEFAULT_MQTT_ROOT_TOPIC: &str = "rustuya";
+pub const DEFAULT_MQTT_COMMAND_TOPIC: &str = "{root}/command";
+pub const DEFAULT_MQTT_EVENT_TOPIC: &str = "{root}/event/{type}/{id}";
 pub const DEFAULT_MQTT_MESSAGE_TOPIC: &str = "{root}/{level}/{id}";
 pub const DEFAULT_MQTT_PAYLOAD_TEMPLATE: &str = "{value}";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
@@ -24,7 +27,7 @@ pub struct Cli {
     #[arg(short = 'm', long, env = "MQTT_BROKER")]
     pub mqtt_broker: Option<String>,
 
-    /// MQTT Root topic (used as prefix for command/event topics)
+    /// MQTT Root topic (defaults to rustuya)
     #[arg(long, env = "MQTT_ROOT_TOPIC")]
     pub mqtt_root_topic: Option<String>,
 
@@ -32,7 +35,7 @@ pub struct Cli {
     #[arg(long, env = "MQTT_COMMAND_TOPIC")]
     pub mqtt_command_topic: Option<String>,
 
-    /// MQTT Event topic (defaults to {root_topic}/event)
+    /// MQTT Event topic (defaults to {root}/event/{type})
     #[arg(long, env = "MQTT_EVENT_TOPIC")]
     pub mqtt_event_topic: Option<String>,
 
@@ -148,13 +151,16 @@ impl Cli {
     }
 
     pub fn get_mqtt_topics(&self) -> (String, String) {
-        let root_topic = self.mqtt_root_topic.as_deref().unwrap_or("rustuya");
+        let root_topic = self
+            .mqtt_root_topic
+            .as_deref()
+            .unwrap_or(DEFAULT_MQTT_ROOT_TOPIC);
         let mqtt_command_topic = self.mqtt_command_topic.as_deref().map_or_else(
-            || format!("{root_topic}/command"),
+            || DEFAULT_MQTT_COMMAND_TOPIC.replace("{root}", root_topic),
             |t| t.replace("{root}", root_topic),
         );
         let mqtt_event_topic = self.mqtt_event_topic.as_deref().map_or_else(
-            || format!("{root_topic}/event/{{type}}"),
+            || DEFAULT_MQTT_EVENT_TOPIC.replace("{root}", root_topic),
             |t| t.replace("{root}", root_topic),
         );
         (mqtt_command_topic, mqtt_event_topic)
@@ -178,13 +184,13 @@ impl Cli {
 
     pub fn fill_defaults(&mut self) {
         if self.mqtt_root_topic.is_none() {
-            self.mqtt_root_topic = Some("rustuya".to_string());
+            self.mqtt_root_topic = Some(DEFAULT_MQTT_ROOT_TOPIC.to_string());
         }
         if self.mqtt_command_topic.is_none() {
-            self.mqtt_command_topic = Some("{root}/command".to_string());
+            self.mqtt_command_topic = Some(DEFAULT_MQTT_COMMAND_TOPIC.to_string());
         }
         if self.mqtt_event_topic.is_none() {
-            self.mqtt_event_topic = Some("{root}/event/{type}".to_string());
+            self.mqtt_event_topic = Some(DEFAULT_MQTT_EVENT_TOPIC.to_string());
         }
         if self.state_file.is_none() {
             self.state_file = Some(DEFAULT_STATE_FILE.to_string());

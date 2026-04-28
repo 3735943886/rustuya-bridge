@@ -35,7 +35,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-broker`, `-m` | `MQTT_BROKER` | - | MQTT Broker address (e.g., `mqtt://user:pass@localhost:1883`) |
 | `--mqtt-root-topic` | `MQTT_ROOT_TOPIC` | `rustuya` | MQTT root topic prefix |
 | `--mqtt-command-topic`| `MQTT_COMMAND_TOPIC` | `{root}/command` | MQTT topic for commands |
-| `--mqtt-event-topic` | `MQTT_EVENT_TOPIC` | `{root}/event/{type}` | MQTT topic for events |
+| `--mqtt-event-topic` | `MQTT_EVENT_TOPIC` | `{root}/event/{type}/{id}` | MQTT topic for events |
 | `--mqtt-scanner-topic` | `MQTT_SCANNER_TOPIC` | `{root}/scanner` | MQTT topic for scanner results |
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
 | `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
