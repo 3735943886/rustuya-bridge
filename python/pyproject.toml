@@ -4,6 +4,21 @@ build-backend = "maturin"
 
 [project]
 name = "rustuyabridge"
-version = "0.1.0"
-description = "Python bindings for rustuya-bridge"
-requires-python = ">=3.8"
+dynamic = ["version"]
+description = "Python bindings for rustuyabridge"
+authors = [
+    { name = "3735943886" }
+]
+requires-python = ">=3.7"
+license = { text = "MIT" }
+keywords = ["tuya", "iot", "smart-home", "automation"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/3735943886/rustuya-bridge"
+Repository = "https://github.com/3735943886/rustuya-bridge"
