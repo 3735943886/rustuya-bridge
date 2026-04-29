@@ -107,7 +107,7 @@ impl PyBridgeServer {
 }
 
 #[pymodule]
-fn rustuya_bridge_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn pyrustuyabridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_log::init();
     m.add_class::<PyBridgeServer>()?;
     Ok(())
