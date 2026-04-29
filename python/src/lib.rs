@@ -17,6 +17,8 @@ impl PyBridgeServer {
             config: None,
             mqtt_broker: None,
             mqtt_root_topic: None,
+            mqtt_user: None,
+            mqtt_password: None,
             mqtt_command_topic: None,
             mqtt_event_topic: None,
             mqtt_client_id: None,
@@ -38,6 +40,12 @@ impl PyBridgeServer {
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_root_topic") {
                 cli.mqtt_root_topic = Some(val.extract()?);
+            }
+            if let Ok(Some(val)) = dict.get_item("mqtt_user") {
+                cli.mqtt_user = Some(val.extract()?);
+            }
+            if let Ok(Some(val)) = dict.get_item("mqtt_password") {
+                cli.mqtt_password = Some(val.extract()?);
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_command_topic") {
                 cli.mqtt_command_topic = Some(val.extract()?);

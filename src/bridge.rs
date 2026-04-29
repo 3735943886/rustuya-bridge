@@ -337,7 +337,7 @@ impl BridgeContext {
 
         let (mqtt_command_topic, _) = cli.get_mqtt_topics();
         let client_id = cli.mqtt_client_id.as_deref().unwrap_or("rustuya-bridge");
-        let mqtt_options = self.create_mqtt_options(broker_url, client_id)?;
+        let mqtt_options = self.create_mqtt_options(broker_url, client_id, cli)?;
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
         let sub_topic = tpl_to_wildcard(&mqtt_command_topic);
@@ -463,6 +463,7 @@ impl BridgeContext {
         &self,
         broker_url: &str,
         client_id: &str,
+        cli: &Cli,
     ) -> Result<rumqttc::MqttOptions> {
         let mut opts = if broker_url.contains("://") {
             let url = url::Url::parse(broker_url)?;
@@ -473,9 +474,14 @@ impl BridgeContext {
             let port = url.port().unwrap_or(if is_ssl { 8883 } else { 1883 });
 
             let mut opts = rumqttc::MqttOptions::new(client_id, host, port);
-            if !url.username().is_empty() {
+
+            // Priority: Cli fields > URL components
+            if let Some(user) = &cli.mqtt_user {
+                opts.set_credentials(user, cli.mqtt_password.as_deref().unwrap_or(""));
+            } else if !url.username().is_empty() {
                 opts.set_credentials(url.username(), url.password().unwrap_or(""));
             }
+
             if is_ssl {
                 opts.set_transport(rumqttc::Transport::tls(Vec::new(), None, None));
             }
@@ -484,7 +490,11 @@ impl BridgeContext {
             let parts: Vec<&str> = broker_url.split(':').collect();
             let host = parts[0];
             let port = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1883);
-            rumqttc::MqttOptions::new(client_id, host, port)
+            let mut opts = rumqttc::MqttOptions::new(client_id, host, port);
+            if let Some(user) = &cli.mqtt_user {
+                opts.set_credentials(user, cli.mqtt_password.as_deref().unwrap_or(""));
+            }
+            opts
         };
 
         opts.set_keep_alive(Duration::from_secs(5));

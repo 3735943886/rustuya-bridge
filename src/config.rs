@@ -27,6 +27,14 @@ pub struct Cli {
     #[arg(short = 'm', long, env = "MQTT_BROKER")]
     pub mqtt_broker: Option<String>,
 
+    /// MQTT User
+    #[arg(long, env = "MQTT_USER")]
+    pub mqtt_user: Option<String>,
+
+    /// MQTT Password
+    #[arg(long, env = "MQTT_PASSWORD")]
+    pub mqtt_password: Option<String>,
+
     /// MQTT Root topic (defaults to rustuya)
     #[arg(long, env = "MQTT_ROOT_TOPIC")]
     pub mqtt_root_topic: Option<String>,
@@ -115,6 +123,8 @@ impl Cli {
         let Self {
             config: _,
             mqtt_broker,
+            mqtt_user,
+            mqtt_password,
             mqtt_root_topic,
             mqtt_command_topic,
             mqtt_event_topic,
@@ -137,6 +147,8 @@ impl Cli {
         }
 
         merge_field!(mqtt_broker);
+        merge_field!(mqtt_user);
+        merge_field!(mqtt_password);
         merge_field!(mqtt_root_topic);
         merge_field!(mqtt_command_topic);
         merge_field!(mqtt_event_topic);
