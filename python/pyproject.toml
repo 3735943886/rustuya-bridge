@@ -24,7 +24,4 @@ Homepage = "https://github.com/3735943886/rustuya-bridge"
 Repository = "https://github.com/3735943886/rustuya-bridge"
 
 [tool.maturin]
-python-source = "src"
-module-name = "pyrustuyabridge"
-features = ["pyo3/extension-module"]
 exclude = ["target/*", "**/target/*"]
