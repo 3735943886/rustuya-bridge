@@ -15,3 +15,10 @@ tokio = { version = "1.49", features = ["rt-multi-thread"] }
 anyhow = "1.0"
 pyo3-log = "0.13"
 rustuyabridge = { path = "../" }
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Maximize optimizations
+panic = "abort"     # Remove panic unwinding
+strip = true        # Strip symbols from binary
