@@ -76,10 +76,10 @@ pub fn tpl_to_wildcard(template: &str) -> String {
         .replace("{action}", "+")
 }
 
-/// Matches MQTT topic against template and extracts variables
-pub fn match_topic(topic: &str, template: &str) -> Option<HashMap<String, String>> {
+/// Compiles a template into a Regex if it contains variables
+pub fn compile_topic_regex(template: &str) -> Option<Regex> {
     if !template.contains('{') {
-        return (topic == template).then(HashMap::new);
+        return None;
     }
 
     // Convert template to regex. E.g. "tuya/{id}/command" -> "^tuya/(?P<id>[^/]+)/command$"
@@ -88,16 +88,27 @@ pub fn match_topic(topic: &str, template: &str) -> Option<HashMap<String, String
         pattern = pattern.replace(&format!(r"\{{{}\}}", key), &format!(r"(?P<{}>[^/]+)", key));
     }
 
-    let re = Regex::new(&format!("^{}$", pattern)).ok()?;
-    let caps = re.captures(topic)?;
+    Regex::new(&format!("^{}$", pattern)).ok()
+}
 
-    let mut vars = HashMap::new();
-    for name in re.capture_names().flatten() {
-        if let Some(m) = caps.name(name) {
-            vars.insert(name.to_string(), m.as_str().to_string());
+/// Matches MQTT topic against precompiled regex or template
+pub fn match_topic(
+    topic: &str,
+    template: &str,
+    re: Option<&Regex>,
+) -> Option<HashMap<String, String>> {
+    if let Some(re) = re {
+        let caps = re.captures(topic)?;
+        let mut vars = HashMap::new();
+        for name in re.capture_names().flatten() {
+            if let Some(m) = caps.name(name) {
+                vars.insert(name.to_string(), m.as_str().to_string());
+            }
         }
+        Some(vars)
+    } else {
+        (topic == template).then(HashMap::new)
     }
-    Some(vars)
 }
 
 impl BridgeContext {
@@ -172,20 +183,44 @@ impl BridgeContext {
     }
 
     /// Starts state saver task with debounce
-    pub fn spawn_state_saver(self: Arc<Self>, mut save_rx: mpsc::Receiver<()>) {
+    pub fn spawn_state_saver(
+        self: Arc<Self>,
+        mut save_rx: mpsc::Receiver<()>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            while save_rx.recv().await.is_some() {
-                tokio::time::sleep(Duration::from_secs(self.save_debounce_secs)).await;
-                while save_rx.try_recv().is_ok() {} // Drain pending requests
-                if let Err(e) = self.save_state().await {
-                    error!("Save failed: {}", e);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    res = save_rx.recv() => {
+                        if res.is_none() { break; }
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                while save_rx.try_recv().is_ok() {} // Drain pending requests
+                                if let Err(e) = self.save_state().await {
+                                    error!("Save failed during shutdown: {}", e);
+                                }
+                                break;
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(self.save_debounce_secs)) => {
+                                while save_rx.try_recv().is_ok() {} // Drain pending requests
+                                if let Err(e) = self.save_state().await {
+                                    error!("Save failed: {}", e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        });
+        })
     }
 
     /// Starts device event listener task
-    pub fn spawn_device_listener(self: Arc<Self>, mut refresh_rx: mpsc::Receiver<()>) {
+    pub fn spawn_device_listener(
+        self: Arc<Self>,
+        mut refresh_rx: mpsc::Receiver<()>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 let instances = {
@@ -194,16 +229,20 @@ impl BridgeContext {
                 };
 
                 if instances.is_empty() {
-                    if refresh_rx.recv().await.is_none() {
-                        break;
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        res = refresh_rx.recv() => {
+                            if res.is_none() { return; }
+                            continue;
+                        }
                     }
-                    continue;
                 }
 
                 let mut stream = rustuya::device::unified_listener(instances.clone());
                 debug!("Started unified listener for {} devices", instances.len());
                 loop {
                     tokio::select! {
+                        _ = cancel.cancelled() => return,
                         res = tokio::time::timeout(Duration::from_secs(LISTENER_TIMEOUT_SECS), stream.next()) => {
                             match res {
                                 Ok(Some(event_res)) => {
@@ -281,7 +320,7 @@ impl BridgeContext {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Resolves target device ID and name from raw device event and payload
@@ -341,6 +380,7 @@ impl BridgeContext {
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
         let sub_topic = tpl_to_wildcard(&mqtt_command_topic);
+        let command_topic_re = compile_topic_regex(&mqtt_command_topic);
 
         let handle = tokio::spawn(async move {
             let mut retry_delay = INITIAL_RETRY_DELAY_SECS;
@@ -370,7 +410,7 @@ impl BridgeContext {
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
                                 let payload = String::from_utf8_lossy(&p.payload);
                                 debug!("MQTT Received: [{}] {}", p.topic, payload);
-                                let vars = match_topic(&p.topic, &mqtt_command_topic).unwrap_or_default();
+                                let vars = match_topic(&p.topic, &mqtt_command_topic, command_topic_re.as_ref()).unwrap_or_default();
                                 let req_val = self.parse_mqtt_payload(&payload, vars);
 
                                 let requests = if let Some(arr) = req_val.as_array() {

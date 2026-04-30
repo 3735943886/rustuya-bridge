@@ -19,6 +19,7 @@ regex = "1.11"
 anyhow = "1.0"
 thiserror = "2.0"
 url = "2.5"
+tokio-util = "0.7"
 
 [profile.release]
 opt-level = 3

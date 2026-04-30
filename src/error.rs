@@ -16,4 +16,6 @@ pub enum BridgeError {
     InvalidRequest(String),
     #[error("Timeout: {0}")]
     Timeout(String),
+    #[error("Device error: {0}")]
+    DeviceError(String),
 }
