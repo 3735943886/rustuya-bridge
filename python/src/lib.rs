@@ -33,49 +33,49 @@ impl PyBridgeServer {
 
         if let Some(dict) = kwargs {
             if let Ok(Some(val)) = dict.get_item("config_path") {
-                cli.config = Some(val.extract()?);
+                cli.config = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_broker") {
-                cli.mqtt_broker = Some(val.extract()?);
+                cli.mqtt_broker = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_root_topic") {
-                cli.mqtt_root_topic = Some(val.extract()?);
+                cli.mqtt_root_topic = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_user") {
-                cli.mqtt_user = Some(val.extract()?);
+                cli.mqtt_user = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_password") {
-                cli.mqtt_password = Some(val.extract()?);
+                cli.mqtt_password = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_command_topic") {
-                cli.mqtt_command_topic = Some(val.extract()?);
+                cli.mqtt_command_topic = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_event_topic") {
-                cli.mqtt_event_topic = Some(val.extract()?);
+                cli.mqtt_event_topic = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_client_id") {
-                cli.mqtt_client_id = Some(val.extract()?);
+                cli.mqtt_client_id = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_message_topic") {
-                cli.mqtt_message_topic = Some(val.extract()?);
+                cli.mqtt_message_topic = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_payload_template") {
-                cli.mqtt_payload_template = Some(val.extract()?);
+                cli.mqtt_payload_template = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_scanner_topic") {
-                cli.mqtt_scanner_topic = Some(val.extract()?);
+                cli.mqtt_scanner_topic = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("mqtt_retain") {
-                cli.mqtt_retain = Some(val.extract()?);
+                cli.mqtt_retain = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("state_file") {
-                cli.state_file = Some(val.extract()?);
+                cli.state_file = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("save_debounce_secs") {
-                cli.save_debounce_secs = Some(val.extract()?);
+                cli.save_debounce_secs = val.extract()?;
             }
             if let Ok(Some(val)) = dict.get_item("log_level") {
-                cli.log_level = Some(val.extract()?);
+                cli.log_level = val.extract()?;
             }
         }
 
