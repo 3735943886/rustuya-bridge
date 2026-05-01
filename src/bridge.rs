@@ -468,7 +468,7 @@ impl BridgeContext {
     }
 
     pub async fn publish_bridge_config(&self, cli: &crate::config::Cli, clear: bool) {
-        let topic = "rustuya/bridge/config".to_string();
+        let topic = crate::config::BRIDGE_CONFIG_TOPIC.to_string();
         let payload = if clear {
             String::new()
         } else {
@@ -538,6 +538,15 @@ impl BridgeContext {
         };
 
         opts.set_keep_alive(Duration::from_secs(5));
+
+        // Set Last Will and Testament (LWT) to clear the config on abnormal termination
+        opts.set_last_will(rumqttc::LastWill {
+            topic: crate::config::BRIDGE_CONFIG_TOPIC.to_string(),
+            message: bytes::Bytes::from(""),
+            qos: rumqttc::QoS::AtLeastOnce,
+            retain: true,
+        });
+
         Ok(opts)
     }
 

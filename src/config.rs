@@ -15,6 +15,7 @@ pub const DEFAULT_MQTT_PAYLOAD_TEMPLATE: &str = "{value}";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_MQTT_CLIENT_ID: &str = "rustuya-bridge";
 pub const DEFAULT_MQTT_SCANNER_TOPIC: &str = "{root}/scanner";
+pub const BRIDGE_CONFIG_TOPIC: &str = "rustuya/bridge/config";
 
 #[derive(Parser, Debug, Serialize, Deserialize, Clone)]
 #[command(author, version, about, long_about = None)]
