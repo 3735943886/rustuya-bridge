@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "rustuyabridge"
+name = "pyrustuyabridge"
 dynamic = ["version"]
 description = "Python bindings for rustuyabridge"
 authors = [
