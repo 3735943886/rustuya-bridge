@@ -427,7 +427,10 @@ impl BridgeContext {
                                     let ctx_h = self.clone();
                                     tokio::spawn(async move {
                                         let res = crate::handlers::handle_request(ctx_h.clone(), req).await;
-                                        ctx_h.publish_api_response(res).await;
+                                        // Suppress response for successful set/get actions to avoid redundancy
+                                        if res.status != crate::types::Status::Ok || !matches!(res.action.as_deref(), Some("set" | "get")) {
+                                            ctx_h.publish_api_response(res).await;
+                                        }
                                     });
                                 }
                             }
