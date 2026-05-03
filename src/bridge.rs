@@ -823,10 +823,16 @@ impl BridgeContext {
                 }
             }
 
+            let retain = self.mqtt_retain && level == "error";
+            if retain {
+                let mut topics = self.published_topics.write().await;
+                topics.entry(id.to_string()).or_default().insert(topic.clone());
+            }
+
             self.try_send_mqtt(Some(MqttMessage {
                 topic,
                 payload: payload.to_string(),
-                retain: false,
+                retain,
             }))
             .await;
         }
