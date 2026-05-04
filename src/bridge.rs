@@ -547,6 +547,14 @@ impl BridgeContext {
     /// Fully closes the bridge context and cleans up resources
     pub async fn close(&self) {
         info!("Closing bridge context...");
+
+        // Drop all Device instances first so the rustuya library stops its
+        // internal background scanning/reconnection tasks before we proceed.
+        {
+            let mut state = self.state.write().await;
+            state.instances.clear();
+        }
+
         self.cancel.cancel();
         self.shutdown_mqtt().await;
         let _ = self.save_state().await;
