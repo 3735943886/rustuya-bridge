@@ -380,8 +380,8 @@ impl BridgeContext {
         };
 
         let (mqtt_command_topic, _) = cli.get_mqtt_topics();
-        let client_id = cli.mqtt_client_id.as_deref().unwrap_or("rustuya-bridge");
-        let mqtt_options = self.create_mqtt_options(broker_url, client_id, cli)?;
+        let client_id = cli.get_mqtt_client_id();
+        let mqtt_options = self.create_mqtt_options(broker_url, &client_id, cli)?;
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 100);
         let sub_topic = tpl_to_wildcard(&mqtt_command_topic);
@@ -516,7 +516,7 @@ impl BridgeContext {
     }
 
     pub async fn publish_bridge_config(&self, cli: Option<&crate::config::Cli>, clear: bool) {
-        let topic = crate::config::BRIDGE_CONFIG_TOPIC.to_string();
+        let topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
         let payload = if clear {
             String::new()
         } else {
@@ -621,7 +621,7 @@ impl BridgeContext {
 
         // Set Last Will and Testament (LWT) to clear the config on abnormal termination
         opts.set_last_will(rumqttc::LastWill {
-            topic: crate::config::BRIDGE_CONFIG_TOPIC.to_string(),
+            topic: crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic),
             message: bytes::Bytes::from(""),
             qos: rumqttc::QoS::AtLeastOnce,
             retain: true,

@@ -13,9 +13,9 @@ pub const DEFAULT_MQTT_EVENT_TOPIC: &str = "{root}/event/{type}/{id}";
 pub const DEFAULT_MQTT_MESSAGE_TOPIC: &str = "{root}/{level}/{id}";
 pub const DEFAULT_MQTT_PAYLOAD_TEMPLATE: &str = "{value}";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
-pub const DEFAULT_MQTT_CLIENT_ID: &str = "rustuya-bridge";
+pub const DEFAULT_MQTT_CLIENT_ID: &str = "{root}-bridge";
 pub const DEFAULT_MQTT_SCANNER_TOPIC: &str = "{root}/scanner";
-pub const BRIDGE_CONFIG_TOPIC: &str = "rustuya/bridge/config";
+pub const BRIDGE_CONFIG_TOPIC: &str = "{root}/bridge/config";
 
 #[derive(Parser, Debug, Serialize, Deserialize, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -183,6 +183,17 @@ impl Cli {
             |t| t.replace("{root}", root_topic),
         );
         (mqtt_command_topic, mqtt_event_topic)
+    }
+
+    pub fn get_mqtt_client_id(&self) -> String {
+        let root_topic = self
+            .mqtt_root_topic
+            .as_deref()
+            .unwrap_or(DEFAULT_MQTT_ROOT_TOPIC);
+        self.mqtt_client_id.as_deref().map_or_else(
+            || DEFAULT_MQTT_CLIENT_ID.replace("{root}", root_topic),
+            |t| t.replace("{root}", root_topic),
+        )
     }
 
     pub fn get_state_file(&self) -> String {
