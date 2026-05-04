@@ -61,8 +61,10 @@ pub struct BridgeContext {
     pub state_file: String,
     pub save_debounce_secs: u64,
     pub state: RwLock<BridgeState>,
-    /// Published topics per device (for clearing retained messages)
+    /// All retain topics ever published (keyed by device id for per-device removal)
     pub published_topics: RwLock<HashMap<String, HashSet<String>>>,
+    /// Flat set of ALL retain topics scheduled for publishing (for shutdown clearing)
+    pub retain_topics: RwLock<HashSet<String>>,
     pub save_tx: mpsc::Sender<()>,
     pub refresh_tx: mpsc::Sender<()>,
     pub cancel: tokio_util::sync::CancellationToken,
@@ -176,6 +178,7 @@ impl BridgeContext {
                 name_map: initial_name_map,
             }),
             published_topics: RwLock::new(HashMap::new()),
+            retain_topics: RwLock::new(HashSet::new()),
             save_tx,
             refresh_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -555,12 +558,18 @@ impl BridgeContext {
     }
 
     async fn try_send_mqtt(&self, msg: Option<MqttMessage>) {
-        if let Some(tx) = &self.mqtt_tx
-            && tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
+        if let Some(tx) = &self.mqtt_tx {
+            // Track retain topics the moment they are scheduled for publishing.
+            // This ensures no race between tracking and the shutdown clearing.
+            if let Some(ref m) = msg && m.retain {
+                self.retain_topics.write().await.insert(m.topic.clone());
+            }
+            if tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
                 .await
                 .is_err()
-        {
-            warn!("MQTT queue full, dropping message");
+            {
+                warn!("MQTT queue full, dropping message");
+            }
         }
     }
 
@@ -836,14 +845,6 @@ impl BridgeContext {
                 return;
             }
 
-            if self.mqtt_retain {
-                let mut topics = self.published_topics.write().await;
-                let device_topics = topics.entry(id.clone()).or_default();
-                for (topic, _) in &templates {
-                    device_topics.insert(topic.clone());
-                }
-            }
-
             for (topic, payload) in templates {
                 self.try_send_mqtt(Some(MqttMessage {
                     topic,
@@ -887,14 +888,6 @@ impl BridgeContext {
             }
 
             let retain = self.mqtt_retain && level == "error";
-            if retain {
-                let mut topics = self.published_topics.write().await;
-                topics
-                    .entry(id.to_string())
-                    .or_default()
-                    .insert(topic.clone());
-            }
-
             self.try_send_mqtt(Some(MqttMessage {
                 topic,
                 payload: payload.to_string(),
@@ -1030,11 +1023,11 @@ impl BridgeContext {
         }
     }
 
-    /// Safely retrieves and clears all published topics
+    /// Safely retrieves and clears all retain topics scheduled for publishing (used during shutdown)
     pub async fn get_and_clear_all_published_topics(&self) -> Vec<String> {
-        let mut published = self.published_topics.write().await;
-        let topics = published.values().flatten().cloned().collect();
-        published.clear();
+        let mut retain = self.retain_topics.write().await;
+        let topics: Vec<String> = retain.iter().cloned().collect();
+        retain.clear();
         topics
     }
 
