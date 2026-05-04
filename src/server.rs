@@ -8,11 +8,16 @@ use std::sync::Arc;
 pub struct BridgeServer {
     cli: Cli,
     ctx: Option<Arc<BridgeContext>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl BridgeServer {
     pub fn new(cli: Cli) -> Self {
-        Self { cli, ctx: None }
+        Self {
+            cli,
+            ctx: None,
+            handles: Vec::new(),
+        }
     }
 
     pub async fn setup(&mut self) -> Result<Arc<BridgeContext>> {
@@ -22,15 +27,21 @@ impl BridgeServer {
         let (ctx, mqtt_tx_rx, save_rx, refresh_rx) = BridgeContext::new(&self.cli).await;
 
         // Start background services
-        ctx.clone().spawn_state_saver(save_rx, ctx.cancel.clone());
-        ctx.clone()
+        let h1 = ctx.clone().spawn_state_saver(save_rx, ctx.cancel.clone());
+        let h2 = ctx
+            .clone()
             .spawn_device_listener(refresh_rx, ctx.cancel.clone());
-        ctx.clone().spawn_mqtt_task(&self.cli, mqtt_tx_rx)?;
+        let h3 = ctx.clone().spawn_mqtt_task(&self.cli, mqtt_tx_rx)?;
 
         // Publish current running config
         ctx.publish_bridge_config(Some(&self.cli), false).await;
 
         self.ctx = Some(ctx.clone());
+        self.handles.push(h1);
+        self.handles.push(h2);
+        if let Some(h) = h3 {
+            self.handles.push(h);
+        }
         Ok(ctx)
     }
 
@@ -64,10 +75,15 @@ impl BridgeServer {
         Ok(())
     }
 
-    pub async fn close(&self) -> Result<()> {
+    pub async fn close(&mut self) -> Result<()> {
         if let Some(ctx) = &self.ctx {
             ctx.close().await;
         }
+
+        for handle in self.handles.drain(..) {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        }
+
         Ok(())
     }
 }

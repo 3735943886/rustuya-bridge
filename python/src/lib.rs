@@ -131,7 +131,7 @@ impl PyBridgeServer {
     fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            let server = inner.lock().await;
+            let mut server = inner.lock().await;
             server
                 .close()
                 .await
