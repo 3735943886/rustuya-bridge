@@ -65,6 +65,7 @@ pub struct BridgeContext {
     pub published_topics: RwLock<HashMap<String, HashSet<String>>>,
     pub save_tx: mpsc::Sender<()>,
     pub refresh_tx: mpsc::Sender<()>,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Converts MQTT template to wildcard for subscription
@@ -177,6 +178,7 @@ impl BridgeContext {
             published_topics: RwLock::new(HashMap::new()),
             save_tx,
             refresh_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
         });
 
         (ctx, mqtt_tx_receiver, save_rx, refresh_rx)
@@ -451,7 +453,19 @@ impl BridgeContext {
                                 }
                             }
                             Some(None) | None => {
-                                debug!("MQTT shutdown signal received, flushing and disconnecting...");
+                                debug!("MQTT shutdown signal received, clearing and disconnecting...");
+
+                                // 1. Clear bridge config
+                                let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.to_string();
+                                let _ = client.publish(config_topic, rumqttc::QoS::AtLeastOnce, true, "").await;
+
+                                // 2. Clear all retained messages
+                                let topics = self.get_and_clear_all_published_topics().await;
+                                for topic in topics {
+                                    let _ = client.publish(topic, rumqttc::QoS::AtLeastOnce, true, "").await;
+                                }
+
+                                // 3. Disconnect
                                 let _ = client.disconnect().await;
                                 loop {
                                     if eventloop.poll().await.is_err() {
@@ -470,12 +484,13 @@ impl BridgeContext {
         Ok(Some(handle))
     }
 
-    pub async fn publish_bridge_config(&self, cli: &crate::config::Cli, clear: bool) {
+    pub async fn publish_bridge_config(&self, cli: Option<&crate::config::Cli>, clear: bool) {
         let topic = crate::config::BRIDGE_CONFIG_TOPIC.to_string();
         let payload = if clear {
             String::new()
         } else {
-            serde_json::to_string(cli).unwrap_or_else(|_| "{}".to_string())
+            cli.map(|c| serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string()))
+                .unwrap_or_else(|| "{}".to_string())
         };
         self.try_send_mqtt(Some(MqttMessage {
             topic,
@@ -487,8 +502,23 @@ impl BridgeContext {
 
     pub async fn shutdown_mqtt(&self) {
         if let Some(tx) = &self.mqtt_tx {
-            let _ = tokio::time::timeout(Duration::from_millis(500), tx.send(None)).await;
+            let _ = tx.send(None).await;
         }
+    }
+
+    /// Signals MQTT to shutdown (synchronous version for Drop)
+    pub fn signal_shutdown_mqtt(&self) {
+        if let Some(tx) = &self.mqtt_tx {
+            let _ = tx.try_send(None);
+        }
+    }
+
+    /// Fully closes the bridge context and cleans up resources
+    pub async fn close(&self) {
+        info!("Closing bridge context...");
+        self.cancel.cancel();
+        self.shutdown_mqtt().await;
+        let _ = self.save_state().await;
     }
 
     async fn try_send_mqtt(&self, msg: Option<MqttMessage>) {
@@ -962,15 +992,17 @@ impl BridgeContext {
     /// Clears all retained messages for all devices
     pub async fn clear_all_retained_messages(&self) {
         if self.mqtt_tx.is_some() {
-            let all_topics: Vec<String> = {
-                let mut published = self.published_topics.write().await;
-                let topics = published.values().flatten().cloned().collect();
-                published.clear();
-                topics
-            };
-
+            let all_topics = self.get_and_clear_all_published_topics().await;
             self.clear_topics(all_topics).await;
         }
+    }
+
+    /// Safely retrieves and clears all published topics
+    pub async fn get_and_clear_all_published_topics(&self) -> Vec<String> {
+        let mut published = self.published_topics.write().await;
+        let topics = published.values().flatten().cloned().collect();
+        published.clear();
+        topics
     }
 
     /// Normalizes DeviceConfig fields and applies aliases
@@ -1255,5 +1287,11 @@ impl BridgeContext {
         }
 
         Err(BridgeError::DeviceNotFound(id.to_string()))
+    }
+}
+
+impl Drop for BridgeContext {
+    fn drop(&mut self) {
+        self.signal_shutdown_mqtt();
     }
 }

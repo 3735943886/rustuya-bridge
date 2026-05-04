@@ -2,10 +2,12 @@ use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 use rustuyabridge::config::Cli;
 use rustuyabridge::server::BridgeServer;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[pyclass]
 pub struct PyBridgeServer {
-    cli: Cli,
+    inner: Arc<Mutex<BridgeServer>>,
 }
 
 #[pymethods]
@@ -80,33 +82,58 @@ impl PyBridgeServer {
         }
 
         cli.fill_defaults();
-        Ok(Self { cli })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(BridgeServer::new(cli))),
+        })
     }
 
     /// Start the server and block the current thread until it exits (e.g. on Ctrl+C).
     /// The Python GIL is released while running.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
-        let cli = self.cli.clone();
+        let inner = self.inner.clone();
 
         py.detach(move || {
-            let rt = tokio::runtime::Runtime::new()?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             rt.block_on(async {
-                let server = BridgeServer::new(cli);
-                server.start().await
+                let mut server = inner.lock().await;
+                server
+                    .setup()
+                    .await
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                server
+                    .run()
+                    .await
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
             })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            Ok(())
         })
     }
 
     /// Start the server asynchronously in the Python asyncio event loop.
     fn start_async<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
-        let cli = self.cli.clone();
+        let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            let server = BridgeServer::new(cli);
+            let mut server = inner.lock().await;
             server
-                .start()
+                .setup()
+                .await
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            server
+                .run()
+                .await
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Stop the bridge and clear MQTT messages.
+    fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let server = inner.lock().await;
+            server
+                .close()
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             Ok(())

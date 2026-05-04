@@ -14,6 +14,7 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
     // Start the server
-    let server = BridgeServer::new(cli);
-    server.start().await
+    let mut server = BridgeServer::new(cli);
+    server.setup().await?;
+    server.run().await
 }

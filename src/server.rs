@@ -3,32 +3,42 @@ use crate::config::Cli;
 use anyhow::Result;
 use log::info;
 
+use std::sync::Arc;
+
 pub struct BridgeServer {
     cli: Cli,
+    ctx: Option<Arc<BridgeContext>>,
 }
 
 impl BridgeServer {
     pub fn new(cli: Cli) -> Self {
-        Self { cli }
+        Self { cli, ctx: None }
     }
 
-    pub async fn start(self) -> Result<()> {
+    pub async fn setup(&mut self) -> Result<Arc<BridgeContext>> {
         // Maximize file descriptor limit for better performance
         rustuya::runtime::maximize_fd_limit()?;
 
         let (ctx, mqtt_tx_rx, save_rx, refresh_rx) = BridgeContext::new(&self.cli).await;
 
-        let cancel = tokio_util::sync::CancellationToken::new();
-
         // Start background services
-        let state_saver_handle = ctx.clone().spawn_state_saver(save_rx, cancel.clone());
-        let listener_handle = ctx
-            .clone()
-            .spawn_device_listener(refresh_rx, cancel.clone());
-        let mqtt_handle = ctx.clone().spawn_mqtt_task(&self.cli, mqtt_tx_rx)?;
+        ctx.clone().spawn_state_saver(save_rx, ctx.cancel.clone());
+        ctx.clone()
+            .spawn_device_listener(refresh_rx, ctx.cancel.clone());
+        ctx.clone().spawn_mqtt_task(&self.cli, mqtt_tx_rx)?;
 
         // Publish current running config
-        ctx.publish_bridge_config(&self.cli, false).await;
+        ctx.publish_bridge_config(Some(&self.cli), false).await;
+
+        self.ctx = Some(ctx.clone());
+        Ok(ctx)
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Server not setup"))?;
 
         info!("Bridge running. Press Ctrl+C to stop.");
 
@@ -49,30 +59,15 @@ impl BridgeServer {
         }
 
         info!("Shutting down...");
-        cancel.cancel();
+        ctx.close().await;
 
-        // Publish clearing message and gracefully flush/close MQTT
-        ctx.publish_bridge_config(&self.cli, true).await;
-        ctx.clear_all_retained_messages().await;
-        ctx.shutdown_mqtt().await;
+        Ok(())
+    }
 
-        let _ = tokio::join!(
-            async {
-                if let Some(handle) = mqtt_handle {
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
-                }
-            },
-            async {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(3), listener_handle).await;
-            },
-            async {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), state_saver_handle)
-                    .await;
-            }
-        );
-
-        let _ = ctx.save_state().await;
+    pub async fn close(&self) -> Result<()> {
+        if let Some(ctx) = &self.ctx {
+            ctx.close().await;
+        }
         Ok(())
     }
 }
