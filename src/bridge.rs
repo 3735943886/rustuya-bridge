@@ -383,7 +383,7 @@ impl BridgeContext {
         let client_id = cli.mqtt_client_id.as_deref().unwrap_or("rustuya-bridge");
         let mqtt_options = self.create_mqtt_options(broker_url, client_id, cli)?;
 
-        let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 100);
         let sub_topic = tpl_to_wildcard(&mqtt_command_topic);
         let command_topic_re = compile_topic_regex(&mqtt_command_topic);
 
@@ -617,7 +617,7 @@ impl BridgeContext {
             opts
         };
 
-        opts.set_keep_alive(Duration::from_secs(5));
+        opts.set_keep_alive(Duration::from_secs(30));
 
         // Set Last Will and Testament (LWT) to clear the config on abnormal termination
         opts.set_last_will(rumqttc::LastWill {
