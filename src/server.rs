@@ -45,9 +45,8 @@ impl BridgeServer {
         Ok(ctx)
     }
 
-    pub async fn run(&self) -> Result<()> {
-        let ctx = self
-            .ctx
+    pub async fn run(&mut self) -> Result<()> {
+        self.ctx
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Server not setup"))?;
 
@@ -70,18 +69,19 @@ impl BridgeServer {
         }
 
         info!("Shutting down...");
-        ctx.close().await;
-
-        Ok(())
+        // close() signals all tasks and waits for them to fully complete
+        self.close().await
     }
 
     pub async fn close(&mut self) -> Result<()> {
+        // Signal all background tasks (cancel + mqtt shutdown)
         if let Some(ctx) = &self.ctx {
             ctx.close().await;
         }
 
+        // Wait for all tasks to finish (including MQTT cleanup + PubAck flush)
         for handle in self.handles.drain(..) {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
         }
 
         Ok(())

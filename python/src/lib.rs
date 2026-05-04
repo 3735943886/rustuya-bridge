@@ -88,7 +88,7 @@ impl PyBridgeServer {
     }
 
     /// Start the server and block the current thread until it exits (e.g. on Ctrl+C).
-    /// The Python GIL is released while running.
+    /// The Python GIL is released while running. Cleans up MQTT before returning.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
 
@@ -101,6 +101,7 @@ impl PyBridgeServer {
                     .setup()
                     .await
                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                // run() now calls close() internally, which waits for MQTT task to finish
                 server
                     .run()
                     .await
@@ -119,6 +120,7 @@ impl PyBridgeServer {
                 .setup()
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            // run() now calls close() internally
             server
                 .run()
                 .await
@@ -127,7 +129,7 @@ impl PyBridgeServer {
         })
     }
 
-    /// Stop the bridge and clear MQTT messages.
+    /// Stop the bridge and clean up MQTT retained messages.
     fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {

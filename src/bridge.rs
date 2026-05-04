@@ -458,14 +458,9 @@ impl BridgeContext {
                             Some(None) | None => {
                                 debug!("MQTT shutdown signal received, clearing and disconnecting...");
 
-                                // 1. Clear bridge config
-                                let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.to_string();
-                                let _ = client.publish(config_topic, rumqttc::QoS::AtLeastOnce, true, "").await;
-                                let mut expected_pubacks: usize = 1;
-
-                                // 2. Clear all retained messages
+                                // Clear all tracked retain topics (includes bridge/config)
                                 let topics = self.get_and_clear_all_published_topics().await;
-                                expected_pubacks += topics.len();
+                                let expected_pubacks = topics.len();
                                 for topic in topics {
                                     let _ = client.publish(topic, rumqttc::QoS::AtLeastOnce, true, "").await;
                                 }
@@ -561,7 +556,9 @@ impl BridgeContext {
         if let Some(tx) = &self.mqtt_tx {
             // Track retain topics the moment they are scheduled for publishing.
             // This ensures no race between tracking and the shutdown clearing.
-            if let Some(ref m) = msg && m.retain {
+            if let Some(ref m) = msg
+                && m.retain
+            {
                 self.retain_topics.write().await.insert(m.topic.clone());
             }
             if tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
