@@ -8,7 +8,10 @@ use std::sync::Arc;
 pub struct BridgeServer {
     cli: Cli,
     ctx: Option<Arc<BridgeContext>>,
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Handles for state_saver and device_listener - aborted on close
+    background_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// MQTT task handle - waited on close to ensure clean disconnect
+    mqtt_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BridgeServer {
@@ -16,7 +19,8 @@ impl BridgeServer {
         Self {
             cli,
             ctx: None,
-            handles: Vec::new(),
+            background_handles: Vec::new(),
+            mqtt_handle: None,
         }
     }
 
@@ -37,11 +41,9 @@ impl BridgeServer {
         ctx.publish_bridge_config(Some(&self.cli), false).await;
 
         self.ctx = Some(ctx.clone());
-        self.handles.push(h1);
-        self.handles.push(h2);
-        if let Some(h) = h3 {
-            self.handles.push(h);
-        }
+        self.background_handles.push(h1);
+        self.background_handles.push(h2);
+        self.mqtt_handle = h3;
         Ok(ctx)
     }
 
@@ -69,19 +71,25 @@ impl BridgeServer {
         }
 
         info!("Shutting down...");
-        // close() signals all tasks and waits for them to fully complete
         self.close().await
     }
 
     pub async fn close(&mut self) -> Result<()> {
-        // Signal all background tasks (cancel + mqtt shutdown)
+        // Signal all background tasks (drop instances, cancel, mqtt shutdown)
         if let Some(ctx) = &self.ctx {
             ctx.close().await;
         }
 
-        // Wait for all tasks to finish (including MQTT cleanup + PubAck flush)
-        for handle in self.handles.drain(..) {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
+        // Abort state_saver and device_listener immediately.
+        // rustuya may block their threads; abort forces cancellation.
+        for handle in self.background_handles.drain(..) {
+            handle.abort();
+        }
+
+        // Wait for MQTT task to fully flush and disconnect cleanly (up to 7s).
+        // The MQTT task has its own internal 5s PubAck timeout.
+        if let Some(handle) = self.mqtt_handle.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(7), handle).await;
         }
 
         Ok(())
