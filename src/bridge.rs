@@ -458,14 +458,47 @@ impl BridgeContext {
                                 // 1. Clear bridge config
                                 let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.to_string();
                                 let _ = client.publish(config_topic, rumqttc::QoS::AtLeastOnce, true, "").await;
+                                let mut expected_pubacks: usize = 1;
 
                                 // 2. Clear all retained messages
                                 let topics = self.get_and_clear_all_published_topics().await;
+                                expected_pubacks += topics.len();
                                 for topic in topics {
                                     let _ = client.publish(topic, rumqttc::QoS::AtLeastOnce, true, "").await;
                                 }
 
-                                // 3. Disconnect
+                                debug!("Waiting for {} PubAcks before disconnecting...", expected_pubacks);
+
+                                // 3. Poll eventloop until all PubAcks are received (with timeout)
+                                let mut received_pubacks: usize = 0;
+                                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                                loop {
+                                    if received_pubacks >= expected_pubacks {
+                                        break;
+                                    }
+                                    if tokio::time::Instant::now() >= deadline {
+                                        warn!("Timed out waiting for PubAcks ({}/{} received)", received_pubacks, expected_pubacks);
+                                        break;
+                                    }
+                                    match tokio::time::timeout_at(deadline, eventloop.poll()).await {
+                                        Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)))) => {
+                                            received_pubacks += 1;
+                                        }
+                                        Ok(Err(e)) => {
+                                            warn!("MQTT error while waiting for PubAck: {}", e);
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            warn!("Timed out waiting for PubAcks");
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                debug!("PubAck flush done ({}/{}).", received_pubacks, expected_pubacks);
+
+                                // 4. Disconnect
                                 let _ = client.disconnect().await;
                                 loop {
                                     if eventloop.poll().await.is_err() {
