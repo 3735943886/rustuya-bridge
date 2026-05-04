@@ -31,6 +31,7 @@ impl PyBridgeServer {
             state_file: None,
             save_debounce_secs: None,
             log_level: None,
+            no_signals: None,
         };
 
         if let Some(dict) = kwargs {

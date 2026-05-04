@@ -48,7 +48,8 @@ impl BridgeServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let ctx = self.ctx
+        let ctx = self
+            .ctx
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Server not setup"))?;
 
