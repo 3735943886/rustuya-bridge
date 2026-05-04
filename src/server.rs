@@ -48,26 +48,44 @@ impl BridgeServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        self.ctx
+        let ctx = self.ctx
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Server not setup"))?;
 
         info!("Bridge running. Press Ctrl+C to stop.");
 
-        // Wait for termination signal
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigint = signal(SignalKind::interrupt())?;
-            let mut sigterm = signal(SignalKind::terminate())?;
-            tokio::select! {
-                _ = sigint.recv() => info!("Received SIGINT"),
-                _ = sigterm.recv() => info!("Received SIGTERM"),
+        let cancel = ctx.cancel.clone();
+
+        let no_signals = self.cli.no_signals.unwrap_or(false);
+
+        // Wait for termination signal or internal cancellation
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("Shutdown requested internally");
             }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await?;
+            _ = async {
+                if no_signals {
+                    futures_util::future::pending::<()>().await;
+                }
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    if let (Ok(mut sigint), Ok(mut sigterm)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) {
+                        tokio::select! {
+                            _ = sigint.recv() => info!("Received SIGINT"),
+                            _ = sigterm.recv() => info!("Received SIGTERM"),
+                        }
+                    } else {
+                        // Fallback if signal binding fails
+                        futures_util::future::pending::<()>().await;
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("Received Ctrl+C");
+                }
+            } => {}
         }
 
         info!("Shutting down...");

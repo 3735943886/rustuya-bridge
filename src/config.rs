@@ -79,6 +79,10 @@ pub struct Cli {
     /// Log level (error, warn, info, debug, trace)
     #[arg(short = 'l', long, env = "LOG_LEVEL")]
     pub log_level: Option<String>,
+
+    /// Disable internal signal handling (for library use)
+    #[arg(long, env = "NO_SIGNALS")]
+    pub no_signals: Option<bool>,
 }
 
 impl Cli {
@@ -137,6 +141,7 @@ impl Cli {
             state_file,
             save_debounce_secs,
             log_level,
+            no_signals,
         } = other;
 
         macro_rules! merge_field {
@@ -161,6 +166,7 @@ impl Cli {
         merge_field!(state_file);
         merge_field!(save_debounce_secs);
         merge_field!(log_level);
+        merge_field!(no_signals);
     }
 
     pub fn get_mqtt_topics(&self) -> (String, String) {
@@ -228,6 +234,9 @@ impl Cli {
         }
         if self.mqtt_scanner_topic.is_none() {
             self.mqtt_scanner_topic = Some(DEFAULT_MQTT_SCANNER_TOPIC.to_string());
+        }
+        if self.no_signals.is_none() {
+            self.no_signals = Some(false);
         }
     }
 }

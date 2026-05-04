@@ -79,6 +79,9 @@ impl PyBridgeServer {
             if let Ok(Some(val)) = dict.get_item("log_level") {
                 cli.log_level = val.extract()?;
             }
+            if let Ok(Some(val)) = dict.get_item("no_signals") {
+                cli.no_signals = val.extract()?;
+            }
         }
 
         cli.fill_defaults();
