@@ -826,7 +826,10 @@ impl BridgeContext {
             let retain = self.mqtt_retain && level == "error";
             if retain {
                 let mut topics = self.published_topics.write().await;
-                topics.entry(id.to_string()).or_default().insert(topic.clone());
+                topics
+                    .entry(id.to_string())
+                    .or_default()
+                    .insert(topic.clone());
             }
 
             self.try_send_mqtt(Some(MqttMessage {
@@ -930,6 +933,18 @@ impl BridgeContext {
         }
     }
 
+    /// Internal helper to publish empty retain messages for a set of topics
+    async fn clear_topics(&self, topics: impl IntoIterator<Item = String>) {
+        for topic in topics {
+            self.try_send_mqtt(Some(MqttMessage {
+                topic,
+                payload: String::new(),
+                retain: true,
+            }))
+            .await;
+        }
+    }
+
     /// Clears all retained messages for a device
     pub async fn clear_retained_messages(&self, id: &str) {
         if self.mqtt_tx.is_some() {
@@ -939,15 +954,22 @@ impl BridgeContext {
             };
 
             if let Some(topics) = topics {
-                for topic in topics {
-                    self.try_send_mqtt(Some(MqttMessage {
-                        topic,
-                        payload: "".to_string(),
-                        retain: true,
-                    }))
-                    .await;
-                }
+                self.clear_topics(topics).await;
             }
+        }
+    }
+
+    /// Clears all retained messages for all devices
+    pub async fn clear_all_retained_messages(&self) {
+        if self.mqtt_tx.is_some() {
+            let all_topics: Vec<String> = {
+                let mut published = self.published_topics.write().await;
+                let topics = published.values().flatten().cloned().collect();
+                published.clear();
+                topics
+            };
+
+            self.clear_topics(all_topics).await;
         }
     }
 

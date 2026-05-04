@@ -53,6 +53,7 @@ impl BridgeServer {
 
         // Publish clearing message and gracefully flush/close MQTT
         ctx.publish_bridge_config(&self.cli, true).await;
+        ctx.clear_all_retained_messages().await;
         ctx.shutdown_mqtt().await;
 
         let _ = tokio::join!(
