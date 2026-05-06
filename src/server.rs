@@ -99,10 +99,15 @@ impl BridgeServer {
             ctx.close().await;
         }
 
-        // Abort state_saver and device_listener immediately.
-        // rustuya may block their threads; abort forces cancellation.
-        for handle in self.background_handles.drain(..) {
-            handle.abort();
+        // Wait for state_saver and device_listener to exit gracefully due to cancellation.
+        // rustuya may block their threads; abort if they don't exit cleanly within 2 seconds.
+        for mut handle in self.background_handles.drain(..) {
+            if tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+            }
         }
 
         // Wait for MQTT task to fully flush and disconnect cleanly (up to 7s).

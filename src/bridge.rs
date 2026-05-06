@@ -73,15 +73,34 @@ pub struct BridgeContext {
 /// Converts MQTT template to wildcard for subscription
 /// Converts MQTT template to wildcard for subscription
 pub fn tpl_to_wildcard(template: &str, root_topic: &str) -> String {
-    template
-        .replace("{root}", root_topic)
-        .replace("{id}", "+")
-        .replace("{name}", "+")
-        .replace("{dp}", "+")
-        .replace("{action}", "+")
-        .replace("{cid}", "+")
-        .replace("{type}", "+")
-        .replace("{level}", "+")
+    let mut res = String::with_capacity(template.len());
+    let mut last = 0;
+    while let Some(start) = template[last..].find('{') {
+        let actual_start = last + start;
+        res.push_str(&template[last..actual_start]);
+        if let Some(end) = template[actual_start..].find('}') {
+            let actual_end = actual_start + end;
+            let key = &template[actual_start + 1..actual_end];
+            let mut matched = true;
+            match key {
+                "root" => res.push_str(root_topic),
+                "id" | "name" | "dp" | "action" | "cid" | "type" | "level" => res.push('+'),
+                _ => {
+                    matched = false;
+                }
+            }
+            if matched {
+                last = actual_end + 1;
+            } else {
+                res.push('{');
+                last = actual_start + 1;
+            }
+        } else {
+            break;
+        }
+    }
+    res.push_str(&template[last..]);
+    res
 }
 
 /// Compiles a template into a Regex if it contains variables
@@ -939,37 +958,53 @@ impl BridgeContext {
 
     /// Helper to replace template variables in a string
     fn replace_vars(&self, template: &str, vars: TopicVars) -> String {
-        let mut res = template
-            .replace("{root}", &self.mqtt_root_topic)
-            .replace("{id}", vars.id)
-            .replace("{name}", vars.name.unwrap_or(""))
-            .replace("{cid}", vars.cid.unwrap_or(""));
-
-        if let Some(l) = vars.level {
-            res = res.replace("{level}", l);
+        let mut res = String::with_capacity(template.len() + 32);
+        let mut last = 0;
+        while let Some(start) = template[last..].find('{') {
+            let actual_start = last + start;
+            res.push_str(&template[last..actual_start]);
+            if let Some(end) = template[actual_start..].find('}') {
+                let actual_end = actual_start + end;
+                let key = &template[actual_start + 1..actual_end];
+                let mut matched = true;
+                match key {
+                    "root" => res.push_str(&self.mqtt_root_topic),
+                    "id" => res.push_str(vars.id),
+                    "name" => res.push_str(vars.name.unwrap_or("")),
+                    "cid" => res.push_str(vars.cid.unwrap_or("")),
+                    "level" if vars.level.is_some() => res.push_str(vars.level.unwrap()),
+                    "type" if vars.event_type.is_some() => res.push_str(vars.event_type.unwrap()),
+                    "dp" if vars.dp.is_some() => res.push_str(vars.dp.unwrap()),
+                    "value" if vars.val.is_some() => {
+                        use std::fmt::Write;
+                        let _ = write!(res, "{}", vars.val.unwrap());
+                    }
+                    "value" | "dps" if vars.dps_str.is_some() => {
+                        res.push_str(vars.dps_str.unwrap());
+                    }
+                    "timestamp" => {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        use std::fmt::Write;
+                        let _ = write!(res, "{}", ts);
+                    }
+                    _ => {
+                        matched = false;
+                    }
+                }
+                if matched {
+                    last = actual_end + 1;
+                } else {
+                    res.push('{');
+                    last = actual_start + 1;
+                }
+            } else {
+                break;
+            }
         }
-        if let Some(t) = vars.event_type {
-            res = res.replace("{type}", t);
-        }
-        if let Some(d) = vars.dp {
-            res = res.replace("{dp}", d);
-        }
-        if let Some(v) = vars.val {
-            res = res.replace("{value}", &v.to_string());
-        } else if let Some(ds) = vars.dps_str {
-            res = res.replace("{value}", ds);
-        }
-        if let Some(ds) = vars.dps_str {
-            res = res.replace("{dps}", ds);
-        }
-        res = res.replace(
-            "{timestamp}",
-            &std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                .to_string(),
-        );
+        res.push_str(&template[last..]);
         res
     }
 
