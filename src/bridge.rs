@@ -137,6 +137,32 @@ pub fn match_topic(
         (topic == template).then(HashMap::new)
     }
 }
+async fn verify_write_permission(state_file: &str) {
+    let path = Path::new(state_file);
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        panic!(
+            "Cannot create directory for state file ({}): {}",
+            parent.display(),
+            e
+        );
+    }
+
+    let test_path = path.with_extension("test_write");
+
+    if let Err(e) = tokio::fs::write(&test_path, b"").await {
+        panic!(
+            "No write permission for state file ({})!\n\
+            Please check directory permissions. (Error: {})",
+            state_file, e
+        );
+    }
+
+    let _ = tokio::fs::remove_file(&test_path).await;
+}
 
 impl BridgeContext {
     pub async fn new(
@@ -147,6 +173,8 @@ impl BridgeContext {
         mpsc::Receiver<()>,
         mpsc::Receiver<()>,
     ) {
+        verify_write_permission(&cli.get_state_file()).await;
+
         let (_, mqtt_event_topic) = cli.get_mqtt_topics();
         let initial_configs = load_state(&cli.get_state_file()).await;
 
