@@ -20,6 +20,7 @@ pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
 pub const LISTENER_TIMEOUT_SECS: u64 = 300;
 pub const REQUEST_TIMEOUT_SECS: u64 = 15;
+pub const SCAVENGER_TIMEOUT_SECS: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct MqttMessage {
@@ -51,6 +52,7 @@ pub struct BridgeState {
 }
 
 pub struct BridgeContext {
+    pub cli: Cli,
     pub mqtt_tx: Option<mpsc::Sender<Option<MqttMessage>>>,
     pub mqtt_root_topic: String,
     pub mqtt_event_topic: String,
@@ -61,22 +63,24 @@ pub struct BridgeContext {
     pub state_file: String,
     pub save_debounce_secs: u64,
     pub state: RwLock<BridgeState>,
-    /// All retain topics ever published (keyed by device id for per-device removal)
-    pub published_topics: RwLock<HashMap<String, HashSet<String>>>,
-    /// Flat set of ALL retain topics scheduled for publishing (for shutdown clearing)
-    pub retain_topics: RwLock<HashSet<String>>,
     pub save_tx: mpsc::Sender<()>,
     pub refresh_tx: mpsc::Sender<()>,
+    pub scavenger_tx: tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<String>>>>,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Converts MQTT template to wildcard for subscription
-pub fn tpl_to_wildcard(template: &str) -> String {
+/// Converts MQTT template to wildcard for subscription
+pub fn tpl_to_wildcard(template: &str, root_topic: &str) -> String {
     template
+        .replace("{root}", root_topic)
         .replace("{id}", "+")
         .replace("{name}", "+")
         .replace("{dp}", "+")
         .replace("{action}", "+")
+        .replace("{cid}", "+")
+        .replace("{type}", "+")
+        .replace("{level}", "+")
 }
 
 /// Compiles a template into a Regex if it contains variables
@@ -159,6 +163,7 @@ impl BridgeContext {
         let (refresh_tx, refresh_rx) = mpsc::channel(1);
 
         let ctx = Arc::new(Self {
+            cli: cli.clone(),
             mqtt_tx: cli.mqtt_broker.is_some().then_some(mqtt_tx_sender),
             mqtt_root_topic: cli
                 .mqtt_root_topic
@@ -177,10 +182,9 @@ impl BridgeContext {
                 cid_map: initial_cid_map,
                 name_map: initial_name_map,
             }),
-            published_topics: RwLock::new(HashMap::new()),
-            retain_topics: RwLock::new(HashSet::new()),
             save_tx,
             refresh_tx,
+            scavenger_tx: tokio::sync::Mutex::new(None),
             cancel: tokio_util::sync::CancellationToken::new(),
         });
 
@@ -384,7 +388,7 @@ impl BridgeContext {
         let mqtt_options = self.create_mqtt_options(broker_url, &client_id, cli)?;
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 100);
-        let sub_topic = tpl_to_wildcard(&mqtt_command_topic);
+        let sub_topic = tpl_to_wildcard(&mqtt_command_topic, &self.mqtt_root_topic);
         let command_topic_re = compile_topic_regex(&mqtt_command_topic);
 
         let handle = tokio::spawn(async move {
@@ -458,12 +462,10 @@ impl BridgeContext {
                             Some(None) | None => {
                                 debug!("MQTT shutdown signal received, clearing and disconnecting...");
 
-                                // Clear all tracked retain topics (includes bridge/config)
-                                let topics = self.get_and_clear_all_published_topics().await;
-                                let expected_pubacks = topics.len();
-                                for topic in topics {
-                                    let _ = client.publish(topic, rumqttc::QoS::AtLeastOnce, true, "").await;
-                                }
+                                // Clear bridge config retain topic
+                                let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
+                                let expected_pubacks = 1;
+                                let _ = client.publish(config_topic, rumqttc::QoS::AtLeastOnce, true, "").await;
 
                                 debug!("Waiting for {} PubAcks before disconnecting...", expected_pubacks);
 
@@ -561,20 +563,12 @@ impl BridgeContext {
     }
 
     async fn try_send_mqtt(&self, msg: Option<MqttMessage>) {
-        if let Some(tx) = &self.mqtt_tx {
-            // Track retain topics the moment they are scheduled for publishing.
-            // This ensures no race between tracking and the shutdown clearing.
-            if let Some(ref m) = msg
-                && m.retain
-            {
-                self.retain_topics.write().await.insert(m.topic.clone());
-            }
-            if tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
+        if let Some(tx) = &self.mqtt_tx
+            && tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
                 .await
                 .is_err()
-            {
-                warn!("MQTT queue full, dropping message");
-            }
+        {
+            warn!("MQTT queue full, dropping message");
         }
     }
 
@@ -851,10 +845,18 @@ impl BridgeContext {
             }
 
             for (topic, payload) in templates {
+                let mut retain = self.mqtt_retain;
+                if retain && !topic.contains(&id) && !payload.contains(&id) {
+                    warn!(
+                        "Ignoring retain for event from '{}' because '{}' is missing from both topic and payload",
+                        id, id
+                    );
+                    retain = false;
+                }
                 self.try_send_mqtt(Some(MqttMessage {
                     topic,
                     payload,
-                    retain: self.mqtt_retain,
+                    retain,
                 }))
                 .await;
             }
@@ -892,10 +894,18 @@ impl BridgeContext {
                 }
             }
 
-            let retain = self.mqtt_retain && level == "error";
+            let payload_str = payload.to_string();
+            let mut retain = self.mqtt_retain && level == "error";
+            if retain && id != "bridge" && !topic.contains(id) && !payload_str.contains(id) {
+                warn!(
+                    "Ignoring retain for message from '{}' because '{}' is missing from both topic and payload",
+                    id, id
+                );
+                retain = false;
+            }
             self.try_send_mqtt(Some(MqttMessage {
                 topic,
-                payload: payload.to_string(),
+                payload: payload_str,
                 retain,
             }))
             .await;
@@ -976,7 +986,7 @@ impl BridgeContext {
                 )
             } else {
                 self.replace_vars(
-                    &self.mqtt_message_topic.clone().unwrap_or_default(),
+                    self.mqtt_message_topic.as_deref().unwrap_or_default(),
                     TopicVars {
                         id: "bridge",
                         name: Some("bridge"),
@@ -986,7 +996,7 @@ impl BridgeContext {
                 )
             };
             self.try_send_mqtt(Some(MqttMessage {
-                topic: topic.clone(),
+                topic,
                 payload: payload.to_string(),
                 retain: false,
             }))
@@ -994,46 +1004,111 @@ impl BridgeContext {
         }
     }
 
-    /// Internal helper to publish empty retain messages for a set of topics
-    async fn clear_topics(&self, topics: impl IntoIterator<Item = String>) {
-        for topic in topics {
-            self.try_send_mqtt(Some(MqttMessage {
-                topic,
-                payload: String::new(),
-                retain: true,
-            }))
-            .await;
+    /// Spawns a background task to clear retained messages for specific devices
+    pub async fn spawn_retain_scavenger(&self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
         }
-    }
 
-    /// Clears all retained messages for a device
-    pub async fn clear_retained_messages(&self, id: &str) {
-        if self.mqtt_tx.is_some() {
-            let topics = {
-                let mut published = self.published_topics.write().await;
-                published.remove(id)
-            };
+        let mut lock = self.scavenger_tx.lock().await;
+        if let Some(tx) = &*lock
+            && tx.send(ids.clone()).is_ok()
+        {
+            return;
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *lock = Some(tx);
 
-            if let Some(topics) = topics {
-                self.clear_topics(topics).await;
+        let broker_url = match &self.cli.mqtt_broker {
+            Some(url) => url.clone(),
+            None => return,
+        };
+        let client_id = format!(
+            "{}_scavenger_{}",
+            self.cli.get_mqtt_client_id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        let mqtt_options = match self.create_mqtt_options(&broker_url, &client_id, &self.cli) {
+            Ok(opts) => opts,
+            Err(e) => {
+                error!("Failed to create MQTT options for scavenger: {}", e);
+                return;
             }
-        }
-    }
+        };
 
-    /// Clears all retained messages for all devices
-    pub async fn clear_all_retained_messages(&self) {
-        if self.mqtt_tx.is_some() {
-            let all_topics = self.get_and_clear_all_published_topics().await;
-            self.clear_topics(all_topics).await;
-        }
-    }
+        // Determine wildcard subscriptions based on templates
+        let mut subs = HashSet::new();
+        let templates = vec![
+            self.mqtt_event_topic.clone(),
+            self.mqtt_message_topic.clone().unwrap_or_default(),
+        ];
 
-    /// Safely retrieves and clears all retain topics scheduled for publishing (used during shutdown)
-    pub async fn get_and_clear_all_published_topics(&self) -> Vec<String> {
-        let mut retain = self.retain_topics.write().await;
-        let topics: Vec<String> = retain.iter().cloned().collect();
-        retain.clear();
-        topics
+        let root_topic = self.mqtt_root_topic.clone();
+
+        for tpl in templates {
+            if tpl.is_empty() {
+                continue;
+            }
+            subs.insert(tpl_to_wildcard(&tpl, &root_topic));
+        }
+
+        tokio::spawn(async move {
+            let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+
+            for sub in &subs {
+                if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
+                    error!("Scavenger subscription failed for {}: {}", sub, e);
+                } else {
+                    debug!("Scavenger subscribed to {}", sub);
+                }
+            }
+
+            let mut targets: HashSet<String> = ids.into_iter().collect();
+            let mut deadline =
+                tokio::time::Instant::now() + Duration::from_secs(SCAVENGER_TIMEOUT_SECS);
+
+            loop {
+                tokio::select! {
+                    new_ids_opt = rx.recv() => {
+                        if let Some(new_ids) = new_ids_opt {
+                            let count = new_ids.len();
+                            targets.extend(new_ids);
+                            deadline = tokio::time::Instant::now() + Duration::from_secs(SCAVENGER_TIMEOUT_SECS);
+                            debug!("Scavenger added {} new targets, extended timeout", count);
+                        } else {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        break;
+                    }
+                    notification = eventloop.poll() => {
+                        match notification {
+                            Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
+                                let payload = String::from_utf8_lossy(&p.payload);
+                                if p.retain
+                                    && targets
+                                        .iter()
+                                        .any(|id| p.topic.contains(id) || payload.contains(id))
+                                {
+                                    debug!("Scavenger clearing retained message: {}", p.topic);
+                                    let _ = client
+                                        .publish(&p.topic, rumqttc::QoS::AtLeastOnce, true, "")
+                                        .await;
+                                }
+                            }
+                            Err(_) => break, // Connection error
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            debug!("Scavenger finished for {} devices", targets.len());
+            let _ = client.disconnect().await;
+        });
     }
 
     /// Normalizes DeviceConfig fields and applies aliases
@@ -1186,14 +1261,14 @@ impl BridgeContext {
             }
         }
 
-        // Clear retained messages AFTER dropping all bridge locks
-        for target_id in &targets {
-            self.clear_retained_messages(target_id).await;
-        }
+        // Send refresh signal to kill the listener stream and drop physical connections
+        self.request_refresh();
+
+        // Scavenge retained messages for removed devices
+        self.spawn_retain_scavenger(targets.clone()).await;
 
         info!("Devices removed: {}", targets.join(", "));
         self.request_save();
-        self.request_refresh();
         Ok(ApiResponse::ok("remove", targets.join(",")))
     }
 
@@ -1212,13 +1287,14 @@ impl BridgeContext {
         };
 
         info!("All devices cleared");
-        // Clear all retained messages after clearing configs
-        for id in ids {
-            self.clear_retained_messages(&id).await;
-        }
+
+        // Send refresh signal to kill the listener stream and drop physical connections
+        self.request_refresh();
+
+        // Scavenge all retained messages
+        self.spawn_retain_scavenger(ids).await;
 
         self.request_save();
-        self.request_refresh();
         Ok(ApiResponse::ok("clear", "all"))
     }
 
