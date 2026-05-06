@@ -385,7 +385,7 @@ impl BridgeContext {
 
         let (mqtt_command_topic, _) = cli.get_mqtt_topics();
         let client_id = cli.get_mqtt_client_id();
-        let mqtt_options = self.create_mqtt_options(broker_url, &client_id, cli)?;
+        let mqtt_options = self.create_mqtt_options(broker_url, &client_id, cli, true)?;
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 100);
         let sub_topic = tpl_to_wildcard(&mqtt_command_topic, &self.mqtt_root_topic);
@@ -578,6 +578,7 @@ impl BridgeContext {
         broker_url: &str,
         client_id: &str,
         cli: &Cli,
+        with_lwt: bool,
     ) -> Result<rumqttc::MqttOptions> {
         let mut opts = if broker_url.contains("://") {
             let url = url::Url::parse(broker_url)?;
@@ -613,13 +614,15 @@ impl BridgeContext {
 
         opts.set_keep_alive(Duration::from_secs(30));
 
-        // Set Last Will and Testament (LWT) to clear the config on abnormal termination
-        opts.set_last_will(rumqttc::LastWill {
-            topic: crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic),
-            message: bytes::Bytes::from(""),
-            qos: rumqttc::QoS::AtLeastOnce,
-            retain: true,
-        });
+        if with_lwt {
+            // Set Last Will and Testament (LWT) to clear the config on abnormal termination
+            opts.set_last_will(rumqttc::LastWill {
+                topic: crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic),
+                message: bytes::Bytes::from(""),
+                qos: rumqttc::QoS::AtLeastOnce,
+                retain: true,
+            });
+        }
 
         Ok(opts)
     }
@@ -1031,7 +1034,8 @@ impl BridgeContext {
                 .unwrap()
                 .as_millis()
         );
-        let mqtt_options = match self.create_mqtt_options(&broker_url, &client_id, &self.cli) {
+        let mqtt_options = match self.create_mqtt_options(&broker_url, &client_id, &self.cli, false)
+        {
             Ok(opts) => opts,
             Err(e) => {
                 error!("Failed to create MQTT options for scavenger: {}", e);
@@ -1088,6 +1092,11 @@ impl BridgeContext {
                     notification = eventloop.poll() => {
                         match notification {
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
+                                let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &root_topic);
+                                if p.topic == config_topic {
+                                    continue;
+                                }
+
                                 let payload = String::from_utf8_lossy(&p.payload);
                                 if p.retain
                                     && targets
