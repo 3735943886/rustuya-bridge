@@ -280,7 +280,7 @@ impl BridgeContext {
                                             cfg.last_error_code = Some(code);
                                         }
                                     }
-                                    self.publish_device_message(&target_id, name.as_deref(), cid.as_deref(), "error", payload).await;
+                                    self.publish_device_message(&target_id, name.as_deref(), cid.as_deref(), "error", payload, self.mqtt_retain).await;
                                     continue;
                                 }
 
@@ -875,6 +875,7 @@ impl BridgeContext {
         cid: Option<&str>,
         level: &str,
         mut payload: Value,
+        retain: bool,
     ) {
         if self.mqtt_tx.is_some() {
             let topic = self.replace_vars(
@@ -899,18 +900,18 @@ impl BridgeContext {
             }
 
             let payload_str = payload.to_string();
-            let mut retain = self.mqtt_retain && level == "error";
-            if retain && id != "bridge" && !topic.contains(id) && !payload_str.contains(id) {
+            let mut final_retain = retain;
+            if final_retain && !topic.contains(id) && !payload_str.contains(id) {
                 warn!(
                     "Ignoring retain for message from '{}' because '{}' is missing from both topic and payload",
                     id, id
                 );
-                retain = false;
+                final_retain = false;
             }
             self.try_send_mqtt(Some(MqttMessage {
                 topic,
                 payload: payload_str,
-                retain,
+                retain: final_retain,
             }))
             .await;
         }
@@ -927,7 +928,7 @@ impl BridgeContext {
 
         match serde_json::to_value(&response) {
             Ok(payload) => {
-                self.publish_device_message(id, name, None, level, payload)
+                self.publish_device_message(id, name, None, level, payload, false)
                     .await;
             }
             Err(e) => {
