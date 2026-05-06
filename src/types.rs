@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScavengerTarget {
+    pub id: String,
+    pub name: Option<String>,
+    pub cid: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum SingleOrList {

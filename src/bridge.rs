@@ -65,7 +65,8 @@ pub struct BridgeContext {
     pub state: RwLock<BridgeState>,
     pub save_tx: mpsc::Sender<()>,
     pub refresh_tx: mpsc::Sender<()>,
-    pub scavenger_tx: tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<String>>>>,
+    pub scavenger_tx:
+        tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<crate::types::ScavengerTarget>>>>,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -91,7 +92,7 @@ pub fn compile_topic_regex(template: &str) -> Option<Regex> {
 
     // Convert template to regex. E.g. "tuya/{id}/command" -> "^tuya/(?P<id>[^/]+)/command$"
     let mut pattern = regex::escape(template);
-    for key in ["id", "name", "dp", "action"] {
+    for key in ["id", "name", "dp", "action", "cid", "type", "level"] {
         pattern = pattern.replace(&format!(r"\{{{}\}}", key), &format!(r"(?P<{}>[^/]+)", key));
     }
 
@@ -1008,14 +1009,14 @@ impl BridgeContext {
     }
 
     /// Spawns a background task to clear retained messages for specific devices
-    pub async fn spawn_retain_scavenger(&self, ids: Vec<String>) {
-        if ids.is_empty() {
+    pub async fn spawn_retain_scavenger(&self, targets: Vec<crate::types::ScavengerTarget>) {
+        if targets.is_empty() {
             return;
         }
 
         let mut lock = self.scavenger_tx.lock().await;
         if let Some(tx) = &*lock
-            && tx.send(ids.clone()).is_ok()
+            && tx.send(targets.clone()).is_ok()
         {
             return;
         }
@@ -1052,12 +1053,17 @@ impl BridgeContext {
 
         let root_topic = self.mqtt_root_topic.clone();
 
-        for tpl in templates {
+        for tpl in &templates {
             if tpl.is_empty() {
                 continue;
             }
-            subs.insert(tpl_to_wildcard(&tpl, &root_topic));
+            subs.insert(tpl_to_wildcard(tpl, &root_topic));
         }
+
+        let event_tpl = templates[0].clone();
+        let msg_tpl = templates[1].clone();
+        let event_re = compile_topic_regex(&event_tpl);
+        let msg_re = compile_topic_regex(&msg_tpl);
 
         tokio::spawn(async move {
             let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
@@ -1070,16 +1076,16 @@ impl BridgeContext {
                 }
             }
 
-            let mut targets: HashSet<String> = ids.into_iter().collect();
+            let mut active_targets = targets;
             let mut deadline =
                 tokio::time::Instant::now() + Duration::from_secs(SCAVENGER_TIMEOUT_SECS);
 
             loop {
                 tokio::select! {
-                    new_ids_opt = rx.recv() => {
-                        if let Some(new_ids) = new_ids_opt {
-                            let count = new_ids.len();
-                            targets.extend(new_ids);
+                    new_targets_opt = rx.recv() => {
+                        if let Some(new_targets) = new_targets_opt {
+                            let count = new_targets.len();
+                            active_targets.extend(new_targets);
                             deadline = tokio::time::Instant::now() + Duration::from_secs(SCAVENGER_TIMEOUT_SECS);
                             debug!("Scavenger added {} new targets, extended timeout", count);
                         } else {
@@ -1092,17 +1098,47 @@ impl BridgeContext {
                     notification = eventloop.poll() => {
                         match notification {
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
+                                if !p.retain {
+                                    continue;
+                                }
+
                                 let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &root_topic);
                                 if p.topic == config_topic {
                                     continue;
                                 }
 
-                                let payload = String::from_utf8_lossy(&p.payload);
-                                if p.retain
-                                    && targets
-                                        .iter()
-                                        .any(|id| p.topic.contains(id) || payload.contains(id))
-                                {
+                                let mut should_clear = false;
+
+                                // 1. Precise Topic Match
+                                let vars = match_topic(&p.topic, &event_tpl, event_re.as_ref())
+                                    .or_else(|| match_topic(&p.topic, &msg_tpl, msg_re.as_ref()));
+
+                                if let Some(vars) = vars {
+                                    let ext_id = vars.get("id");
+                                    let ext_name = vars.get("name");
+                                    let ext_cid = vars.get("cid");
+
+                                    should_clear = active_targets.iter().any(|t| {
+                                        let match_id = ext_id.is_some_and(|id| id == &t.id);
+                                        let match_cid = ext_cid.is_some() && t.cid.as_ref() == ext_cid;
+                                        let match_name = ext_name.is_some() && t.name.as_ref() == ext_name;
+                                        match_id || match_cid || match_name
+                                    });
+                                }
+
+                                // 2. Exact Payload Match
+                                if !should_clear {
+                                    let payload = String::from_utf8_lossy(&p.payload);
+                                    should_clear = active_targets.iter().any(|t| {
+                                        // Exact JSON string value match
+                                        let id_match = payload.contains(&format!("\"{}\"", t.id));
+                                        let cid_match = t.cid.as_ref().is_some_and(|cid| payload.contains(&format!("\"{}\"", cid)));
+                                        let name_match = t.name.as_ref().is_some_and(|name| payload.contains(&format!("\"{}\"", name)));
+                                        id_match || cid_match || name_match
+                                    });
+                                }
+
+                                if should_clear {
                                     debug!("Scavenger clearing retained message: {}", p.topic);
                                     let _ = client
                                         .publish(&p.topic, rumqttc::QoS::AtLeastOnce, true, "")
@@ -1115,7 +1151,7 @@ impl BridgeContext {
                     }
                 }
             }
-            debug!("Scavenger finished for {} devices", targets.len());
+            debug!("Scavenger finished for {} devices", active_targets.len());
             let _ = client.disconnect().await;
         });
     }
@@ -1247,11 +1283,18 @@ impl BridgeContext {
         targets.sort();
         targets.dedup();
 
+        let mut scavenger_targets = Vec::new();
         {
             let mut state = self.state.write().await;
 
             for target_id in &targets {
                 if let Some(cfg) = state.configs.remove(target_id) {
+                    scavenger_targets.push(crate::types::ScavengerTarget {
+                        id: target_id.clone(),
+                        name: cfg.name.clone(),
+                        cid: cfg.cid.clone(),
+                    });
+
                     if let Some(n) = cfg.name
                         && let Some(ids) = state.name_map.get_mut(&n)
                     {
@@ -1265,6 +1308,12 @@ impl BridgeContext {
                     {
                         state.cid_map.remove(&(parent_id, cid));
                     }
+                } else {
+                    scavenger_targets.push(crate::types::ScavengerTarget {
+                        id: target_id.clone(),
+                        name: None,
+                        cid: None,
+                    });
                 }
                 state.instances.remove(target_id);
             }
@@ -1274,25 +1323,32 @@ impl BridgeContext {
         self.request_refresh();
 
         // Scavenge retained messages for removed devices
-        self.spawn_retain_scavenger(targets.clone()).await;
+        self.spawn_retain_scavenger(scavenger_targets).await;
 
         info!("Devices removed: {}", targets.join(", "));
         self.request_save();
         Ok(ApiResponse::ok("remove", targets.join(",")))
     }
 
-    /// Clears all devices and configurations
     pub async fn clear_devices(&self) -> Result<ApiResponse, BridgeError> {
-        let ids: Vec<String> = {
+        let scavenger_targets: Vec<crate::types::ScavengerTarget> = {
             let mut state = self.state.write().await;
 
-            let ids = state.configs.keys().cloned().collect();
+            let targets = state
+                .configs
+                .values()
+                .map(|cfg| crate::types::ScavengerTarget {
+                    id: cfg.id.clone(),
+                    name: cfg.name.clone(),
+                    cid: cfg.cid.clone(),
+                })
+                .collect();
 
             state.configs.clear();
             state.instances.clear();
             state.cid_map.clear();
             state.name_map.clear();
-            ids
+            targets
         };
 
         info!("All devices cleared");
@@ -1301,7 +1357,7 @@ impl BridgeContext {
         self.request_refresh();
 
         // Scavenge all retained messages
-        self.spawn_retain_scavenger(ids).await;
+        self.spawn_retain_scavenger(scavenger_targets).await;
 
         self.request_save();
         Ok(ApiResponse::ok("clear", "all"))
