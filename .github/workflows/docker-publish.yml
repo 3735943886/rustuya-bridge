@@ -5,12 +5,12 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write    # softprops/action-gh-release creates the GitHub Release
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
