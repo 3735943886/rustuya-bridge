@@ -9,17 +9,48 @@ An MQTT-based bridge server for managing Tuya devices via [`rustuya`](https://gi
 
 ## How to Run
 
-### Direct Execution
-```bash
-cargo run --release -- --mqtt-broker mqtt://localhost:1883
-```
-
 > **Standalone mode**: If `--mqtt-broker` is omitted, the bridge runs in
 > debug/standalone mode — devices are still tracked and persisted to the
 > state file, but no MQTT publish/subscribe occurs. A warning is logged at
 > startup.
 
-### Docker Execution
+### Pre-built Binary (recommended)
+Download the archive for your platform from the
+[Releases](https://github.com/3735943886/rustuya-bridge/releases) page,
+extract, and run:
+```bash
+tar -xzf rustuya-bridge-<target>.tar.gz
+./rustuya-bridge --mqtt-broker mqtt://localhost:1883
+```
+
+| Platform | Target |
+|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-musl` |
+| Linux ARM64 (RPi 4/5, ARM servers) | `aarch64-unknown-linux-musl` |
+| Linux ARMv7 (RPi 3, Zero 2 W) | `armv7-unknown-linux-musleabihf` |
+| macOS Intel | `x86_64-apple-darwin` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| Windows | `x86_64-pc-windows-msvc` |
+
+For long-running deployments, run the binary under a process supervisor such
+as **systemd** (Linux), **launchd** (macOS), or **supervisord** so that the
+bridge restarts automatically on crash and starts at boot.
+
+### Install via `cargo install`
+Builds and installs the latest tagged release into `~/.cargo/bin`:
+```bash
+cargo install --git https://github.com/3735943886/rustuya-bridge --locked
+rustuya-bridge --mqtt-broker mqtt://localhost:1883
+```
+
+### Build from Source
+```bash
+git clone https://github.com/3735943886/rustuya-bridge
+cd rustuya-bridge
+cargo run --release -- --mqtt-broker mqtt://localhost:1883
+```
+
+### Docker
 Run with **host network mode** to ensure Tuya device discovery works correctly:
 ```bash
 docker run -d \
