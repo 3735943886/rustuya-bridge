@@ -28,7 +28,18 @@ impl BridgeServer {
         // Maximize file descriptor limit for better performance
         rustuya::runtime::maximize_fd_limit()?;
 
+        let session_id = format!(
+            "sid_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        self.cli.session_id = Some(session_id);
+
         let (ctx, mqtt_tx_rx, save_rx, refresh_rx) = BridgeContext::new(&self.cli).await;
+
+        ctx.check_existing_instance().await?;
 
         // Start background services
         let h1 = ctx.clone().spawn_state_saver(save_rx, ctx.cancel.clone());

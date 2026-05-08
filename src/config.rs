@@ -83,6 +83,11 @@ pub struct Cli {
     /// Disable internal signal handling (for library use)
     #[arg(long, env = "NO_SIGNALS")]
     pub no_signals: Option<bool>,
+
+    /// Session ID generated at runtime to prevent duplicate execution
+    #[serde(skip_deserializing)]
+    #[arg(skip)]
+    pub session_id: Option<String>,
 }
 
 impl Cli {
@@ -142,6 +147,7 @@ impl Cli {
             save_debounce_secs,
             log_level,
             no_signals,
+            session_id,
         } = other;
 
         macro_rules! merge_field {
@@ -167,6 +173,7 @@ impl Cli {
         merge_field!(save_debounce_secs);
         merge_field!(log_level);
         merge_field!(no_signals);
+        merge_field!(session_id);
     }
 
     pub fn get_mqtt_topics(&self) -> (String, String) {

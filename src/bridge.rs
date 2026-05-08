@@ -438,6 +438,8 @@ impl BridgeContext {
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 100);
         let sub_topic = tpl_to_wildcard(&mqtt_command_topic, &self.mqtt_root_topic);
         let command_topic_re = compile_topic_regex(&mqtt_command_topic);
+        let config_topic =
+            crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
 
         let handle = tokio::spawn(async move {
             let mut retry_delay = INITIAL_RETRY_DELAY_SECS;
@@ -463,10 +465,25 @@ impl BridgeContext {
                                 } else {
                                     info!("Subscribed to: {}", sub_topic);
                                 }
+                                if let Err(e) = client.subscribe(&config_topic, rumqttc::QoS::AtLeastOnce).await {
+                                    error!("Config subscription failed: {}", e);
+                                }
                             }
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
                                 let payload = String::from_utf8_lossy(&p.payload);
                                 debug!("MQTT Received: [{}] {}", p.topic, payload);
+
+                                if p.topic == config_topic {
+                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload)
+                                        && let Some(sid) = val.get("session_id").and_then(|v| v.as_str())
+                                        && Some(sid) != self.cli.session_id.as_deref() {
+                                        error!("Another bridge instance took over (session_id: {}). Shutting down.", sid);
+                                        self.cancel.cancel();
+                                        return;
+                                    }
+                                    continue;
+                                }
+
                                 let vars = match_topic(&p.topic, &mqtt_command_topic, command_topic_re.as_ref()).unwrap_or_default();
                                 let req_val = self.parse_mqtt_payload(&payload, vars);
 
@@ -493,7 +510,8 @@ impl BridgeContext {
                             }
                             Err(e) => {
                                 error!("MQTT Error: {}. Retrying in {}s...", e, retry_delay);
-                                next_retry = Some(Instant::now() + Duration::from_secs(retry_delay));
+                                let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 1000;
+                                next_retry = Some(Instant::now() + Duration::from_secs(retry_delay) + Duration::from_millis(jitter as u64));
                                 retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY_SECS);
                             }
                             _ => {}
@@ -618,6 +636,34 @@ impl BridgeContext {
         {
             warn!("MQTT queue full, dropping message");
         }
+    }
+
+    pub async fn check_existing_instance(&self) -> Result<()> {
+        let broker_url = match &self.cli.mqtt_broker {
+            Some(url) => url,
+            None => return Ok(()),
+        };
+        let client_id = format!("{}_check", self.cli.get_mqtt_client_id());
+        let opts = self.create_mqtt_options(broker_url, &client_id, &self.cli, false)?;
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(opts, 10);
+        let topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
+        client.subscribe(&topic, rumqttc::QoS::AtLeastOnce).await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, eventloop.poll()).await {
+            if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(p)) = event {
+                let payload = String::from_utf8_lossy(&p.payload);
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload)
+                    && val.get("session_id").is_some()
+                {
+                    anyhow::bail!(
+                        "Duplicate instance detected. Another bridge is already running."
+                    );
+                }
+            }
+        }
+        let _ = client.disconnect().await;
+        Ok(())
     }
 
     /// Creates MQTT options from broker URL
