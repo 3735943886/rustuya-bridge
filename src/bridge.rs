@@ -203,6 +203,12 @@ impl BridgeContext {
     )> {
         verify_write_permission(cli.state_file()).await?;
 
+        if cli.mqtt_broker.is_none() {
+            warn!(
+                "No --mqtt-broker configured; running in debug/standalone mode (devices are tracked locally but no MQTT publish/subscribe)"
+            );
+        }
+
         let (_, mqtt_event_topic) = cli.mqtt_topics();
         let initial_configs = load_state(cli.state_file()).await;
 
