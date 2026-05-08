@@ -34,7 +34,7 @@ impl BridgeServer {
     /// the MQTT task fails to start.
     pub async fn setup(&mut self) -> Result<Arc<BridgeContext>> {
         // Maximize file descriptor limit for better performance
-        rustuya::runtime::maximize_fd_limit()?;
+        rustuya::maximize_fd_limit()?;
 
         let session_id = format!(
             "sid_{}",

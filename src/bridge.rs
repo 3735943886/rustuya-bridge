@@ -218,7 +218,12 @@ impl BridgeContext {
             } else if let Some(key) = &cfg.key {
                 let dev = DeviceBuilder::new(id, key.as_bytes().to_vec())
                     .address(cfg.ip.as_deref().unwrap_or("Auto"))
-                    .version(cfg.version.as_deref().unwrap_or("Auto"))
+                    .version(
+                        cfg.version
+                            .as_deref()
+                            .and_then(|s| s.parse::<rustuya::Version>().ok())
+                            .unwrap_or_default(),
+                    )
                     .nowait(true)
                     .run();
                 initial_instances.insert(id.clone(), dev);
@@ -1403,7 +1408,12 @@ impl BridgeContext {
                 // Register as direct device
                 let dev = DeviceBuilder::new(&id, key.as_bytes().to_vec())
                     .address(cfg.ip.as_deref().unwrap_or("Auto"))
-                    .version(cfg.version.as_deref().unwrap_or("Auto"))
+                    .version(
+                        cfg.version
+                            .as_deref()
+                            .and_then(|s| s.parse::<rustuya::Version>().ok())
+                            .unwrap_or_default(),
+                    )
                     .nowait(true)
                     .run();
                 state.instances.insert(id.clone(), dev);
