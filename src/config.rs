@@ -24,7 +24,7 @@ pub struct Cli {
     #[arg(short = 'C', long, env = "CONFIG")]
     pub config: Option<String>,
 
-    /// MQTT Broker address (e.g., mqtt://localhost:1883, mqtts://localhost:8883, tcp://localhost:1883, or localhost)
+    /// MQTT Broker address (e.g., `mqtt://localhost:1883`, `mqtts://localhost:8883`, `tcp://localhost:1883`, or `localhost`)
     #[arg(short = 'm', long, env = "MQTT_BROKER")]
     pub mqtt_broker: Option<String>,
 
@@ -90,7 +90,41 @@ pub struct Cli {
     pub session_id: Option<String>,
 }
 
+impl Default for Cli {
+    /// Defaults used as the last layer of [`Cli::load`]. Fields without a meaningful
+    /// default (`mqtt_broker`, `mqtt_user`, `mqtt_password`, `config`, `session_id`)
+    /// stay `None`.
+    fn default() -> Self {
+        Self {
+            config: None,
+            mqtt_broker: None,
+            mqtt_user: None,
+            mqtt_password: None,
+            mqtt_root_topic: Some(DEFAULT_MQTT_ROOT_TOPIC.into()),
+            mqtt_command_topic: Some(DEFAULT_MQTT_COMMAND_TOPIC.into()),
+            mqtt_event_topic: Some(DEFAULT_MQTT_EVENT_TOPIC.into()),
+            mqtt_client_id: Some(DEFAULT_MQTT_CLIENT_ID.into()),
+            mqtt_message_topic: Some(DEFAULT_MQTT_MESSAGE_TOPIC.into()),
+            mqtt_payload_template: Some(DEFAULT_MQTT_PAYLOAD_TEMPLATE.into()),
+            mqtt_scanner_topic: Some(DEFAULT_MQTT_SCANNER_TOPIC.into()),
+            mqtt_retain: Some(false),
+            state_file: Some(DEFAULT_STATE_FILE.into()),
+            save_debounce_secs: Some(DEFAULT_SAVE_DEBOUNCE_SECS),
+            log_level: Some(DEFAULT_LOG_LEVEL.into()),
+            no_signals: Some(false),
+            session_id: None,
+        }
+    }
+}
+
 impl Cli {
+    /// Parses CLI/env arguments and merges any JSON config file specified by `--config`.
+    /// If the file does not exist, the current settings are written there for future runs.
+    ///
+    /// Resolution priority (highest first): CLI/env > config file > [`Cli::default`].
+    ///
+    /// # Errors
+    /// Returns an error if the config file cannot be read, parsed, or written.
     pub async fn load() -> Result<Self> {
         let mut cli = Self::parse();
 
@@ -109,8 +143,7 @@ impl Cli {
                     "Config file {config_path} not found, creating a new one from current settings"
                 );
 
-                // Fill defaults so the saved JSON has meaningful values instead of just nulls
-                cli.fill_defaults();
+                cli.merge(Self::default());
 
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent).await.ok();
@@ -125,10 +158,11 @@ impl Cli {
             }
         }
 
-        cli.fill_defaults();
+        cli.merge(Self::default());
         Ok(cli)
     }
 
+    /// Fills `None` fields in `self` from `other`. Existing `Some` values are preserved.
     fn merge(&mut self, other: Self) {
         let Self {
             config: _,
@@ -149,113 +183,77 @@ impl Cli {
             no_signals,
             session_id,
         } = other;
-
-        macro_rules! merge_field {
-            ($field:ident) => {
-                if self.$field.is_none() {
-                    self.$field = $field;
-                }
-            };
+        macro_rules! fill {
+            ($($f:ident),* $(,)?) => { $(self.$f = self.$f.take().or($f);)* };
         }
-
-        merge_field!(mqtt_broker);
-        merge_field!(mqtt_user);
-        merge_field!(mqtt_password);
-        merge_field!(mqtt_root_topic);
-        merge_field!(mqtt_command_topic);
-        merge_field!(mqtt_event_topic);
-        merge_field!(mqtt_client_id);
-        merge_field!(mqtt_message_topic);
-        merge_field!(mqtt_payload_template);
-        merge_field!(mqtt_scanner_topic);
-        merge_field!(mqtt_retain);
-        merge_field!(state_file);
-        merge_field!(save_debounce_secs);
-        merge_field!(log_level);
-        merge_field!(no_signals);
-        merge_field!(session_id);
+        fill!(
+            mqtt_broker,
+            mqtt_user,
+            mqtt_password,
+            mqtt_root_topic,
+            mqtt_command_topic,
+            mqtt_event_topic,
+            mqtt_client_id,
+            mqtt_message_topic,
+            mqtt_payload_template,
+            mqtt_scanner_topic,
+            mqtt_retain,
+            state_file,
+            save_debounce_secs,
+            log_level,
+            no_signals,
+            session_id,
+        );
     }
 
-    pub fn get_mqtt_topics(&self) -> (String, String) {
-        let root_topic = self
+    /// Returns `(command_topic, event_topic)` with `{root}` substituted.
+    #[must_use]
+    pub fn mqtt_topics(&self) -> (String, String) {
+        let root = self
             .mqtt_root_topic
             .as_deref()
             .unwrap_or(DEFAULT_MQTT_ROOT_TOPIC);
-        let mqtt_command_topic = self.mqtt_command_topic.as_deref().map_or_else(
-            || DEFAULT_MQTT_COMMAND_TOPIC.replace("{root}", root_topic),
-            |t| t.replace("{root}", root_topic),
-        );
-        let mqtt_event_topic = self.mqtt_event_topic.as_deref().map_or_else(
-            || DEFAULT_MQTT_EVENT_TOPIC.replace("{root}", root_topic),
-            |t| t.replace("{root}", root_topic),
-        );
-        (mqtt_command_topic, mqtt_event_topic)
-    }
-
-    pub fn get_mqtt_client_id(&self) -> String {
-        let root_topic = self
-            .mqtt_root_topic
+        let command = self
+            .mqtt_command_topic
             .as_deref()
-            .unwrap_or(DEFAULT_MQTT_ROOT_TOPIC);
-        self.mqtt_client_id.as_deref().map_or_else(
-            || DEFAULT_MQTT_CLIENT_ID.replace("{root}", root_topic),
-            |t| t.replace("{root}", root_topic),
+            .unwrap_or(DEFAULT_MQTT_COMMAND_TOPIC);
+        let event = self
+            .mqtt_event_topic
+            .as_deref()
+            .unwrap_or(DEFAULT_MQTT_EVENT_TOPIC);
+        (
+            command.replace("{root}", root),
+            event.replace("{root}", root),
         )
     }
 
-    pub fn get_state_file(&self) -> String {
-        self.state_file
+    /// Returns the MQTT client ID with `{root}` substituted.
+    #[must_use]
+    pub fn mqtt_client_id(&self) -> String {
+        let root = self
+            .mqtt_root_topic
             .as_deref()
-            .unwrap_or(DEFAULT_STATE_FILE)
-            .to_string()
+            .unwrap_or(DEFAULT_MQTT_ROOT_TOPIC);
+        self.mqtt_client_id
+            .as_deref()
+            .unwrap_or(DEFAULT_MQTT_CLIENT_ID)
+            .replace("{root}", root)
     }
 
-    pub fn get_save_debounce_secs(&self) -> u64 {
+    #[must_use]
+    pub fn state_file(&self) -> &str {
+        self.state_file.as_deref().unwrap_or(DEFAULT_STATE_FILE)
+    }
+
+    #[must_use]
+    pub fn save_debounce_secs(&self) -> u64 {
         self.save_debounce_secs
             .unwrap_or(DEFAULT_SAVE_DEBOUNCE_SECS)
     }
 
-    pub fn get_mqtt_retain(&self) -> bool {
+    #[must_use]
+    pub fn mqtt_retain(&self) -> bool {
         self.mqtt_retain.unwrap_or(false)
-    }
-
-    pub fn fill_defaults(&mut self) {
-        if self.mqtt_root_topic.is_none() {
-            self.mqtt_root_topic = Some(DEFAULT_MQTT_ROOT_TOPIC.to_string());
-        }
-        if self.mqtt_command_topic.is_none() {
-            self.mqtt_command_topic = Some(DEFAULT_MQTT_COMMAND_TOPIC.to_string());
-        }
-        if self.mqtt_event_topic.is_none() {
-            self.mqtt_event_topic = Some(DEFAULT_MQTT_EVENT_TOPIC.to_string());
-        }
-        if self.state_file.is_none() {
-            self.state_file = Some(DEFAULT_STATE_FILE.to_string());
-        }
-        if self.save_debounce_secs.is_none() {
-            self.save_debounce_secs = Some(DEFAULT_SAVE_DEBOUNCE_SECS);
-        }
-        if self.mqtt_retain.is_none() {
-            self.mqtt_retain = Some(false);
-        }
-        if self.mqtt_message_topic.is_none() {
-            self.mqtt_message_topic = Some(DEFAULT_MQTT_MESSAGE_TOPIC.to_string());
-        }
-        if self.mqtt_payload_template.is_none() {
-            self.mqtt_payload_template = Some(DEFAULT_MQTT_PAYLOAD_TEMPLATE.to_string());
-        }
-        if self.log_level.is_none() {
-            self.log_level = Some(DEFAULT_LOG_LEVEL.to_string());
-        }
-        if self.mqtt_client_id.is_none() {
-            self.mqtt_client_id = Some(DEFAULT_MQTT_CLIENT_ID.to_string());
-        }
-        if self.mqtt_scanner_topic.is_none() {
-            self.mqtt_scanner_topic = Some(DEFAULT_MQTT_SCANNER_TOPIC.to_string());
-        }
-        if self.no_signals.is_none() {
-            self.no_signals = Some(false);
-        }
     }
 }
 

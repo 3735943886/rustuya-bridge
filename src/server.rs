@@ -8,14 +8,15 @@ use std::sync::Arc;
 pub struct BridgeServer {
     cli: Cli,
     ctx: Option<Arc<BridgeContext>>,
-    /// Handles for state_saver and device_listener - aborted on close
+    /// Handles for `state_saver` and `device_listener` - aborted on close
     background_handles: Vec<tokio::task::JoinHandle<()>>,
     /// MQTT task handle - waited on close to ensure clean disconnect
     mqtt_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BridgeServer {
-    pub fn new(cli: Cli) -> Self {
+    #[must_use]
+    pub const fn new(cli: Cli) -> Self {
         Self {
             cli,
             ctx: None,
@@ -24,6 +25,13 @@ impl BridgeServer {
         }
     }
 
+    /// Initializes the bridge context, starts background tasks (state saver, device
+    /// listener, MQTT task) and publishes the running config to MQTT.
+    ///
+    /// # Errors
+    /// Returns an error if file-descriptor limits cannot be raised, the state file
+    /// directory is not writable, another bridge instance is already running, or
+    /// the MQTT task fails to start.
     pub async fn setup(&mut self) -> Result<Arc<BridgeContext>> {
         // Maximize file descriptor limit for better performance
         rustuya::runtime::maximize_fd_limit()?;
@@ -32,12 +40,11 @@ impl BridgeServer {
             "sid_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
+                .map_or(0, |d| d.as_millis())
         );
         self.cli.session_id = Some(session_id);
 
-        let (ctx, mqtt_tx_rx, save_rx, refresh_rx) = BridgeContext::new(&self.cli).await;
+        let (ctx, mqtt_tx_rx, save_rx, refresh_rx) = BridgeContext::new(&self.cli).await?;
 
         ctx.check_existing_instance().await?;
 
@@ -58,6 +65,11 @@ impl BridgeServer {
         Ok(ctx)
     }
 
+    /// Blocks until the bridge receives a shutdown signal (SIGINT/SIGTERM, or internal
+    /// cancellation), then performs a graceful shutdown.
+    ///
+    /// # Errors
+    /// Returns an error if [`Self::setup`] has not been called, or if shutdown fails.
     pub async fn run(&mut self) -> Result<()> {
         let ctx = self
             .ctx
@@ -72,10 +84,10 @@ impl BridgeServer {
 
         // Wait for termination signal or internal cancellation
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 info!("Shutdown requested internally");
             }
-            _ = async {
+            () = async {
                 if no_signals {
                     futures_util::future::pending::<()>().await;
                 }
@@ -104,6 +116,11 @@ impl BridgeServer {
         self.close().await
     }
 
+    /// Drops the bridge context, aborts background tasks (with grace period), and waits
+    /// for the MQTT task to finish flushing.
+    ///
+    /// # Errors
+    /// Currently always returns `Ok`; reserved for future shutdown failures.
     pub async fn close(&mut self) -> Result<()> {
         // Signal all background tasks (drop instances, cancel, mqtt shutdown)
         if let Some(ctx) = &self.ctx {

@@ -1,5 +1,7 @@
+use rustuya::Device;
 use rustuya::protocol::CommandType;
 use serde_json::Value;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
@@ -27,6 +29,47 @@ pub async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiR
     }
 }
 
+/// Resolves targets, then runs `op(device, resolved_cid)` for each connected target with a timeout.
+/// Errors map to [`BridgeError::DeviceError`] (op failure) or [`BridgeError::Timeout`].
+async fn execute_per_target<F, Fut, T, E>(
+    ctx: &Arc<BridgeContext>,
+    targets: &[String],
+    op_label: &str,
+    cid: Option<String>,
+    op: F,
+) -> Result<(), BridgeError>
+where
+    F: Fn(Device, Option<String>) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    for target_id in targets {
+        let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
+        let Ok(dev) = ctx.get_connected_device(target_id).await else {
+            continue;
+        };
+        match timeout(
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            op(dev, actual_cid),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(BridgeError::DeviceError(e.to_string())),
+            Err(_) => {
+                return Err(BridgeError::Timeout(format!(
+                    "{op_label} timeout for {target_id}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "single dispatch switch over the BridgeRequest enum; splitting hurts locality"
+)]
 async fn handle_request_inner(
     ctx: Arc<BridgeContext>,
     req: BridgeRequest,
@@ -69,26 +112,10 @@ async fn handle_request_inner(
                     name.map(SingleOrList::into_vec),
                 )
                 .await?;
-            for target_id in &targets {
-                let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
-                if let Ok(dev) = ctx.get_connected_device(target_id).await {
-                    match timeout(
-                        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-                        dev.request(CommandType::DpQuery, None, actual_cid),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => return Err(BridgeError::DeviceError(e.to_string())),
-                        Err(_) => {
-                            return Err(BridgeError::Timeout(format!(
-                                "get timeout for {}",
-                                target_id
-                            )));
-                        }
-                    }
-                }
-            }
+            execute_per_target(&ctx, &targets, "get", cid, |dev, actual_cid| async move {
+                dev.request(CommandType::DpQuery, None, actual_cid).await
+            })
+            .await?;
             Ok(ApiResponse::ok("get", targets.join(",")))
         }
         BridgeRequest::Set { id, name, dps, cid } => {
@@ -98,30 +125,14 @@ async fn handle_request_inner(
                     name.map(SingleOrList::into_vec),
                 )
                 .await?;
-            for target_id in &targets {
-                let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
-                if let Ok(dev) = ctx.get_connected_device(target_id).await {
-                    match timeout(
-                        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-                        dev.request(
-                            CommandType::Control,
-                            Some(Value::Object(dps.clone())),
-                            actual_cid,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => return Err(BridgeError::DeviceError(e.to_string())),
-                        Err(_) => {
-                            return Err(BridgeError::Timeout(format!(
-                                "set timeout for {}",
-                                target_id
-                            )));
-                        }
-                    }
+            execute_per_target(&ctx, &targets, "set", cid, |dev, actual_cid| {
+                let dps = dps.clone();
+                async move {
+                    dev.request(CommandType::Control, Some(Value::Object(dps)), actual_cid)
+                        .await
                 }
-            }
+            })
+            .await?;
             Ok(ApiResponse::ok("set", targets.join(",")))
         }
         BridgeRequest::Request {
@@ -138,26 +149,11 @@ async fn handle_request_inner(
                     name.map(SingleOrList::into_vec),
                 )
                 .await?;
-            for target_id in &targets {
-                let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
-                if let Ok(dev) = ctx.get_connected_device(target_id).await {
-                    match timeout(
-                        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-                        dev.request(command, data.clone(), actual_cid),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => return Err(BridgeError::DeviceError(e.to_string())),
-                        Err(_) => {
-                            return Err(BridgeError::Timeout(format!(
-                                "request timeout for {}",
-                                target_id
-                            )));
-                        }
-                    }
-                }
-            }
+            execute_per_target(&ctx, &targets, "request", cid, |dev, actual_cid| {
+                let data = data.clone();
+                async move { dev.request(command, data, actual_cid).await }
+            })
+            .await?;
             Ok(ApiResponse::ok(
                 format!("{command:?}").to_lowercase(),
                 targets.join(","),
@@ -170,25 +166,10 @@ async fn handle_request_inner(
                     name.map(SingleOrList::into_vec),
                 )
                 .await?;
-            for target_id in &targets {
-                if let Ok(dev) = ctx.get_connected_device(target_id).await {
-                    match timeout(
-                        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-                        dev.sub_discover(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => return Err(BridgeError::DeviceError(e.to_string())),
-                        Err(_) => {
-                            return Err(BridgeError::Timeout(format!(
-                                "sub_discover timeout for {}",
-                                target_id
-                            )));
-                        }
-                    }
-                }
-            }
+            execute_per_target(&ctx, &targets, "sub_discover", None, |dev, _| async move {
+                dev.sub_discover().await
+            })
+            .await?;
             Ok(ApiResponse::ok("sub_discover", targets.join(",")))
         }
         BridgeRequest::Scan => {
