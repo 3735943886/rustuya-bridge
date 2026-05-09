@@ -36,18 +36,19 @@ For long-running deployments, run the binary under a process supervisor such
 as **systemd** (Linux), **launchd** (macOS), or **supervisord** so that the
 bridge restarts automatically on crash and starts at boot.
 
-### Install via `cargo install`
-Builds and installs the latest tagged release into `~/.cargo/bin`:
-```bash
-cargo install --git https://github.com/3735943886/rustuya-bridge --locked
-rustuya-bridge --mqtt-broker mqtt://localhost:1883
-```
-
 ### Build from Source
+Clone and run directly with cargo, or produce a release binary you can copy
+elsewhere:
 ```bash
 git clone https://github.com/3735943886/rustuya-bridge
 cd rustuya-bridge
+
+# One-shot run (development)
 cargo run --release -- --mqtt-broker mqtt://localhost:1883
+
+# Build only — binary at ./target/release/rustuya-bridge
+cargo build --release
+./target/release/rustuya-bridge --mqtt-broker mqtt://localhost:1883
 ```
 
 ### Docker
