@@ -98,7 +98,7 @@ A JSON file can be used to manage all settings. Command-line arguments take prio
 
 Run with:
 ```bash
-cargo run -- --config config.json
+./rustuya-bridge --config config.json
 ```
 
 ### MQTT Usage
@@ -242,15 +242,19 @@ The bridge publishes events to the following MQTT topics:
 ## Operational Notes
 
 ### Duplicate Instance Detection
-At startup the bridge briefly subscribes to `{root}/bridge/config` and refuses
-to start if another instance's retained config is observed. Each running
-bridge embeds a session ID; if a newer instance takes over the topic, older
-instances detect the change and shut themselves down automatically. This
-prevents two bridges from talking to the same Tuya devices simultaneously.
+Only one bridge can run against the same MQTT broker + root topic at a time;
+duplicates are detected via the retained `{root}/bridge/config` topic and the
+older instance shuts itself down automatically.
 
 ### State File
 Device registrations are persisted to `--state-file` (default `rustuya.json`)
-with debounced writes. Removing the file resets the bridge to an empty device
-list on next start. The path is treated as relative to the working directory —
-use an absolute path (or the Docker default `/data/rustuya.json`) when
-running under systemd.
+with debounced writes. The path is treated as relative to the working
+directory — use an absolute path (or the Docker default `/data/rustuya.json`)
+when running under systemd.
+
+> **If `--mqtt-retain` is enabled, do not delete the state file to "reset"
+> the bridge.** The retain-scavenger only runs in response to `remove` /
+> `clear` actions while the bridge is alive, so deleting the file leaves
+> stale retained messages on the broker for devices it no longer knows
+> about. Send a `clear` command (or per-device `remove`) first. With the
+> default `mqtt_retain = false`, deleting the file is harmless.
