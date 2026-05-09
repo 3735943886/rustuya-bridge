@@ -9,7 +9,22 @@ permissions:
   contents: write
 
 jobs:
+  # taiki-e/upload-rust-binary-action does not create the release itself;
+  # ensure it exists (idempotently) before the matrix uploads to it.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   upload-assets:
+    needs: create-release
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
