@@ -412,8 +412,32 @@ cmd_remove() {
 cmd_purge() {
     require_root purge
     require_systemd
-    confirm "PURGE rustuya-bridge AND all data (${DATA_DIR}, user ${SVC_USER})?" \
-        || { log "Aborted."; return 0; }
+
+    cat <<EOF
+
+${C_YELLOW}PURGE will permanently delete:${C_RESET}
+  • binary       ${BIN_PATH}
+  • unit         ${UNIT_PATH}
+  • helper       ${SELF_PATH}
+  • data dir     ${DATA_DIR}/   (config.json, rustuya.json, all device state)
+  • user         ${SVC_USER}
+
+${C_YELLOW}Heads-up about retained MQTT messages:${C_RESET}
+The retain-scavenger only runs in response to ${C_BOLD}remove${C_RESET} / ${C_BOLD}clear${C_RESET} commands
+while the bridge is alive. If ${C_BOLD}mqtt_retain${C_RESET} was enabled, purging now leaves
+stale retained messages on the broker for every previously-registered device.
+For a clean broker, publish ${C_BOLD}{"action":"clear"}${C_RESET} on the command topic and
+wait for it to complete BEFORE running purge.
+EOF
+
+    if [ -f "$CONFIG_FILE" ] \
+        && grep -Eq '"mqtt_retain"[[:space:]]*:[[:space:]]*true' "$CONFIG_FILE"; then
+        printf '\n'
+        warn "Detected mqtt_retain=true in ${CONFIG_FILE} — sending a 'clear' first is strongly recommended."
+    fi
+    printf '\n'
+
+    confirm "Proceed with PURGE?" || { log "Aborted."; return 0; }
 
     stop_disable_service
     rm -f "$UNIT_PATH" "$BIN_PATH" "$SELF_PATH"
