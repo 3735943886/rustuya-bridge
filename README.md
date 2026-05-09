@@ -242,9 +242,7 @@ The bridge publishes events to the following MQTT topics:
 ## Operational Notes
 
 ### Duplicate Instance Detection
-Only one bridge can run against the same MQTT broker + root topic at a time;
-duplicates are detected via the retained `{root}/bridge/config` topic and the
-older instance shuts itself down automatically.
+Running two bridges against the same MQTT broker + root topic is prevented.
 
 ### State File
 Device registrations are persisted to `--state-file` (default `rustuya.json`)
