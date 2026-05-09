@@ -36,6 +36,25 @@ For long-running deployments, run the binary under a process supervisor such
 as **systemd** (Linux), **launchd** (macOS), or **supervisord** so that the
 bridge restarts automatically on crash and starts at boot.
 
+#### One-line install (Linux + systemd)
+[`scripts/bridgectl.sh`](scripts/bridgectl.sh) installs the latest release,
+creates a dedicated `rustuya` user, writes a default config, registers the
+systemd unit, and starts the service. It also copies itself to
+`/usr/local/bin/bridgectl` so subsequent management runs from anywhere.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/3735943886/rustuya-bridge/master/scripts/bridgectl.sh \
+  | sudo bash -s -- install --yes
+```
+
+After install:
+```bash
+bridgectl                  # show status / latest version / service state
+sudo bridgectl upgrade     # pull the latest release and restart
+sudo bridgectl remove      # stop + uninstall (keeps data dir and user)
+sudo bridgectl purge       # also wipe data dir, user, and the helper itself
+```
+
 ### Build from Source
 Clone and run directly with cargo, or produce a release binary you can copy
 elsewhere:
