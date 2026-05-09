@@ -17,6 +17,7 @@ pub enum SingleOrList {
 }
 
 impl SingleOrList {
+    #[must_use]
     pub fn into_vec(self) -> Vec<String> {
         match self {
             Self::Single(s) => vec![s],
@@ -81,6 +82,7 @@ pub enum BridgeRequest {
 }
 
 impl BridgeRequest {
+    #[must_use]
     pub const fn action_name(&self) -> &str {
         match self {
             Self::Add { .. } => "add",
@@ -95,6 +97,7 @@ impl BridgeRequest {
         }
     }
 
+    #[must_use]
     pub fn target_id(&self) -> Option<&str> {
         match self {
             Self::Add { id, .. } => Some(id),
@@ -124,6 +127,7 @@ pub struct ApiResponse {
 }
 
 impl ApiResponse {
+    #[must_use]
     pub fn ok(action: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             status: Status::Ok,
@@ -134,6 +138,19 @@ impl ApiResponse {
         }
     }
 
+    /// `ok` response without an `id` field (e.g. bridge-level status).
+    #[must_use]
+    pub fn ok_action(action: impl Into<String>) -> Self {
+        Self {
+            status: Status::Ok,
+            action: Some(action.into()),
+            id: None,
+            error: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[must_use]
     pub fn error(err: impl std::fmt::Display) -> Self {
         Self {
             status: Status::Error,
@@ -144,16 +161,19 @@ impl ApiResponse {
         }
     }
 
+    #[must_use]
     pub fn with_extra(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.extra.insert(key.into(), value.into());
         self
     }
 
+    #[must_use]
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
     }
 
+    #[must_use]
     pub fn with_action(mut self, action: impl Into<String>) -> Self {
         self.action = Some(action.into());
         self

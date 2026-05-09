@@ -22,6 +22,12 @@ pub const LISTENER_TIMEOUT_SECS: u64 = 300;
 pub const REQUEST_TIMEOUT_SECS: u64 = 15;
 pub const SCAVENGER_TIMEOUT_SECS: u64 = 1;
 
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
 #[derive(Debug, Clone)]
 pub struct MqttMessage {
     pub topic: String,
@@ -45,7 +51,7 @@ struct TopicVars<'a> {
 pub struct BridgeState {
     pub configs: HashMap<String, DeviceConfig>,
     pub instances: HashMap<String, Device>,
-    /// Mapping from (parent_id, cid) to sub-device ID
+    /// Mapping from (`parent_id`, `cid`) to sub-device ID
     pub cid_map: HashMap<(String, String), String>,
     /// Mapping from name to device IDs
     pub name_map: HashMap<String, Vec<String>>,
@@ -70,40 +76,57 @@ pub struct BridgeContext {
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
-/// Converts MQTT template to wildcard for subscription
-/// Converts MQTT template to wildcard for subscription
-pub fn tpl_to_wildcard(template: &str, root_topic: &str) -> String {
-    let mut res = String::with_capacity(template.len());
+/// Topic-template variable keys recognised by [`tpl_to_wildcard`], [`compile_topic_regex`],
+/// and [`BridgeContext::replace_vars`]. The `value`, `dps`, `timestamp`, and `root` keys are
+/// handled separately because they require values rather than wildcard substitution.
+const TOPIC_WILDCARD_KEYS: &[&str] = &["id", "name", "dp", "action", "cid", "type", "level"];
+
+/// Walks a template string of the form `"foo/{id}/bar"`, calling `substitute(key, &mut out)`
+/// for each `{key}` placeholder. The callback returns `true` to consume the placeholder or
+/// `false` to leave it untouched (the literal `{key}` is then emitted).
+fn render_template<F>(template: &str, mut substitute: F) -> String
+where
+    F: FnMut(&str, &mut String) -> bool,
+{
+    let mut res = String::with_capacity(template.len() + 32);
     let mut last = 0;
     while let Some(start) = template[last..].find('{') {
         let actual_start = last + start;
         res.push_str(&template[last..actual_start]);
-        if let Some(end) = template[actual_start..].find('}') {
-            let actual_end = actual_start + end;
-            let key = &template[actual_start + 1..actual_end];
-            let mut matched = true;
-            match key {
-                "root" => res.push_str(root_topic),
-                "id" | "name" | "dp" | "action" | "cid" | "type" | "level" => res.push('+'),
-                _ => {
-                    matched = false;
-                }
-            }
-            if matched {
-                last = actual_end + 1;
-            } else {
-                res.push('{');
-                last = actual_start + 1;
-            }
-        } else {
+        let Some(end) = template[actual_start..].find('}') else {
             break;
+        };
+        let actual_end = actual_start + end;
+        let key = &template[actual_start + 1..actual_end];
+        if substitute(key, &mut res) {
+            last = actual_end + 1;
+        } else {
+            res.push('{');
+            last = actual_start + 1;
         }
     }
     res.push_str(&template[last..]);
     res
 }
 
+/// Converts MQTT template to wildcard for subscription
+#[must_use]
+pub fn tpl_to_wildcard(template: &str, root_topic: &str) -> String {
+    render_template(template, |key, out| match key {
+        "root" => {
+            out.push_str(root_topic);
+            true
+        }
+        k if TOPIC_WILDCARD_KEYS.contains(&k) => {
+            out.push('+');
+            true
+        }
+        _ => false,
+    })
+}
+
 /// Compiles a template into a Regex if it contains variables
+#[must_use]
 pub fn compile_topic_regex(template: &str) -> Option<Regex> {
     if !template.contains('{') {
         return None;
@@ -111,14 +134,15 @@ pub fn compile_topic_regex(template: &str) -> Option<Regex> {
 
     // Convert template to regex. E.g. "tuya/{id}/command" -> "^tuya/(?P<id>[^/]+)/command$"
     let mut pattern = regex::escape(template);
-    for key in ["id", "name", "dp", "action", "cid", "type", "level"] {
-        pattern = pattern.replace(&format!(r"\{{{}\}}", key), &format!(r"(?P<{}>[^/]+)", key));
+    for key in TOPIC_WILDCARD_KEYS {
+        pattern = pattern.replace(&format!(r"\{{{key}\}}"), &format!(r"(?P<{key}>[^/]+)"));
     }
 
-    Regex::new(&format!("^{}$", pattern)).ok()
+    Regex::new(&format!("^{pattern}$")).ok()
 }
 
 /// Matches MQTT topic against precompiled regex or template
+#[must_use]
 pub fn match_topic(
     topic: &str,
     template: &str,
@@ -137,46 +161,56 @@ pub fn match_topic(
         (topic == template).then(HashMap::new)
     }
 }
-async fn verify_write_permission(state_file: &str) {
+async fn verify_write_permission(state_file: &str) -> Result<()> {
     let path = Path::new(state_file);
 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
     {
-        panic!(
-            "Cannot create directory for state file ({}): {}",
-            parent.display(),
-            e
-        );
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Cannot create directory for state file ({}): {e}",
+                parent.display()
+            )
+        })?;
     }
 
     let test_path = path.with_extension("test_write");
 
-    if let Err(e) = tokio::fs::write(&test_path, b"").await {
-        panic!(
-            "No write permission for state file ({})!\n\
-            Please check directory permissions. (Error: {})",
-            state_file, e
-        );
-    }
+    tokio::fs::write(&test_path, b"").await.map_err(|e| {
+        anyhow::anyhow!(
+            "No write permission for state file ({state_file}). Check directory permissions: {e}"
+        )
+    })?;
 
     let _ = tokio::fs::remove_file(&test_path).await;
+    Ok(())
 }
 
 impl BridgeContext {
+    /// Constructs a new bridge context. Verifies write permission to the state
+    /// file, then loads existing device configs and prepares background channels.
+    ///
+    /// # Errors
+    /// Returns an error if the state file directory is not writable.
     pub async fn new(
         cli: &Cli,
-    ) -> (
+    ) -> Result<(
         Arc<Self>,
         mpsc::Receiver<Option<MqttMessage>>,
         mpsc::Receiver<()>,
         mpsc::Receiver<()>,
-    ) {
-        verify_write_permission(&cli.get_state_file()).await;
+    )> {
+        verify_write_permission(cli.state_file()).await?;
 
-        let (_, mqtt_event_topic) = cli.get_mqtt_topics();
-        let initial_configs = load_state(&cli.get_state_file()).await;
+        if cli.mqtt_broker.is_none() {
+            warn!(
+                "No --mqtt-broker configured; running in debug/standalone mode (devices are tracked locally but no MQTT publish/subscribe)"
+            );
+        }
+
+        let (_, mqtt_event_topic) = cli.mqtt_topics();
+        let initial_configs = load_state(cli.state_file()).await;
 
         let mut initial_instances = HashMap::new();
         let mut initial_name_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -190,12 +224,17 @@ impl BridgeContext {
             } else if let Some(key) = &cfg.key {
                 let dev = DeviceBuilder::new(id, key.as_bytes().to_vec())
                     .address(cfg.ip.as_deref().unwrap_or("Auto"))
-                    .version(cfg.version.as_deref().unwrap_or("Auto"))
+                    .version(
+                        cfg.version
+                            .as_deref()
+                            .and_then(|s| s.parse::<rustuya::Version>().ok())
+                            .unwrap_or_default(),
+                    )
                     .nowait(true)
                     .run();
                 initial_instances.insert(id.clone(), dev);
             } else {
-                error!("Device {} is invalid: missing key or parent info", id);
+                error!("Device {id} is invalid: missing key or parent info");
             }
 
             if let Some(name) = &cfg.name {
@@ -218,12 +257,12 @@ impl BridgeContext {
                 .clone()
                 .unwrap_or_else(|| crate::config::DEFAULT_MQTT_ROOT_TOPIC.to_string()),
             mqtt_event_topic,
-            mqtt_retain: cli.get_mqtt_retain(),
+            mqtt_retain: cli.mqtt_retain(),
             mqtt_message_topic: cli.mqtt_message_topic.clone(),
             mqtt_payload_template: cli.mqtt_payload_template.clone(),
             mqtt_scanner_topic: cli.mqtt_scanner_topic.clone(),
-            state_file: cli.get_state_file(),
-            save_debounce_secs: cli.get_save_debounce_secs(),
+            state_file: cli.state_file().to_string(),
+            save_debounce_secs: cli.save_debounce_secs(),
             state: RwLock::new(BridgeState {
                 configs: initial_configs,
                 instances: initial_instances,
@@ -236,7 +275,7 @@ impl BridgeContext {
             cancel: tokio_util::sync::CancellationToken::new(),
         });
 
-        (ctx, mqtt_tx_receiver, save_rx, refresh_rx)
+        Ok((ctx, mqtt_tx_receiver, save_rx, refresh_rx))
     }
 
     /// Starts state saver task with debounce
@@ -248,21 +287,21 @@ impl BridgeContext {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    () = cancel.cancelled() => break,
                     res = save_rx.recv() => {
                         if res.is_none() { break; }
                         tokio::select! {
-                            _ = cancel.cancelled() => {
+                            () = cancel.cancelled() => {
                                 while save_rx.try_recv().is_ok() {} // Drain pending requests
                                 if let Err(e) = self.save_state().await {
-                                    error!("Save failed during shutdown: {}", e);
+                                    error!("Save failed during shutdown: {e}");
                                 }
                                 break;
                             }
-                            _ = tokio::time::sleep(Duration::from_secs(self.save_debounce_secs)) => {
+                            () = tokio::time::sleep(Duration::from_secs(self.save_debounce_secs)) => {
                                 while save_rx.try_recv().is_ok() {} // Drain pending requests
                                 if let Err(e) = self.save_state().await {
-                                    error!("Save failed: {}", e);
+                                    error!("Save failed: {e}");
                                 }
                             }
                         }
@@ -287,7 +326,7 @@ impl BridgeContext {
 
                 if instances.is_empty() {
                     tokio::select! {
-                        _ = cancel.cancelled() => return,
+                        () = cancel.cancelled() => return,
                         res = refresh_rx.recv() => {
                             if res.is_none() { return; }
                             continue;
@@ -299,14 +338,18 @@ impl BridgeContext {
                 debug!("Started unified listener for {} devices", instances.len());
                 loop {
                     tokio::select! {
-                        _ = cancel.cancelled() => return,
+                        () = cancel.cancelled() => return,
                         res = tokio::time::timeout(Duration::from_secs(LISTENER_TIMEOUT_SECS), stream.next()) => {
                             match res {
                                 Ok(Some(event_res)) => {
                                     if let Ok(event) = event_res {
-                                        let payload_str = event.message.payload_as_string().unwrap();
-                                        trace!("Raw event from {}: {}", event.device_id, payload_str);
-                                        let payload: Value = serde_json::from_str(&payload_str).unwrap_or(Value::String(payload_str.clone()));
+                                        let Some(payload_str) = event.message.payload_as_string() else {
+                                            warn!("Non-UTF8 payload from {}", event.device_id);
+                                            continue;
+                                        };
+                                        trace!("Raw event from {}: {payload_str}", event.device_id);
+                                        let payload: Value = serde_json::from_str(&payload_str)
+                                            .unwrap_or_else(|_| Value::String(payload_str.clone()));
                                         let (target_id, name, cid, exists) = self.resolve_event_target(&event.device_id, &payload).await;
 
                                 // Check for 'dps' at root or inside 'data' (for sub-devices/gateways)
@@ -314,13 +357,15 @@ impl BridgeContext {
 
                                 // Check for error messages
                                 if payload_obj.is_some_and(|o| o.contains_key("errorCode") || o.contains_key("errorMsg")) {
-                                    if let Some(ref n) = name {
-                                        info!("Device {} ({}) reported error: {}", target_id, n, payload);
+                                    if let Some(n) = name.as_ref() {
+                                        info!("Device {target_id} ({n}) reported error: {payload}");
                                     } else {
-                                        info!("Device {} reported error: {}", target_id, payload);
+                                        info!("Device {target_id} reported error: {payload}");
                                     }
                                     // Update last_error_code in device config
-                                    let error_code = payload.get("errorCode").and_then(|v| v.as_u64()).map(|v| v as u32);
+                                    let error_code = payload.get("errorCode")
+                                        .and_then(Value::as_u64)
+                                        .and_then(|v| u32::try_from(v).ok());
                                     if let Some(code) = error_code {
                                         let mut state = self.state.write().await;
                                         if let Some(cfg) = state.configs.get_mut(&target_id) {
@@ -369,7 +414,7 @@ impl BridgeContext {
                                     break;
                                 }
                                 Err(_) => {
-                                    info!("Device listener timeout after {}s (no events received)", LISTENER_TIMEOUT_SECS);
+                                    info!("Device listener timeout after {LISTENER_TIMEOUT_SECS}s (no events received)");
                                 }
                             }
                         }
@@ -398,41 +443,49 @@ impl BridgeContext {
                 })
             })
             .and_then(|c| c.as_str())
-            .map(|s| s.to_string());
+            .map(ToString::to_string);
 
-        let state = self.state.read().await;
-
-        // Use sub-device info if CID is registered, else fall back to parent
-        let target_id = if let Some(c) = &cid {
-            state
-                .cid_map
-                .get(&(parent_id.to_string(), c.clone()))
-                .cloned()
-                .unwrap_or_else(|| parent_id.to_string())
-        } else {
-            parent_id.to_string()
+        let (target_id, name, exists) = {
+            let state = self.state.read().await;
+            let target_id = cid.as_ref().map_or_else(
+                || parent_id.to_string(),
+                |c| {
+                    state
+                        .cid_map
+                        .get(&(parent_id.to_string(), c.clone()))
+                        .cloned()
+                        .unwrap_or_else(|| parent_id.to_string())
+                },
+            );
+            let (name, exists) = state
+                .configs
+                .get(&target_id)
+                .map_or((None, false), |c| (c.name.clone(), true));
+            drop(state);
+            (target_id, name, exists)
         };
-
-        let cfg = state.configs.get(&target_id);
-        let name = cfg.and_then(|c| c.name.clone());
-        let exists = cfg.is_some();
 
         (target_id, name, cid, exists)
     }
 
-    /// Starts MQTT task for command processing and event publishing
+    /// Starts MQTT task for command processing and event publishing.
+    ///
+    /// Returns `Ok(None)` if no broker is configured.
+    ///
+    /// # Errors
+    /// Returns an error if MQTT options cannot be constructed (e.g. invalid broker URL).
+    #[allow(clippy::too_many_lines, reason = "tokio::select! event-loop driver")]
     pub fn spawn_mqtt_task(
         self: Arc<Self>,
         cli: &Cli,
         mut mqtt_tx_receiver: mpsc::Receiver<Option<MqttMessage>>,
     ) -> Result<Option<tokio::task::JoinHandle<()>>> {
-        let broker_url = match &cli.mqtt_broker {
-            Some(url) => url,
-            None => return Ok(None),
+        let Some(broker_url) = &cli.mqtt_broker else {
+            return Ok(None);
         };
 
-        let (mqtt_command_topic, _) = cli.get_mqtt_topics();
-        let client_id = cli.get_mqtt_client_id();
+        let (mqtt_command_topic, _) = cli.mqtt_topics();
+        let client_id = cli.mqtt_client_id();
         let mqtt_options = self.create_mqtt_options(broker_url, &client_id, cli, true)?;
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 100);
@@ -446,7 +499,7 @@ impl BridgeContext {
             let mut next_retry: Option<Instant> = None;
             loop {
                 tokio::select! {
-                    _ = async {
+                    () = async {
                         if let Some(deadline) = next_retry {
                             tokio::time::sleep_until(deadline).await;
                         } else {
@@ -461,23 +514,23 @@ impl BridgeContext {
                                 info!("Connected to MQTT broker");
                                 retry_delay = INITIAL_RETRY_DELAY_SECS;
                                 if let Err(e) = client.subscribe(&sub_topic, rumqttc::QoS::AtLeastOnce).await {
-                                    error!("Subscription failed: {}", e);
+                                    error!("Subscription failed: {e}");
                                 } else {
-                                    info!("Subscribed to: {}", sub_topic);
+                                    info!("Subscribed to: {sub_topic}");
                                 }
                                 if let Err(e) = client.subscribe(&config_topic, rumqttc::QoS::AtLeastOnce).await {
-                                    error!("Config subscription failed: {}", e);
+                                    error!("Config subscription failed: {e}");
                                 }
                             }
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
                                 let payload = String::from_utf8_lossy(&p.payload);
-                                debug!("MQTT Received: [{}] {}", p.topic, payload);
+                                debug!("MQTT Received: [{}] {payload}", p.topic);
 
                                 if p.topic == config_topic {
                                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload)
-                                        && let Some(sid) = val.get("session_id").and_then(|v| v.as_str())
+                                        && let Some(sid) = val.get("session_id").and_then(Value::as_str)
                                         && Some(sid) != self.cli.session_id.as_deref() {
-                                        error!("Another bridge instance took over (session_id: {}). Shutting down.", sid);
+                                        error!("Another bridge instance took over (session_id: {sid}). Shutting down.");
                                         self.cancel.cancel();
                                         return;
                                     }
@@ -485,7 +538,7 @@ impl BridgeContext {
                                 }
 
                                 let vars = match_topic(&p.topic, &mqtt_command_topic, command_topic_re.as_ref()).unwrap_or_default();
-                                let req_val = self.parse_mqtt_payload(&payload, vars);
+                                let req_val = Self::parse_mqtt_payload(&payload, &vars);
 
                                 let requests = if let Some(arr) = req_val.as_array() {
                                     arr.iter()
@@ -509,23 +562,21 @@ impl BridgeContext {
                                 }
                             }
                             Err(e) => {
-                                error!("MQTT Error: {}. Retrying in {}s...", e, retry_delay);
-                                let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 1000;
-                                next_retry = Some(Instant::now() + Duration::from_secs(retry_delay) + Duration::from_millis(jitter as u64));
+                                error!("MQTT Error: {e}. Retrying in {retry_delay}s...");
+                                let jitter = u64::try_from(unix_millis() % 1000).unwrap_or(0);
+                                next_retry = Some(Instant::now() + Duration::from_secs(retry_delay) + Duration::from_millis(jitter));
                                 retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY_SECS);
                             }
                             _ => {}
                         }
                     }
                     msg_opt = mqtt_tx_receiver.recv() => {
-                        match msg_opt {
-                            Some(Some(msg)) => {
-                                debug!("MQTT Publish: [{}] {}", msg.topic, msg.payload);
-                                if let Err(e) = client.publish(msg.topic, rumqttc::QoS::AtLeastOnce, msg.retain, msg.payload).await {
-                                    error!("Publish failed: {}", e);
-                                }
+                        if let Some(Some(msg)) = msg_opt {
+                            debug!("MQTT Publish: [{}] {}", msg.topic, msg.payload);
+                            if let Err(e) = client.publish(msg.topic, rumqttc::QoS::AtLeastOnce, msg.retain, msg.payload).await {
+                                error!("Publish failed: {e}");
                             }
-                            Some(None) | None => {
+                        } else {
                                 debug!("MQTT shutdown signal received, clearing and disconnecting...");
 
                                 // Clear bridge config retain topic
@@ -533,7 +584,7 @@ impl BridgeContext {
                                 let expected_pubacks = 1;
                                 let _ = client.publish(config_topic, rumqttc::QoS::AtLeastOnce, true, "").await;
 
-                                debug!("Waiting for {} PubAcks before disconnecting...", expected_pubacks);
+                                debug!("Waiting for {expected_pubacks} PubAcks before disconnecting...");
 
                                 // 3. Poll eventloop until all PubAcks are received (with timeout)
                                 let mut received_pubacks: usize = 0;
@@ -543,7 +594,7 @@ impl BridgeContext {
                                         break;
                                     }
                                     if tokio::time::Instant::now() >= deadline {
-                                        warn!("Timed out waiting for PubAcks ({}/{} received)", received_pubacks, expected_pubacks);
+                                        warn!("Timed out waiting for PubAcks ({received_pubacks}/{expected_pubacks} received)");
                                         break;
                                     }
                                     match tokio::time::timeout_at(deadline, eventloop.poll()).await {
@@ -551,7 +602,7 @@ impl BridgeContext {
                                             received_pubacks += 1;
                                         }
                                         Ok(Err(e)) => {
-                                            warn!("MQTT error while waiting for PubAck: {}", e);
+                                            warn!("MQTT error while waiting for PubAck: {e}");
                                             break;
                                         }
                                         Err(_) => {
@@ -562,7 +613,7 @@ impl BridgeContext {
                                     }
                                 }
 
-                                debug!("PubAck flush done ({}/{}).", received_pubacks, expected_pubacks);
+                                debug!("PubAck flush done ({received_pubacks}/{expected_pubacks}).");
 
                                 // 4. Disconnect
                                 let _ = client.disconnect().await;
@@ -573,7 +624,6 @@ impl BridgeContext {
                                 }
                                 debug!("MQTT eventloop terminated");
                                 return;
-                            }
                         }
                     }
                 }
@@ -588,8 +638,10 @@ impl BridgeContext {
         let payload = if clear {
             String::new()
         } else {
-            cli.map(|c| serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string()))
-                .unwrap_or_else(|| "{}".to_string())
+            cli.map_or_else(
+                || "{}".to_string(),
+                |c| serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string()),
+            )
         };
         self.try_send_mqtt(Some(MqttMessage {
             topic,
@@ -638,12 +690,16 @@ impl BridgeContext {
         }
     }
 
+    /// Briefly subscribes to the bridge config topic and returns an error if another
+    /// bridge instance is detected (its retained config is observed within 500ms).
+    ///
+    /// # Errors
+    /// Returns an error if the MQTT subscription fails or if a duplicate instance is detected.
     pub async fn check_existing_instance(&self) -> Result<()> {
-        let broker_url = match &self.cli.mqtt_broker {
-            Some(url) => url,
-            None => return Ok(()),
+        let Some(broker_url) = &self.cli.mqtt_broker else {
+            return Ok(());
         };
-        let client_id = format!("{}_check", self.cli.get_mqtt_client_id());
+        let client_id = format!("{}_check", self.cli.mqtt_client_id());
         let opts = self.create_mqtt_options(broker_url, &client_id, &self.cli, false)?;
         let (client, mut eventloop) = rumqttc::AsyncClient::new(opts, 10);
         let topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
@@ -721,23 +777,23 @@ impl BridgeContext {
         Ok(opts)
     }
 
-    /// Parses MQTT payload into a BridgeRequest value, merging topic variables.
-    fn parse_mqtt_payload(&self, payload: &str, vars: HashMap<String, String>) -> Value {
-        let mut val =
-            serde_json::from_str::<Value>(payload).unwrap_or(Value::String(payload.to_string()));
+    /// Parses MQTT payload into a [`BridgeRequest`] value, merging topic variables.
+    fn parse_mqtt_payload(payload: &str, vars: &HashMap<String, String>) -> Value {
+        let mut val = serde_json::from_str::<Value>(payload)
+            .unwrap_or_else(|_| Value::String(payload.to_string()));
 
         // If it's an array, merge topic variables into each element
         if let Some(arr) = val.as_array_mut() {
             for item in arr {
                 if let Some(obj) = item.as_object_mut() {
-                    for (k, v) in &vars {
+                    for (k, v) in vars {
                         if !obj.contains_key(k) {
                             obj.insert(k.clone(), Value::String(v.clone()));
                         }
                     }
                     // Heuristic for 'set' action inside array items
-                    if obj.get("action").and_then(|a| a.as_str()) == Some("set") {
-                        self.apply_set_heuristic(obj);
+                    if obj.get("action").and_then(Value::as_str) == Some("set") {
+                        Self::apply_set_heuristic(obj);
                     }
                 }
             }
@@ -761,7 +817,7 @@ impl BridgeContext {
 
         if let Some(obj) = val.as_object_mut() {
             // Merge topic variables (id, name, cid, action, dp etc)
-            for (k, v) in &vars {
+            for (k, v) in vars {
                 if !obj.contains_key(k) {
                     obj.insert(k.clone(), Value::String(v.clone()));
                 }
@@ -769,15 +825,15 @@ impl BridgeContext {
 
             // Heuristic for tuya2mqtt compatibility and simple set commands:
             // If action is 'set', ensure we have a 'dps' object
-            if obj.get("action").and_then(|a| a.as_str()) == Some("set") {
-                self.apply_set_heuristic(obj);
+            if obj.get("action").and_then(Value::as_str) == Some("set") {
+                Self::apply_set_heuristic(obj);
             }
         }
         val
     }
 
     /// Helper to apply 'set' command heuristic to an object
-    fn apply_set_heuristic(&self, obj: &mut serde_json::Map<String, Value>) {
+    fn apply_set_heuristic(obj: &mut serde_json::Map<String, Value>) {
         if !obj.contains_key("dps") && !obj.contains_key("data") {
             let mut dps = obj.clone();
             dps.remove("id");
@@ -791,6 +847,9 @@ impl BridgeContext {
     }
 
     /// Atomically saves device configuration to state file
+    ///
+    /// # Errors
+    /// Returns an error if the state file cannot be serialized, written, or atomically renamed.
     pub async fn save_state(&self) -> Result<()> {
         let json = {
             let state = self.state.read().await;
@@ -859,12 +918,16 @@ impl BridgeContext {
     }
 
     /// Generates MQTT topics and payloads based on templates
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "MQTT topic template uses literal `{dp}`/`{value}` placeholders, not format args"
+    )]
     fn generate_device_templates(
         &self,
         id: &str,
         name: Option<&str>,
         cid: Option<&str>,
-        dps: Value,
+        dps: &Value,
         is_passive: bool,
     ) -> Vec<(String, String)> {
         let dps_str = dps.to_string();
@@ -873,7 +936,7 @@ impl BridgeContext {
         let replace_vars_local = |s: &str, dp: Option<&str>, val: Option<&Value>| {
             self.replace_vars(
                 s,
-                TopicVars {
+                &TopicVars {
                     id,
                     name,
                     cid,
@@ -918,11 +981,11 @@ impl BridgeContext {
         is_passive: bool,
         exists: bool,
     ) {
-        if dps.is_null() || dps.as_str().is_some_and(|s| s.is_empty()) {
+        if dps.is_null() || dps.as_str().is_some_and(str::is_empty) {
             return;
         }
 
-        debug!("Device Event: [{}] {}", id, dps);
+        debug!("Device Event: [{id}] {dps}");
 
         if self.mqtt_tx.is_some() {
             // Check if device still exists before publishing to avoid race conditions during removal
@@ -934,7 +997,7 @@ impl BridgeContext {
                 &id,
                 name.as_deref(),
                 cid.as_deref(),
-                dps,
+                &dps,
                 is_passive,
             );
             if templates.is_empty() {
@@ -945,8 +1008,7 @@ impl BridgeContext {
                 let mut retain = self.mqtt_retain;
                 if retain && !topic.contains(&id) && !payload.contains(&id) {
                     warn!(
-                        "Ignoring retain for event from '{}' because '{}' is missing from both topic and payload",
-                        id, id
+                        "Ignoring retain for event from '{id}' because '{id}' is missing from both topic and payload"
                     );
                     retain = false;
                 }
@@ -972,8 +1034,8 @@ impl BridgeContext {
     ) {
         if self.mqtt_tx.is_some() {
             let topic = self.replace_vars(
-                &self.mqtt_message_topic.clone().unwrap_or_default(),
-                TopicVars {
+                self.mqtt_message_topic.as_deref().unwrap_or_default(),
+                &TopicVars {
                     id,
                     name,
                     cid,
@@ -996,8 +1058,7 @@ impl BridgeContext {
             let mut final_retain = retain;
             if final_retain && !topic.contains(id) && !payload_str.contains(id) {
                 warn!(
-                    "Ignoring retain for message from '{}' because '{}' is missing from both topic and payload",
-                    id, id
+                    "Ignoring retain for message from '{id}' because '{id}' is missing from both topic and payload"
                 );
                 final_retain = false;
             }
@@ -1010,7 +1071,7 @@ impl BridgeContext {
         }
     }
 
-    /// Publishes an ApiResponse to the appropriate topic
+    /// Publishes an [`ApiResponse`] to the appropriate topic
     pub async fn publish_api_response(&self, response: ApiResponse) {
         let level = match response.status {
             crate::types::Status::Ok => "response",
@@ -1025,74 +1086,82 @@ impl BridgeContext {
                     .await;
             }
             Err(e) => {
-                error!("Failed to serialize ApiResponse: {}", e);
+                error!("Failed to serialize ApiResponse: {e}");
             }
         }
     }
 
     /// Helper to replace template variables in a string
-    fn replace_vars(&self, template: &str, vars: TopicVars) -> String {
-        let mut res = String::with_capacity(template.len() + 32);
-        let mut last = 0;
-        while let Some(start) = template[last..].find('{') {
-            let actual_start = last + start;
-            res.push_str(&template[last..actual_start]);
-            if let Some(end) = template[actual_start..].find('}') {
-                let actual_end = actual_start + end;
-                let key = &template[actual_start + 1..actual_end];
-                let mut matched = true;
-                match key {
-                    "root" => res.push_str(&self.mqtt_root_topic),
-                    "id" => res.push_str(vars.id),
-                    "name" => res.push_str(vars.name.unwrap_or("")),
-                    "cid" => res.push_str(vars.cid.unwrap_or("")),
-                    "level" if vars.level.is_some() => res.push_str(vars.level.unwrap()),
-                    "type" if vars.event_type.is_some() => res.push_str(vars.event_type.unwrap()),
-                    "dp" if vars.dp.is_some() => res.push_str(vars.dp.unwrap()),
-                    "value" if vars.val.is_some() => {
-                        use std::fmt::Write;
-                        let _ = write!(res, "{}", vars.val.unwrap());
-                    }
-                    "value" | "dps" if vars.dps_str.is_some() => {
-                        res.push_str(vars.dps_str.unwrap());
-                    }
-                    "timestamp" => {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        use std::fmt::Write;
-                        let _ = write!(res, "{}", ts);
-                    }
-                    _ => {
-                        matched = false;
-                    }
-                }
-                if matched {
-                    last = actual_end + 1;
-                } else {
-                    res.push('{');
-                    last = actual_start + 1;
-                }
-            } else {
-                break;
+    fn replace_vars(&self, template: &str, vars: &TopicVars<'_>) -> String {
+        use std::fmt::Write;
+
+        render_template(template, |key, out| match key {
+            "root" => {
+                out.push_str(&self.mqtt_root_topic);
+                true
             }
-        }
-        res.push_str(&template[last..]);
-        res
+            "id" => {
+                out.push_str(vars.id);
+                true
+            }
+            "name" => {
+                out.push_str(vars.name.unwrap_or(""));
+                true
+            }
+            "cid" => {
+                out.push_str(vars.cid.unwrap_or(""));
+                true
+            }
+            "level" => vars.level.is_some_and(|v| {
+                out.push_str(v);
+                true
+            }),
+            "type" => vars.event_type.is_some_and(|v| {
+                out.push_str(v);
+                true
+            }),
+            "dp" => vars.dp.is_some_and(|v| {
+                out.push_str(v);
+                true
+            }),
+            "value" => {
+                if let Some(val) = vars.val {
+                    let _ = write!(out, "{val}");
+                    true
+                } else if let Some(dps_str) = vars.dps_str {
+                    out.push_str(dps_str);
+                    true
+                } else {
+                    false
+                }
+            }
+            "dps" => vars.dps_str.is_some_and(|s| {
+                out.push_str(s);
+                true
+            }),
+            "timestamp" => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let _ = write!(out, "{ts}");
+                true
+            }
+            _ => false,
+        })
     }
 
     /// Publishes bridge-level messages (e.g. scanner results)
     pub async fn publish_scanner_event(&self, payload: Value) {
-        if payload.is_null() || payload.as_str().is_some_and(|s| s.is_empty()) {
+        if payload.is_null() || payload.as_str().is_some_and(str::is_empty) {
             return;
         }
-        debug!("Scanner Event: {}", payload);
+        debug!("Scanner Event: {payload}");
         if self.mqtt_tx.is_some() {
             let topic = if let Some(topic) = &self.mqtt_scanner_topic {
                 self.replace_vars(
                     topic,
-                    TopicVars {
+                    &TopicVars {
                         id: "bridge",
                         name: Some("bridge"),
                         ..Default::default()
@@ -1101,7 +1170,7 @@ impl BridgeContext {
             } else {
                 self.replace_vars(
                     self.mqtt_message_topic.as_deref().unwrap_or_default(),
-                    TopicVars {
+                    &TopicVars {
                         id: "bridge",
                         name: Some("bridge"),
                         level: Some("scanner"),
@@ -1119,37 +1188,33 @@ impl BridgeContext {
     }
 
     /// Spawns a background task to clear retained messages for specific devices
+    #[allow(clippy::too_many_lines, reason = "tokio::select! event-loop driver")]
     pub async fn spawn_retain_scavenger(&self, targets: Vec<crate::types::ScavengerTarget>) {
         if targets.is_empty() {
             return;
         }
 
-        let mut lock = self.scavenger_tx.lock().await;
-        if let Some(tx) = &*lock
-            && tx.send(targets.clone()).is_ok()
-        {
-            return;
-        }
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        *lock = Some(tx);
-
-        let broker_url = match &self.cli.mqtt_broker {
-            Some(url) => url.clone(),
-            None => return,
+        let mut rx = {
+            let mut lock = self.scavenger_tx.lock().await;
+            if let Some(tx) = &*lock
+                && tx.send(targets.clone()).is_ok()
+            {
+                return;
+            }
+            let (tx, rx) = mpsc::unbounded_channel();
+            *lock = Some(tx);
+            rx
         };
-        let client_id = format!(
-            "{}_scavenger_{}",
-            self.cli.get_mqtt_client_id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
+
+        let Some(broker_url) = self.cli.mqtt_broker.clone() else {
+            return;
+        };
+        let client_id = format!("{}_scavenger_{}", self.cli.mqtt_client_id(), unix_millis());
         let mqtt_options = match self.create_mqtt_options(&broker_url, &client_id, &self.cli, false)
         {
             Ok(opts) => opts,
             Err(e) => {
-                error!("Failed to create MQTT options for scavenger: {}", e);
+                error!("Failed to create MQTT options for scavenger: {e}");
                 return;
             }
         };
@@ -1180,9 +1245,9 @@ impl BridgeContext {
 
             for sub in &subs {
                 if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
-                    error!("Scavenger subscription failed for {}: {}", sub, e);
+                    error!("Scavenger subscription failed for {sub}: {e}");
                 } else {
-                    debug!("Scavenger subscribed to {}", sub);
+                    debug!("Scavenger subscribed to {sub}");
                 }
             }
 
@@ -1197,12 +1262,12 @@ impl BridgeContext {
                             let count = new_targets.len();
                             active_targets.extend(new_targets);
                             deadline = tokio::time::Instant::now() + Duration::from_secs(SCAVENGER_TIMEOUT_SECS);
-                            debug!("Scavenger added {} new targets, extended timeout", count);
+                            debug!("Scavenger added {count} new targets, extended timeout");
                         } else {
                             break;
                         }
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
+                    () = tokio::time::sleep_until(deadline) => {
                         break;
                     }
                     notification = eventloop.poll() => {
@@ -1224,15 +1289,15 @@ impl BridgeContext {
                                     .or_else(|| match_topic(&p.topic, &msg_tpl, msg_re.as_ref()));
 
                                 if let Some(vars) = vars {
-                                    let ext_id = vars.get("id");
-                                    let ext_name = vars.get("name");
-                                    let ext_cid = vars.get("cid");
+                                    let v_id = vars.get("id");
+                                    let v_name = vars.get("name");
+                                    let v_chan = vars.get("cid");
 
                                     should_clear = active_targets.iter().any(|t| {
-                                        let match_id = ext_id.is_some_and(|id| id == &t.id);
-                                        let match_cid = ext_cid.is_some() && t.cid.as_ref() == ext_cid;
-                                        let match_name = ext_name.is_some() && t.name.as_ref() == ext_name;
-                                        match_id || match_cid || match_name
+                                        let id_hit = v_id.is_some_and(|v| v == &t.id);
+                                        let cid_hit = v_chan.is_some() && t.cid.as_ref() == v_chan;
+                                        let name_hit = v_name.is_some() && t.name.as_ref() == v_name;
+                                        id_hit || cid_hit || name_hit
                                     });
                                 }
 
@@ -1242,8 +1307,8 @@ impl BridgeContext {
                                     should_clear = active_targets.iter().any(|t| {
                                         // Exact JSON string value match
                                         let id_match = payload.contains(&format!("\"{}\"", t.id));
-                                        let cid_match = t.cid.as_ref().is_some_and(|cid| payload.contains(&format!("\"{}\"", cid)));
-                                        let name_match = t.name.as_ref().is_some_and(|name| payload.contains(&format!("\"{}\"", name)));
+                                        let cid_match = t.cid.as_ref().is_some_and(|cid| payload.contains(&format!("\"{cid}\"")));
+                                        let name_match = t.name.as_ref().is_some_and(|name| payload.contains(&format!("\"{name}\"")));
                                         id_match || cid_match || name_match
                                     });
                                 }
@@ -1266,8 +1331,8 @@ impl BridgeContext {
         });
     }
 
-    /// Normalizes DeviceConfig fields and applies aliases
-    fn normalize_config(&self, cfg: &mut DeviceConfig) {
+    /// Normalizes [`DeviceConfig`] fields and applies aliases
+    fn normalize_config(cfg: &mut DeviceConfig) {
         let normalize = |opt: &mut Option<String>| {
             if let Some(s) = opt
                 && (s.is_empty() || s == "Auto")
@@ -1302,8 +1367,12 @@ impl BridgeContext {
     }
 
     /// Adds or updates a device configuration
+    ///
+    /// # Errors
+    /// Returns [`BridgeError::InvalidRequest`] when the device has neither
+    /// `(cid + parent_id)` nor `key`.
     pub async fn add_device(&self, mut cfg: DeviceConfig) -> Result<ApiResponse, BridgeError> {
-        self.normalize_config(&mut cfg);
+        Self::normalize_config(&mut cfg);
 
         let id = cfg.id.clone();
         let name = cfg.name.clone();
@@ -1345,7 +1414,12 @@ impl BridgeContext {
                 // Register as direct device
                 let dev = DeviceBuilder::new(&id, key.as_bytes().to_vec())
                     .address(cfg.ip.as_deref().unwrap_or("Auto"))
-                    .version(cfg.version.as_deref().unwrap_or("Auto"))
+                    .version(
+                        cfg.version
+                            .as_deref()
+                            .and_then(|s| s.parse::<rustuya::Version>().ok())
+                            .unwrap_or_default(),
+                    )
                     .nowait(true)
                     .run();
                 state.instances.insert(id.clone(), dev);
@@ -1362,13 +1436,16 @@ impl BridgeContext {
             }
         }
 
-        info!("Device registered/updated: {}", id);
+        info!("Device registered/updated: {id}");
         self.request_save();
         self.request_refresh();
         Ok(ApiResponse::ok("add", id))
     }
 
     /// Removes devices and their sub-devices
+    ///
+    /// # Errors
+    /// Returns [`BridgeError::NoMatchingDevices`] if no devices match the given selectors.
     pub async fn remove_device(
         &self,
         id: Option<Vec<String>>,
@@ -1377,9 +1454,9 @@ impl BridgeContext {
         let mut targets = self.get_targets(id, name).await?;
 
         // Cascade removal to sub-devices
-        {
+        let sub_targets: Vec<String> = {
             let state = self.state.read().await;
-            let sub_targets: Vec<String> = state
+            state
                 .configs
                 .iter()
                 .filter_map(|(sub_id, cfg)| {
@@ -1387,9 +1464,9 @@ impl BridgeContext {
                         .as_ref()
                         .and_then(|p_id| targets.contains(p_id).then(|| sub_id.clone()))
                 })
-                .collect();
-            targets.extend(sub_targets);
-        }
+                .collect()
+        };
+        targets.extend(sub_targets);
         targets.sort();
         targets.dedup();
 
@@ -1440,6 +1517,10 @@ impl BridgeContext {
         Ok(ApiResponse::ok("remove", targets.join(",")))
     }
 
+    /// Clears all registered devices and scavenges their retained MQTT messages.
+    ///
+    /// # Errors
+    /// Currently always returns `Ok`; reserved for future failure modes.
     pub async fn clear_devices(&self) -> Result<ApiResponse, BridgeError> {
         let scavenger_targets: Vec<crate::types::ScavengerTarget> = {
             let mut state = self.state.write().await;
@@ -1476,54 +1557,47 @@ impl BridgeContext {
     /// Returns current bridge status and registered devices
     pub async fn get_bridge_status(&self) -> ApiResponse {
         let state = self.state.read().await;
-
         let mut devices = serde_json::Map::new();
         for (id, cfg) in &state.configs {
             if let Ok(mut dev_val) = serde_json::to_value(cfg) {
                 if let Some(obj) = dev_val.as_object_mut() {
-                    let status = self.determine_device_status(cfg, &state.instances);
+                    let status = Self::determine_device_status(cfg, &state.instances);
                     obj.insert("status".to_string(), Value::String(status));
                 }
                 devices.insert(id.clone(), dev_val);
             }
         }
+        drop(state);
 
-        let mut resp = ApiResponse::ok("status", "");
-        resp.id = None;
-        resp.with_extra("devices", Value::Object(devices))
+        ApiResponse::ok_action("status").with_extra("devices", Value::Object(devices))
     }
 
-    fn determine_device_status(
-        &self,
-        cfg: &DeviceConfig,
-        instances: &HashMap<String, Device>,
-    ) -> String {
+    fn determine_device_status(cfg: &DeviceConfig, instances: &HashMap<String, Device>) -> String {
         if cfg.cid.is_some() {
             // Sub-device: check if parent instance exists
             cfg.parent_id
                 .as_ref()
-                .map(|p_id| {
+                .map_or("invalid subdevice", |p_id| {
                     if instances.contains_key(p_id) {
                         "subdevice"
                     } else {
                         "no parent"
                     }
                 })
-                .unwrap_or("invalid subdevice")
                 .to_string()
         } else if instances.contains_key(&cfg.id) {
             // Direct device: use last_error_code if present, else "online"
-            if let Some(code) = cfg.last_error_code {
-                code.to_string()
-            } else {
-                "online".to_string()
-            }
+            cfg.last_error_code
+                .map_or_else(|| "online".to_string(), |code| code.to_string())
         } else {
             "offline".to_string()
         }
     }
 
-    /// Resolves target device IDs and returns NoMatchingDevices error if empty
+    /// Resolves target device IDs and returns [`BridgeError::NoMatchingDevices`] if empty.
+    ///
+    /// # Errors
+    /// Returns [`BridgeError::NoMatchingDevices`] when no IDs match the selectors.
     pub async fn get_targets(
         &self,
         id: Option<Vec<String>>,
@@ -1537,7 +1611,7 @@ impl BridgeContext {
         }
     }
 
-    /// Resolves actual CID for a device (priority: request_cid > config_cid)
+    /// Resolves actual CID for a device (priority: `request_cid` > `config_cid`)
     pub async fn resolve_cid(&self, id: &str, request_cid: Option<String>) -> Option<String> {
         if request_cid.is_some() {
             return request_cid;
@@ -1546,26 +1620,31 @@ impl BridgeContext {
         state.configs.get(id).and_then(|c| c.cid.clone())
     }
 
-    /// Gets a connected device instance, supporting sub-devices via parent
+    /// Gets a connected device instance, supporting sub-devices via parent.
+    ///
+    /// # Errors
+    /// Returns [`BridgeError::DeviceNotFound`] if neither the device nor its
+    /// parent (for sub-devices) is currently registered.
     pub async fn get_connected_device(&self, id: &str) -> Result<Device, BridgeError> {
-        let state = self.state.read().await;
-
-        if let Some(dev) = state.instances.get(id) {
-            return Ok(dev.clone());
-        }
-
-        // Try lookup via parent for sub-devices
-        if let Some(cfg) = state.configs.get(id)
-            && let Some(parent_id) = &cfg.parent_id
-        {
-            if let Some(parent_dev) = state.instances.get(parent_id) {
-                return Ok(parent_dev.clone());
-            } else {
-                return Err(BridgeError::DeviceNotFound(format!(
-                    "Parent device '{}' for subdevice '{}' not found",
-                    parent_id, id
-                )));
+        let parent_lookup = {
+            let state = self.state.read().await;
+            if let Some(dev) = state.instances.get(id) {
+                return Ok(dev.clone());
             }
+            // Try lookup via parent for sub-devices
+            state.configs.get(id).and_then(|cfg| {
+                cfg.parent_id
+                    .as_ref()
+                    .map(|p_id| (p_id.clone(), state.instances.get(p_id).cloned()))
+            })
+        };
+
+        if let Some((parent_id, dev)) = parent_lookup {
+            return dev.ok_or_else(|| {
+                BridgeError::DeviceNotFound(format!(
+                    "Parent device '{parent_id}' for subdevice '{id}' not found"
+                ))
+            });
         }
 
         Err(BridgeError::DeviceNotFound(id.to_string()))

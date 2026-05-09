@@ -9,12 +9,48 @@ An MQTT-based bridge server for managing Tuya devices via [`rustuya`](https://gi
 
 ## How to Run
 
-### Direct Execution
+> **Standalone mode**: If `--mqtt-broker` is omitted, the bridge runs in
+> debug/standalone mode — devices are still tracked and persisted to the
+> state file, but no MQTT publish/subscribe occurs. A warning is logged at
+> startup.
+
+### Pre-built Binary (recommended)
+Download the archive for your platform from the
+[Releases](https://github.com/3735943886/rustuya-bridge/releases) page,
+extract, and run:
 ```bash
+tar -xzf rustuya-bridge-<target>.tar.gz
+./rustuya-bridge --mqtt-broker mqtt://localhost:1883
+```
+
+| Platform | Target |
+|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-musl` |
+| Linux ARM64 (RPi 4/5, ARM servers) | `aarch64-unknown-linux-musl` |
+| Linux ARMv7 (RPi 3, Zero 2 W) | `armv7-unknown-linux-musleabihf` |
+| macOS Intel | `x86_64-apple-darwin` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| Windows | `x86_64-pc-windows-msvc` |
+
+For long-running deployments, run the binary under a process supervisor such
+as **systemd** (Linux), **launchd** (macOS), or **supervisord** so that the
+bridge restarts automatically on crash and starts at boot.
+
+### Install via `cargo install`
+Builds and installs the latest tagged release into `~/.cargo/bin`:
+```bash
+cargo install --git https://github.com/3735943886/rustuya-bridge --locked
+rustuya-bridge --mqtt-broker mqtt://localhost:1883
+```
+
+### Build from Source
+```bash
+git clone https://github.com/3735943886/rustuya-bridge
+cd rustuya-bridge
 cargo run --release -- --mqtt-broker mqtt://localhost:1883
 ```
 
-### Docker Execution
+### Docker
 Run with **host network mode** to ensure Tuya device discovery works correctly:
 ```bash
 docker run -d \
@@ -40,8 +76,10 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
 | `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
 | `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | `{value}` | MQTT payload template (e.g., `{"val": {value}}`) |
+| `--mqtt-retain` | `MQTT_RETAIN` | `false` | Retain flag for device state messages |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
+| `--log-level`, `-l` | `LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Configuration File
 A JSON file can be used to manage all settings. Command-line arguments take priority over settings in the config file.
@@ -196,3 +234,22 @@ The bridge publishes events to the following MQTT topics:
 - `mqtt-event-topic`: Device status changes (Active/Passive).
 - `mqtt-message-topic`: Errors and logs.
 - `mqtt-scanner-topic`: Results from the `scan` action. Returns an empty object `{}` when a scan cycle is finished.
+- `{root}/bridge/config`: Retained snapshot of the running configuration,
+  published at startup and cleared on graceful shutdown (also serves as the
+  presence/heartbeat topic).
+
+## Operational Notes
+
+### Duplicate Instance Detection
+At startup the bridge briefly subscribes to `{root}/bridge/config` and refuses
+to start if another instance's retained config is observed. Each running
+bridge embeds a session ID; if a newer instance takes over the topic, older
+instances detect the change and shut themselves down automatically. This
+prevents two bridges from talking to the same Tuya devices simultaneously.
+
+### State File
+Device registrations are persisted to `--state-file` (default `rustuya.json`)
+with debounced writes. Removing the file resets the bridge to an empty device
+list on next start. The path is treated as relative to the working directory —
+use an absolute path (or the Docker default `/data/rustuya.json`) when
+running under systemd.
