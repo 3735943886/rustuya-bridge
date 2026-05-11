@@ -9,7 +9,7 @@ name = "pyrustuyabridge"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 tokio = { version = "1.49", features = ["rt-multi-thread"] }
 anyhow = "1.0"

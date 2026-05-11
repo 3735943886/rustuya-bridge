@@ -5,23 +5,90 @@ build-backend = "maturin"
 [project]
 name = "pyrustuyabridge"
 dynamic = ["version"]
-description = "Python bindings for rustuyabridge"
+description = "Python bindings for rustuyabridge — an MQTT bridge for Tuya devices"
 authors = [
     { name = "3735943886" }
 ]
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["tuya", "iot", "smart-home", "automation"]
+keywords = ["tuya", "mqtt", "iot", "bridge", "smart-home", "automation"]
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Home Automation",
+    "Topic :: System :: Networking",
 ]
+
+[project.readme]
+content-type = "text/markdown"
+text = """
+# pyrustuyabridge
+
+Python bindings for [rustuya-bridge](https://github.com/3735943886/rustuya-bridge),
+an MQTT bridge for managing Tuya devices via the Tuya Local API.
+
+This package exposes the bridge server as an embeddable component so a Python
+manager can run alongside it and interpret MQTT topics/payloads identically to
+the native bridge.
+
+## Install
+
+```bash
+pip install pyrustuyabridge
+```
+
+Pre-built wheels are provided for Linux (manylinux2014 / musllinux_1_2 on
+x86_64 and aarch64), Windows x64, and macOS (x86_64 / arm64). Wheels are
+built with PyO3 `abi3-py39`, so a single wheel per platform supports
+CPython 3.9 and newer.
+
+## Quick start
+
+```python
+import asyncio
+from pyrustuyabridge import PyBridgeServer
+
+async def main():
+    server = PyBridgeServer(
+        mqtt_broker="mqtt://localhost:1883",
+        mqtt_root_topic="rustuya",
+    )
+    await server.start_async()
+
+asyncio.run(main())
+```
+
+## Helpers
+
+The module also exposes topic/payload utilities for managers that need to
+match the bridge's wire format:
+
+- `tpl_to_wildcard(template, root_topic)` — template → MQTT wildcard.
+- `match_topic(topic, template)` — returns extracted variables or `None`.
+- `render_template(template, vars)` — substitutes `{key}` placeholders.
+- `parse_payload(payload, vars)` — parses an MQTT payload into a structured value.
+
+See the [project repository](https://github.com/3735943886/rustuya-bridge)
+for full documentation.
+"""
 
 [project.urls]
 Homepage = "https://github.com/3735943886/rustuya-bridge"
 Repository = "https://github.com/3735943886/rustuya-bridge"
+Issues = "https://github.com/3735943886/rustuya-bridge/issues"
 
 [tool.maturin]
+module-name = "pyrustuyabridge"
 exclude = ["target/*", "**/target/*"]
