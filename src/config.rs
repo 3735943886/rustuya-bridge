@@ -207,6 +207,7 @@ impl Cli {
     }
 
     /// Returns `(command_topic, event_topic)` with `{root}` substituted.
+    #[allow(clippy::literal_string_with_formatting_args)]
     #[must_use]
     pub fn mqtt_topics(&self) -> (String, String) {
         let root = self
@@ -228,6 +229,7 @@ impl Cli {
     }
 
     /// Returns the MQTT client ID with `{root}` substituted.
+    #[allow(clippy::literal_string_with_formatting_args)]
     #[must_use]
     pub fn mqtt_client_id(&self) -> String {
         let root = self

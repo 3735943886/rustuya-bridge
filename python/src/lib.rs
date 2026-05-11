@@ -1,9 +1,99 @@
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
+use rustuyabridge::bridge::{
+    BridgeContext, compile_topic_regex, match_topic, render_template, tpl_to_wildcard,
+};
 use rustuyabridge::config::Cli;
 use rustuyabridge::server::BridgeServer;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Recursively converts a `serde_json::Value` into a Python object.
+fn json_value_to_py<'py>(py: Python<'py>, val: &Value) -> PyResult<Bound<'py, PyAny>> {
+    match val {
+        Value::Null => Ok(py.None().into_bound(py)),
+        Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any()),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i.into_pyobject(py)?.into_any())
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.into_pyobject(py)?.into_any())
+            } else if let Some(f) = n.as_f64() {
+                Ok(f.into_pyobject(py)?.into_any())
+            } else {
+                Ok(py.None().into_bound(py))
+            }
+        }
+        Value::String(s) => Ok(s.into_pyobject(py)?.into_any()),
+        Value::Array(arr) => {
+            let list = PyList::empty(py);
+            for v in arr {
+                list.append(json_value_to_py(py, v)?)?;
+            }
+            Ok(list.into_any())
+        }
+        Value::Object(obj) => {
+            let dict = PyDict::new(py);
+            for (k, v) in obj {
+                dict.set_item(k, json_value_to_py(py, v)?)?;
+            }
+            Ok(dict.into_any())
+        }
+    }
+}
+
+/// Converts an MQTT topic template to a subscription wildcard.
+///
+/// Example: `("rustuya/event/{type}/{id}", "rustuya")` -> `"rustuya/event/+/+"`.
+#[pyfunction]
+#[pyo3(name = "tpl_to_wildcard")]
+fn tpl_to_wildcard_py(template: &str, root_topic: &str) -> String {
+    tpl_to_wildcard(template, root_topic)
+}
+
+/// Matches a topic against a template, returning a dict of extracted variables.
+///
+/// Returns `None` if the topic does not match. For templates without variables
+/// (no `{...}`), this performs exact-string comparison.
+#[pyfunction]
+#[pyo3(name = "match_topic")]
+fn match_topic_py(topic: &str, template: &str) -> Option<HashMap<String, String>> {
+    let re = compile_topic_regex(template);
+    match_topic(topic, template, re.as_ref())
+}
+
+/// Substitutes `{key}` placeholders in `template` using `vars`. Unknown keys
+/// are left as the literal `{key}` (mirroring the bridge's behavior).
+#[pyfunction]
+#[pyo3(name = "render_template")]
+#[allow(clippy::needless_pass_by_value)]
+fn render_template_py(template: &str, vars: HashMap<String, String>) -> String {
+    render_template(template, |key, out| {
+        vars.get(key).is_some_and(|v| {
+            out.push_str(v);
+            true
+        })
+    })
+}
+
+/// Parses an MQTT payload into a structured value, merging in topic variables.
+///
+/// This mirrors `BridgeContext::parse_mqtt_payload` so the manager interprets
+/// custom payload templates identically to the bridge.
+#[pyfunction]
+#[pyo3(name = "parse_payload")]
+#[allow(clippy::needless_pass_by_value)]
+fn parse_payload_py<'py>(
+    py: Python<'py>,
+    payload: &str,
+    vars: HashMap<String, String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let val = BridgeContext::parse_mqtt_payload(payload, &vars);
+    json_value_to_py(py, &val)
+}
 
 #[pyclass]
 pub struct PyBridgeServer {
@@ -15,24 +105,7 @@ impl PyBridgeServer {
     #[new]
     #[pyo3(signature = (**kwargs))]
     fn new(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
-        let mut cli = Cli {
-            config: None,
-            mqtt_broker: None,
-            mqtt_root_topic: None,
-            mqtt_user: None,
-            mqtt_password: None,
-            mqtt_command_topic: None,
-            mqtt_event_topic: None,
-            mqtt_client_id: None,
-            mqtt_message_topic: None,
-            mqtt_payload_template: None,
-            mqtt_scanner_topic: None,
-            mqtt_retain: None,
-            state_file: None,
-            save_debounce_secs: None,
-            log_level: None,
-            no_signals: None,
-        };
+        let mut cli = Cli::default();
 
         if let Some(dict) = kwargs {
             if let Ok(Some(val)) = dict.get_item("config_path") {
@@ -85,7 +158,6 @@ impl PyBridgeServer {
             }
         }
 
-        cli.fill_defaults();
         Ok(Self {
             inner: Arc::new(Mutex::new(BridgeServer::new(cli))),
         })
@@ -129,6 +201,7 @@ impl PyBridgeServer {
                 .run()
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            drop(server);
             Ok(())
         })
     }
@@ -137,8 +210,9 @@ impl PyBridgeServer {
     fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            let mut server = inner.lock().await;
-            server
+            inner
+                .lock()
+                .await
                 .close()
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -151,5 +225,9 @@ impl PyBridgeServer {
 fn pyrustuyabridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_log::init();
     m.add_class::<PyBridgeServer>()?;
+    m.add_function(wrap_pyfunction!(tpl_to_wildcard_py, m)?)?;
+    m.add_function(wrap_pyfunction!(match_topic_py, m)?)?;
+    m.add_function(wrap_pyfunction!(render_template_py, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_payload_py, m)?)?;
     Ok(())
 }

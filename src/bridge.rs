@@ -81,10 +81,12 @@ pub struct BridgeContext {
 /// handled separately because they require values rather than wildcard substitution.
 const TOPIC_WILDCARD_KEYS: &[&str] = &["id", "name", "dp", "action", "cid", "type", "level"];
 
-/// Walks a template string of the form `"foo/{id}/bar"`, calling `substitute(key, &mut out)`
-/// for each `{key}` placeholder. The callback returns `true` to consume the placeholder or
-/// `false` to leave it untouched (the literal `{key}` is then emitted).
-fn render_template<F>(template: &str, mut substitute: F) -> String
+/// Walks a template string and substitutes `{key}` placeholders.
+///
+/// It calls `substitute(key, &mut out)` for each placeholder. The callback returns
+/// `true` to consume the placeholder or `false` to leave it untouched
+/// (the literal `{key}` is then emitted).
+pub fn render_template<F>(template: &str, mut substitute: F) -> String
 where
     F: FnMut(&str, &mut String) -> bool,
 {
@@ -540,14 +542,14 @@ impl BridgeContext {
                                 let vars = match_topic(&p.topic, &mqtt_command_topic, command_topic_re.as_ref()).unwrap_or_default();
                                 let req_val = Self::parse_mqtt_payload(&payload, &vars);
 
-                                let requests = if let Some(arr) = req_val.as_array() {
-                                    arr.iter()
-                                        .filter_map(|v| serde_json::from_value::<BridgeRequest>(v.clone()).ok())
-                                        .collect::<Vec<_>>()
-                                } else if let Ok(req) = serde_json::from_value::<BridgeRequest>(req_val) {
-                                    vec![req]
-                                } else {
-                                    vec![]
+                                let requests = match req_val {
+                                    Value::Array(arr) => arr
+                                        .into_iter()
+                                        .filter_map(|v| serde_json::from_value::<BridgeRequest>(v).ok())
+                                        .collect::<Vec<_>>(),
+                                    other => serde_json::from_value::<BridgeRequest>(other)
+                                        .map(|req| vec![req])
+                                        .unwrap_or_default(),
                                 };
 
                                 for req in requests {
@@ -778,7 +780,7 @@ impl BridgeContext {
     }
 
     /// Parses MQTT payload into a [`BridgeRequest`] value, merging topic variables.
-    fn parse_mqtt_payload(payload: &str, vars: &HashMap<String, String>) -> Value {
+    pub fn parse_mqtt_payload(payload: &str, vars: &HashMap<String, String>) -> Value {
         let mut val = serde_json::from_str::<Value>(payload)
             .unwrap_or_else(|_| Value::String(payload.to_string()));
 
@@ -1158,26 +1160,29 @@ impl BridgeContext {
         }
         debug!("Scanner Event: {payload}");
         if self.mqtt_tx.is_some() {
-            let topic = if let Some(topic) = &self.mqtt_scanner_topic {
-                self.replace_vars(
-                    topic,
-                    &TopicVars {
-                        id: "bridge",
-                        name: Some("bridge"),
-                        ..Default::default()
-                    },
-                )
-            } else {
-                self.replace_vars(
-                    self.mqtt_message_topic.as_deref().unwrap_or_default(),
-                    &TopicVars {
-                        id: "bridge",
-                        name: Some("bridge"),
-                        level: Some("scanner"),
-                        ..Default::default()
-                    },
-                )
-            };
+            let topic = self.mqtt_scanner_topic.as_deref().map_or_else(
+                || {
+                    self.replace_vars(
+                        self.mqtt_message_topic.as_deref().unwrap_or_default(),
+                        &TopicVars {
+                            id: "bridge",
+                            name: Some("bridge"),
+                            level: Some("scanner"),
+                            ..Default::default()
+                        },
+                    )
+                },
+                |topic| {
+                    self.replace_vars(
+                        topic,
+                        &TopicVars {
+                            id: "bridge",
+                            name: Some("bridge"),
+                            ..Default::default()
+                        },
+                    )
+                },
+            );
             self.try_send_mqtt(Some(MqttMessage {
                 topic,
                 payload: payload.to_string(),
