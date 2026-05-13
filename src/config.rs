@@ -127,43 +127,56 @@ impl Cli {
     /// Returns an error if the config file cannot be read, parsed, or written.
     pub async fn load() -> Result<Self> {
         let mut cli = Self::parse();
-
-        if let Some(config_path) = cli.config.clone() {
-            let path = Path::new(&config_path);
-            if path.exists() {
-                let content = tokio::fs::read_to_string(path)
-                    .await
-                    .with_context(|| format!("Failed to read config file: {config_path}"))?;
-                let file_cli: Self = serde_json::from_str(&content)
-                    .with_context(|| format!("Failed to parse config file: {config_path}"))?;
-                cli.merge(file_cli);
-                info!("Merged configuration from {config_path}");
-            } else {
-                info!(
-                    "Config file {config_path} not found, creating a new one from current settings"
-                );
-
-                cli.merge(Self::default());
-
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await.ok();
-                }
-
-                let content = serde_json::to_string_pretty(&cli)
-                    .with_context(|| "Failed to serialize configuration")?;
-                tokio::fs::write(path, content)
-                    .await
-                    .with_context(|| format!("Failed to write config file: {config_path}"))?;
-                info!("Saved configuration to {config_path}");
-            }
-        }
-
+        cli.apply_config_file().await?;
         cli.merge(Self::default());
         Ok(cli)
     }
 
+    /// Reads the JSON config file at `self.config` and merges it into `self`.
+    /// If the file does not exist, the current settings (merged with [`Cli::default`])
+    /// are written there for future runs. No-op when `self.config` is `None`.
+    ///
+    /// The caller is expected to run `self.merge(Self::default())` afterward so any
+    /// field still `None` falls back to [`Cli::default`].
+    ///
+    /// # Errors
+    /// Returns an error if the config file cannot be read, parsed, or written.
+    pub async fn apply_config_file(&mut self) -> Result<()> {
+        let Some(config_path) = self.config.clone() else {
+            return Ok(());
+        };
+        let path = Path::new(&config_path);
+        if path.exists() {
+            let content = tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("Failed to read config file: {config_path}"))?;
+            let file_cli: Self = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse config file: {config_path}"))?;
+            self.merge(file_cli);
+            info!("Merged configuration from {config_path}");
+        } else {
+            info!(
+                "Config file {config_path} not found, creating a new one from current settings"
+            );
+
+            self.merge(Self::default());
+
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.ok();
+            }
+
+            let content = serde_json::to_string_pretty(self)
+                .with_context(|| "Failed to serialize configuration")?;
+            tokio::fs::write(path, content)
+                .await
+                .with_context(|| format!("Failed to write config file: {config_path}"))?;
+            info!("Saved configuration to {config_path}");
+        }
+        Ok(())
+    }
+
     /// Fills `None` fields in `self` from `other`. Existing `Some` values are preserved.
-    fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: Self) {
         let Self {
             config: _,
             mqtt_broker,

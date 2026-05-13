@@ -98,6 +98,9 @@ fn parse_payload_py<'py>(
 #[pyclass]
 pub struct PyBridgeServer {
     inner: Arc<Mutex<BridgeServer>>,
+    /// Snapshot of the merged `Cli` at construction time. Used by
+    /// `config_snapshot()` for inspection without locking `inner`.
+    cli_snapshot: Cli,
 }
 
 #[pymethods]
@@ -105,7 +108,12 @@ impl PyBridgeServer {
     #[new]
     #[pyo3(signature = (**kwargs))]
     fn new(kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
-        let mut cli = Cli::default();
+        // Start with an all-`None` `Cli` so kwargs/file/defaults layer cleanly via
+        // `merge` (which only fills `None` fields). Deserializing empty JSON gives
+        // every `Option<T>` field as `None` automatically — resilient to new
+        // optional fields added on the Rust side without touching this file.
+        let mut cli: Cli = serde_json::from_str("{}")
+            .expect("empty JSON must deserialize into Cli (all fields are Option<T>)");
 
         if let Some(dict) = kwargs {
             if let Ok(Some(val)) = dict.get_item("config_path") {
@@ -158,9 +166,34 @@ impl PyBridgeServer {
             }
         }
 
+        // Apply config file (if requested) using a lightweight current-thread
+        // runtime — this constructor is sync but `apply_config_file` is async.
+        if cli.config.is_some() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            rt.block_on(cli.apply_config_file())
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        }
+
+        // Fall back to bridge defaults for any field still `None`.
+        cli.merge(Cli::default());
+
+        let cli_snapshot = cli.clone();
         Ok(Self {
             inner: Arc::new(Mutex::new(BridgeServer::new(cli))),
+            cli_snapshot,
         })
+    }
+
+    /// Returns the fully-merged configuration (kwargs > config file > defaults)
+    /// as a Python dict. Captured at construction time; runtime-only fields
+    /// like `session_id` will be `None` until the server is started.
+    fn config_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let val = serde_json::to_value(&self.cli_snapshot)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        json_value_to_py(py, &val)
     }
 
     /// Start the server and block the current thread until it exits (e.g. on Ctrl+C).
