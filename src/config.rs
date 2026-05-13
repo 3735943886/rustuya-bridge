@@ -155,9 +155,7 @@ impl Cli {
             self.merge(file_cli);
             info!("Merged configuration from {config_path}");
         } else {
-            info!(
-                "Config file {config_path} not found, creating a new one from current settings"
-            );
+            info!("Config file {config_path} not found, creating a new one from current settings");
 
             self.merge(Self::default());
 
