@@ -1,6 +1,6 @@
 [package]
 name = "rustuyabridge"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 license = "MIT"
 description = "An MQTT bridge for managing Tuya devices via the Tuya Local API."
