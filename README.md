@@ -47,13 +47,28 @@ curl -fsSL https://raw.githubusercontent.com/3735943886/rustuya-bridge/master/sc
   | sudo bash -s -- install --yes
 ```
 
-After install:
+The service starts immediately with `mqtt://localhost:1883` as the default
+broker. To point it at your own broker (or change topics, retain, log level,
+etc.), edit the auto-generated config and restart:
+
+```bash
+sudo nano /var/lib/rustuya/config.json     # see Configuration File below for fields
+sudo systemctl restart rustuya-bridge
+journalctl -u rustuya-bridge -f            # tail logs
+```
+
+Subsequent management:
 ```bash
 bridgectl                  # show status / latest version / service state
 sudo bridgectl upgrade     # pull the latest release and restart
 sudo bridgectl remove      # stop + uninstall (keeps data dir and user)
 sudo bridgectl purge       # also wipe data dir, user, and the helper itself
+bridgectl help             # full command + option reference
 ```
+
+All `install` / `upgrade` / `remove` / `purge` accept `--yes` (`-y`) to skip
+confirmation prompts — required when running non-interactively (e.g. via
+`curl | sudo bash`).
 
 ### Build from Source
 Clone and run directly with cargo, or produce a release binary you can copy
