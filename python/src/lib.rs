@@ -116,53 +116,35 @@ impl PyBridgeServer {
             .expect("empty JSON must deserialize into Cli (all fields are Option<T>)");
 
         if let Some(dict) = kwargs {
-            if let Ok(Some(val)) = dict.get_item("config_path") {
-                cli.config = val.extract()?;
+            // Maps a Python kwarg name onto a `Cli` field. Adding a new field
+            // means appending one line here — kwarg presence/extract/assignment
+            // patterns are uniform.
+            macro_rules! map_kwargs {
+                ($($py_key:literal => $field:ident),* $(,)?) => {
+                    $(
+                        if let Ok(Some(val)) = dict.get_item($py_key) {
+                            cli.$field = val.extract()?;
+                        }
+                    )*
+                };
             }
-            if let Ok(Some(val)) = dict.get_item("mqtt_broker") {
-                cli.mqtt_broker = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_root_topic") {
-                cli.mqtt_root_topic = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_user") {
-                cli.mqtt_user = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_password") {
-                cli.mqtt_password = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_command_topic") {
-                cli.mqtt_command_topic = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_event_topic") {
-                cli.mqtt_event_topic = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_client_id") {
-                cli.mqtt_client_id = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_message_topic") {
-                cli.mqtt_message_topic = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_payload_template") {
-                cli.mqtt_payload_template = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_scanner_topic") {
-                cli.mqtt_scanner_topic = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("mqtt_retain") {
-                cli.mqtt_retain = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("state_file") {
-                cli.state_file = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("save_debounce_secs") {
-                cli.save_debounce_secs = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("log_level") {
-                cli.log_level = val.extract()?;
-            }
-            if let Ok(Some(val)) = dict.get_item("no_signals") {
-                cli.no_signals = val.extract()?;
+            map_kwargs! {
+                "config_path"           => config,
+                "mqtt_broker"           => mqtt_broker,
+                "mqtt_user"             => mqtt_user,
+                "mqtt_password"         => mqtt_password,
+                "mqtt_root_topic"       => mqtt_root_topic,
+                "mqtt_command_topic"    => mqtt_command_topic,
+                "mqtt_event_topic"      => mqtt_event_topic,
+                "mqtt_client_id"        => mqtt_client_id,
+                "mqtt_message_topic"    => mqtt_message_topic,
+                "mqtt_payload_template" => mqtt_payload_template,
+                "mqtt_scanner_topic"    => mqtt_scanner_topic,
+                "mqtt_retain"           => mqtt_retain,
+                "state_file"            => state_file,
+                "save_debounce_secs"    => save_debounce_secs,
+                "log_level"             => log_level,
+                "no_signals"            => no_signals,
             }
         }
 

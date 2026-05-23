@@ -66,6 +66,9 @@ pub struct BridgeContext {
     pub mqtt_message_topic: Option<String>,
     pub mqtt_payload_template: Option<String>,
     pub mqtt_scanner_topic: Option<String>,
+    /// Identifier placeholders present in the (event_topic, payload_template) pair.
+    /// Drives the retain gate in [`Self::publish_device_event`].
+    pub event_identifiers: IdentifierSet,
     pub state_file: String,
     pub save_debounce_secs: u64,
     pub state: RwLock<BridgeState>,
@@ -80,6 +83,57 @@ pub struct BridgeContext {
 /// and [`BridgeContext::replace_vars`]. The `value`, `dps`, `timestamp`, and `root` keys are
 /// handled separately because they require values rather than wildcard substitution.
 const TOPIC_WILDCARD_KEYS: &[&str] = &["id", "name", "dp", "action", "cid", "type", "level"];
+
+/// Records which identifier placeholders (`{id}`, `{name}`, `{cid}`) a set of
+/// topic/payload templates references. Used to decide whether `retain=true` is
+/// safe: a retained message must carry an identifier so the scavenger can find
+/// and clear it when the device is later removed.
+///
+/// `{id}` is treated as always-satisfied because every registered device has an
+/// id; `{name}` and `{cid}` only satisfy retain when the device actually has a
+/// non-empty value for that field.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IdentifierSet {
+    pub id: bool,
+    pub name: bool,
+    pub cid: bool,
+}
+
+impl IdentifierSet {
+    /// Union of identifiers referenced across all given templates.
+    #[must_use]
+    pub fn from_templates<'a, I: IntoIterator<Item = &'a str>>(templates: I) -> Self {
+        let mut set = Self::default();
+        for tpl in templates {
+            if tpl.contains("{id}") {
+                set.id = true;
+            }
+            if tpl.contains("{name}") {
+                set.name = true;
+            }
+            if tpl.contains("{cid}") {
+                set.cid = true;
+            }
+        }
+        set
+    }
+
+    /// `true` when the templates reference no identifier — retain is structurally
+    /// impossible to scavenge regardless of the device.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        !self.id && !self.name && !self.cid
+    }
+
+    /// `true` when at least one referenced identifier has a usable value for the
+    /// given device, so the scavenger can locate and clear the retained message.
+    #[must_use]
+    pub fn satisfied_by(self, name: Option<&str>, cid: Option<&str>) -> bool {
+        self.id
+            || (self.name && name.is_some_and(|s| !s.is_empty()))
+            || (self.cid && cid.is_some_and(|s| !s.is_empty()))
+    }
+}
 
 /// Walks a template string and substitutes `{key}` placeholders.
 ///
@@ -233,7 +287,7 @@ impl BridgeContext {
                             .unwrap_or_default(),
                     )
                     .nowait(true)
-                    .run();
+                    .build();
                 initial_instances.insert(id.clone(), dev);
             } else {
                 error!("Device {id} is invalid: missing key or parent info");
@@ -251,6 +305,19 @@ impl BridgeContext {
         let (save_tx, save_rx) = mpsc::channel(1);
         let (refresh_tx, refresh_rx) = mpsc::channel(1);
 
+        let payload_tpl = cli
+            .mqtt_payload_template
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_MQTT_PAYLOAD_TEMPLATE);
+        let event_identifiers =
+            IdentifierSet::from_templates([mqtt_event_topic.as_str(), payload_tpl]);
+
+        if cli.mqtt_retain() && event_identifiers.is_empty() {
+            warn!(
+                "mqtt_retain=true but neither event_topic ('{mqtt_event_topic}') nor payload_template ('{payload_tpl}') references an identifier ({{id}}, {{name}}, or {{cid}}); retained device events would be unreachable for the scavenger and will be dropped"
+            );
+        }
+
         let ctx = Arc::new(Self {
             cli: cli.clone(),
             mqtt_tx: cli.mqtt_broker.is_some().then_some(mqtt_tx_sender),
@@ -263,6 +330,7 @@ impl BridgeContext {
             mqtt_message_topic: cli.mqtt_message_topic.clone(),
             mqtt_payload_template: cli.mqtt_payload_template.clone(),
             mqtt_scanner_topic: cli.mqtt_scanner_topic.clone(),
+            event_identifiers,
             state_file: cli.state_file().to_string(),
             save_debounce_secs: cli.save_debounce_secs(),
             state: RwLock::new(BridgeState {
@@ -343,74 +411,14 @@ impl BridgeContext {
                         () = cancel.cancelled() => return,
                         res = tokio::time::timeout(Duration::from_secs(LISTENER_TIMEOUT_SECS), stream.next()) => {
                             match res {
-                                Ok(Some(event_res)) => {
-                                    if let Ok(event) = event_res {
-                                        let Some(payload_str) = event.message.payload_as_string() else {
-                                            warn!("Non-UTF8 payload from {}", event.device_id);
-                                            continue;
-                                        };
-                                        trace!("Raw event from {}: {payload_str}", event.device_id);
-                                        let payload: Value = serde_json::from_str(&payload_str)
-                                            .unwrap_or_else(|_| Value::String(payload_str.clone()));
-                                        let (target_id, name, cid, exists) = self.resolve_event_target(&event.device_id, &payload).await;
-
-                                // Check for 'dps' at root or inside 'data' (for sub-devices/gateways)
-                                let payload_obj = payload.as_object();
-
-                                // Check for error messages
-                                if payload_obj.is_some_and(|o| o.contains_key("errorCode") || o.contains_key("errorMsg")) {
-                                    if let Some(n) = name.as_ref() {
-                                        info!("Device {target_id} ({n}) reported error: {payload}");
-                                    } else {
-                                        info!("Device {target_id} reported error: {payload}");
-                                    }
-                                    // Update last_error_code in device config
-                                    let error_code = payload.get("errorCode")
-                                        .and_then(Value::as_u64)
-                                        .and_then(|v| u32::try_from(v).ok());
-                                    if let Some(code) = error_code {
-                                        let mut state = self.state.write().await;
-                                        if let Some(cfg) = state.configs.get_mut(&target_id) {
-                                            cfg.last_error_code = Some(code);
-                                        }
-                                    }
-                                    self.publish_device_message(&target_id, name.as_deref(), cid.as_deref(), "error", payload, self.mqtt_retain).await;
-                                    continue;
+                                Ok(Some(Ok(event))) => {
+                                    let Some(payload_str) = event.message.payload_as_string() else {
+                                        warn!("Non-UTF8 payload from {}", event.device_id);
+                                        continue;
+                                    };
+                                    self.handle_device_event(&event.device_id, payload_str).await;
                                 }
-
-                                let root_dps = payload_obj.and_then(|o| o.get("dps"));
-                                let data_dps = payload_obj.and_then(|o| o.get("data"))
-                                    .and_then(|d| d.as_object())
-                                    .and_then(|do_| do_.get("dps"));
-
-                                let is_passive = root_dps.is_none() && data_dps.is_none();
-                                let mut dps = root_dps.or(data_dps).cloned().unwrap_or_else(|| {
-                                    if let Some(obj) = payload.as_object()
-                                        && let Some(data) = obj.get("data") {
-                                        let mut data_val = data.clone();
-                                        if let Some(data_obj) = data_val.as_object_mut()
-                                            && let Some(inner) = data_obj.get("data").cloned()
-                                            && let Some(inner_obj) = inner.as_object() {
-                                            for (k, v) in inner_obj {
-                                                data_obj.entry(k.clone()).or_insert(v.clone());
-                                            }
-                                            data_obj.remove("data");
-                                        }
-                                        data_val
-                                    } else {
-                                        payload.clone()
-                                    }
-                                });
-
-                                // If target is parent (gateway) but CID was present, include CID in dps for visibility
-                                if target_id == event.device_id && let Some(c) = &cid
-                                    && let Some(obj) = dps.as_object_mut() {
-                                    obj.insert("cid".to_string(), Value::String(c.clone()));
-                                }
-
-                                        self.publish_device_event(target_id, name, cid, dps, is_passive, exists).await;
-                                    }
-                                }
+                                Ok(Some(Err(_))) => {}
                                 Ok(None) => {
                                     warn!("Device listener stream ended");
                                     break;
@@ -425,6 +433,90 @@ impl BridgeContext {
                 }
             }
         })
+    }
+
+    /// Processes one device event: parses payload, branches on error vs DPS,
+    /// updates per-device error state, and dispatches to the appropriate
+    /// `publish_*` method. Extracted from the listener loop to keep the
+    /// `tokio::select!` driver shallow.
+    async fn handle_device_event(&self, device_id: &str, payload_str: String) {
+        trace!("Raw event from {device_id}: {payload_str}");
+        let payload: Value = serde_json::from_str(&payload_str)
+            .unwrap_or_else(|_| Value::String(payload_str.clone()));
+        let (target_id, name, cid, exists) =
+            self.resolve_event_target(device_id, &payload).await;
+        let payload_obj = payload.as_object();
+
+        // Error path: log, persist last_error_code, publish as message.
+        if payload_obj.is_some_and(|o| o.contains_key("errorCode") || o.contains_key("errorMsg"))
+        {
+            if let Some(n) = name.as_ref() {
+                info!("Device {target_id} ({n}) reported error: {payload}");
+            } else {
+                info!("Device {target_id} reported error: {payload}");
+            }
+            let error_code = payload
+                .get("errorCode")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
+            if let Some(code) = error_code {
+                let mut state = self.state.write().await;
+                if let Some(cfg) = state.configs.get_mut(&target_id) {
+                    cfg.last_error_code = Some(code);
+                }
+            }
+            self.publish_device_message(
+                &target_id,
+                name.as_deref(),
+                cid.as_deref(),
+                "error",
+                payload,
+                self.mqtt_retain,
+            )
+            .await;
+            return;
+        }
+
+        // Locate DPS either at the root or nested under "data" (sub-device/gateway).
+        let root_dps = payload_obj.and_then(|o| o.get("dps"));
+        let data_dps = payload_obj
+            .and_then(|o| o.get("data"))
+            .and_then(|d| d.as_object())
+            .and_then(|do_| do_.get("dps"));
+
+        let is_passive = root_dps.is_none() && data_dps.is_none();
+        let mut dps = root_dps.or(data_dps).cloned().unwrap_or_else(|| {
+            // Passive path: synthesise DPS from "data" (flattening nested "data.data"),
+            // falling back to the raw payload.
+            if let Some(obj) = payload.as_object()
+                && let Some(data) = obj.get("data")
+            {
+                let mut data_val = data.clone();
+                if let Some(data_obj) = data_val.as_object_mut()
+                    && let Some(inner) = data_obj.get("data").cloned()
+                    && let Some(inner_obj) = inner.as_object()
+                {
+                    for (k, v) in inner_obj {
+                        data_obj.entry(k.clone()).or_insert(v.clone());
+                    }
+                    data_obj.remove("data");
+                }
+                data_val
+            } else {
+                payload.clone()
+            }
+        });
+
+        // Gateway with sub-device CID: surface the CID in DPS for downstream consumers.
+        if target_id == device_id
+            && let Some(c) = &cid
+            && let Some(obj) = dps.as_object_mut()
+        {
+            obj.insert("cid".to_string(), Value::String(c.clone()));
+        }
+
+        self.publish_device_event(target_id, name, cid, dps, is_passive, exists)
+            .await;
     }
 
     /// Resolves target device ID and name from raw device event and payload
@@ -617,7 +709,11 @@ impl BridgeContext {
 
                                 debug!("PubAck flush done ({received_pubacks}/{expected_pubacks}).");
 
-                                // 4. Disconnect
+                                // 4. Disconnect, then drain the eventloop until rumqttc surfaces
+                                // an error (its signal that the connection is fully torn down).
+                                // No inner timeout: bounded externally by the 7s timeout that
+                                // `BridgeServer::close` wraps around this task's JoinHandle, so a
+                                // broker that never closes the socket cannot hang shutdown.
                                 let _ = client.disconnect().await;
                                 loop {
                                     if eventloop.poll().await.is_err() {
@@ -1006,14 +1102,21 @@ impl BridgeContext {
                 return;
             }
 
+            // Retain is structurally safe only when the topic/payload templates
+            // reference an identifier the scavenger can later use to clear the
+            // retained message. `{id}` is always available; `{name}`/`{cid}` only
+            // when this specific device has them.
+            let retain = self.mqtt_retain
+                && self
+                    .event_identifiers
+                    .satisfied_by(name.as_deref(), cid.as_deref());
+            if self.mqtt_retain && !retain {
+                warn!(
+                    "Ignoring retain for event from '{id}': event_topic/payload_template have no identifier resolvable for this device (name={name:?}, cid={cid:?})"
+                );
+            }
+
             for (topic, payload) in templates {
-                let mut retain = self.mqtt_retain;
-                if retain && !topic.contains(&id) && !payload.contains(&id) {
-                    warn!(
-                        "Ignoring retain for event from '{id}' because '{id}' is missing from both topic and payload"
-                    );
-                    retain = false;
-                }
                 self.try_send_mqtt(Some(MqttMessage {
                     topic,
                     payload,
@@ -1056,18 +1159,14 @@ impl BridgeContext {
                 }
             }
 
-            let payload_str = payload.to_string();
-            let mut final_retain = retain;
-            if final_retain && !topic.contains(id) && !payload_str.contains(id) {
-                warn!(
-                    "Ignoring retain for message from '{id}' because '{id}' is missing from both topic and payload"
-                );
-                final_retain = false;
-            }
+            // We just injected `id` into the payload object above, so the
+            // scavenger's payload-fallback match (`"<id>"`) always finds it —
+            // no extra retain gate needed here. Non-object payloads (e.g. plain
+            // strings) skip the injection; in practice all callers pass objects.
             self.try_send_mqtt(Some(MqttMessage {
                 topic,
-                payload: payload_str,
-                retain: final_retain,
+                payload: payload.to_string(),
+                retain,
             }))
             .await;
         }
@@ -1426,7 +1525,7 @@ impl BridgeContext {
                             .unwrap_or_default(),
                     )
                     .nowait(true)
-                    .run();
+                    .build();
                 state.instances.insert(id.clone(), dev);
             } else {
                 return Err(BridgeError::InvalidRequest(
@@ -1659,5 +1758,178 @@ impl BridgeContext {
 impl Drop for BridgeContext {
     fn drop(&mut self) {
         self.signal_shutdown_mqtt();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── IdentifierSet ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn identifier_set_detects_each_placeholder() {
+        let s = IdentifierSet::from_templates(["{root}/event/{id}"]);
+        assert!(s.id && !s.name && !s.cid);
+
+        let s = IdentifierSet::from_templates(["{root}/event/{name}"]);
+        assert!(!s.id && s.name && !s.cid);
+
+        let s = IdentifierSet::from_templates(["{root}/event/{cid}"]);
+        assert!(!s.id && !s.name && s.cid);
+    }
+
+    #[test]
+    fn identifier_set_unions_across_multiple_templates() {
+        let s = IdentifierSet::from_templates(["{root}/event/{name}", r#"{"id":"{id}"}"#]);
+        assert!(s.id && s.name && !s.cid);
+    }
+
+    #[test]
+    fn identifier_set_is_empty_when_no_identifier_referenced() {
+        let s = IdentifierSet::from_templates(["{root}/event", "{value}"]);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn identifier_set_satisfied_by_id_always() {
+        let s = IdentifierSet { id: true, ..Default::default() };
+        assert!(s.satisfied_by(None, None));
+        assert!(s.satisfied_by(Some(""), None));
+    }
+
+    #[test]
+    fn identifier_set_satisfied_by_name_requires_nonempty() {
+        let s = IdentifierSet { name: true, ..Default::default() };
+        assert!(!s.satisfied_by(None, None));
+        assert!(!s.satisfied_by(Some(""), None));
+        assert!(s.satisfied_by(Some("kitchen"), None));
+    }
+
+    #[test]
+    fn identifier_set_satisfied_by_cid_requires_nonempty() {
+        let s = IdentifierSet { cid: true, ..Default::default() };
+        assert!(!s.satisfied_by(None, None));
+        assert!(s.satisfied_by(None, Some("sub-1")));
+    }
+
+    // ── tpl_to_wildcard ────────────────────────────────────────────────────────
+
+    #[test]
+    fn tpl_to_wildcard_substitutes_root_and_wildcards_variables() {
+        assert_eq!(
+            tpl_to_wildcard("{root}/event/{type}/{id}", "rustuya"),
+            "rustuya/event/+/+"
+        );
+    }
+
+    #[test]
+    fn tpl_to_wildcard_preserves_unknown_keys_literally() {
+        assert_eq!(
+            tpl_to_wildcard("{root}/{value}/x", "rustuya"),
+            "rustuya/{value}/x"
+        );
+    }
+
+    // ── compile_topic_regex / match_topic ─────────────────────────────────────
+
+    #[test]
+    fn compile_topic_regex_returns_none_for_literal_template() {
+        assert!(compile_topic_regex("rustuya/command").is_none());
+    }
+
+    #[test]
+    fn match_topic_extracts_variables() {
+        let tpl = "rustuya/event/{type}/{id}";
+        let re = compile_topic_regex(tpl).unwrap();
+        let vars = match_topic("rustuya/event/active/dev-1", tpl, Some(&re)).unwrap();
+        assert_eq!(vars.get("type").map(String::as_str), Some("active"));
+        assert_eq!(vars.get("id").map(String::as_str), Some("dev-1"));
+    }
+
+    #[test]
+    fn match_topic_rejects_mismatch() {
+        let tpl = "rustuya/event/{id}";
+        let re = compile_topic_regex(tpl).unwrap();
+        assert!(match_topic("rustuya/other/dev-1", tpl, Some(&re)).is_none());
+    }
+
+    #[test]
+    fn match_topic_literal_template_exact_match() {
+        assert!(match_topic("rustuya/command", "rustuya/command", None).is_some());
+        assert!(match_topic("rustuya/command/x", "rustuya/command", None).is_none());
+    }
+
+    // ── render_template ────────────────────────────────────────────────────────
+
+    #[test]
+    fn render_template_substitutes_known_keys_and_keeps_unknown() {
+        let mut vars = HashMap::new();
+        vars.insert("a".to_string(), "1".to_string());
+        let out = render_template("x={a},y={b}", |key, out| {
+            vars.get(key).is_some_and(|v| {
+                out.push_str(v);
+                true
+            })
+        });
+        assert_eq!(out, "x=1,y={b}");
+    }
+
+    // ── parse_mqtt_payload ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_payload_merges_topic_vars_into_object() {
+        let vars: HashMap<String, String> =
+            [("id".into(), "dev-1".into())].into_iter().collect();
+        let val = BridgeContext::parse_mqtt_payload(r#"{"action":"get"}"#, &vars);
+        assert_eq!(val.get("id").and_then(|v| v.as_str()), Some("dev-1"));
+        assert_eq!(val.get("action").and_then(|v| v.as_str()), Some("get"));
+    }
+
+    #[test]
+    fn parse_payload_topic_vars_do_not_overwrite_payload_keys() {
+        let vars: HashMap<String, String> =
+            [("id".into(), "from-topic".into())].into_iter().collect();
+        let val = BridgeContext::parse_mqtt_payload(r#"{"id":"from-payload"}"#, &vars);
+        assert_eq!(
+            val.get("id").and_then(|v| v.as_str()),
+            Some("from-payload")
+        );
+    }
+
+    #[test]
+    fn parse_payload_wraps_scalar_with_dp_var_into_dps() {
+        let vars: HashMap<String, String> = [("dp".into(), "1".into())].into_iter().collect();
+        let val = BridgeContext::parse_mqtt_payload("true", &vars);
+        assert_eq!(val.get("dps").and_then(|v| v.get("1")), Some(&json!(true)));
+    }
+
+    #[test]
+    fn parse_payload_set_heuristic_promotes_loose_fields_into_dps() {
+        let vars: HashMap<String, String> = HashMap::new();
+        let val = BridgeContext::parse_mqtt_payload(
+            r#"{"action":"set","id":"dev-1","1":true,"2":50}"#,
+            &vars,
+        );
+        let dps = val.get("dps").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(dps.get("1"), Some(&json!(true)));
+        assert_eq!(dps.get("2"), Some(&json!(50)));
+        // Selector/action fields must not be smuggled into dps.
+        assert!(!dps.contains_key("id"));
+        assert!(!dps.contains_key("action"));
+    }
+
+    #[test]
+    fn parse_payload_array_merges_vars_per_item() {
+        let vars: HashMap<String, String> =
+            [("id".into(), "dev-1".into())].into_iter().collect();
+        let val = BridgeContext::parse_mqtt_payload(
+            r#"[{"action":"get"},{"action":"status","id":"override"}]"#,
+            &vars,
+        );
+        let arr = val.as_array().unwrap();
+        assert_eq!(arr[0].get("id").and_then(|v| v.as_str()), Some("dev-1"));
+        assert_eq!(arr[1].get("id").and_then(|v| v.as_str()), Some("override"));
     }
 }
