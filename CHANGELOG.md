@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `rustuya-bridge` binary now suppresses `env_logger`'s UTC timestamp prefix
-  when stderr is not a terminal (e.g. running under systemd/journald). The
-  hosting log facility already stamps each line, so the duplicate prefix is
-  redundant; interactive runs (terminal) keep the timestamp for ad-hoc
-  debugging.
+  when launched by systemd/journald (detected via the `$JOURNAL_STREAM`
+  env var that systemd.exec sets on the inherited stderr). Journald
+  already stamps each line with local time, so the duplicate UTC prefix
+  is just noise. Docker, piped stderr, and interactive terminals don't
+  set `$JOURNAL_STREAM`, so the timestamp is preserved there
+  (`docker logs` still shows a usable time).
 - `bridgectl status` is now semver-aware: when the installed binary is a
   pre-release that is newer than the channel's latest, the line reads
   "you are on pre-release X" instead of "⬆ upgrade available", avoiding

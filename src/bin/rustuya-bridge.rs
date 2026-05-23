@@ -1,7 +1,6 @@
 use anyhow::Result;
 use rustuyabridge::config::Cli;
 use rustuyabridge::server::BridgeServer;
-use std::io::IsTerminal as _;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,11 +13,11 @@ async fn main() -> Result<()> {
         .unwrap_or(rustuyabridge::config::DEFAULT_LOG_LEVEL);
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level));
-    // Under systemd/journald (or any redirected stderr) the host already
-    // stamps each line with its own (local) timestamp; env_logger's UTC
-    // prefix would just duplicate it. Keep the timestamp only when stderr
-    // is an interactive terminal.
-    if !std::io::stderr().is_terminal() {
+    // Drop env_logger's UTC timestamp prefix when systemd/journald is
+    // already stamping each line (it sets $JOURNAL_STREAM on the inherited
+    // stderr — see systemd.exec(5)). Docker / piped stderr / terminals
+    // don't set it, so the timestamp is preserved for those cases.
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
         builder.format_timestamp(None);
     }
     builder.init();
