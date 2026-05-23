@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `rustuya-bridge` binary now suppresses `env_logger`'s UTC timestamp prefix
+  when stderr is not a terminal (e.g. running under systemd/journald). The
+  hosting log facility already stamps each line, so the duplicate prefix is
+  redundant; interactive runs (terminal) keep the timestamp for ad-hoc
+  debugging.
+- `bridgectl status` is now semver-aware: when the installed binary is a
+  pre-release that is newer than the channel's latest, the line reads
+  "you are on pre-release X" instead of "⬆ upgrade available", avoiding
+  the misleading downgrade hint.
+- `bridgectl upgrade` warns and reframes the prompt as "Downgrade ... → ..."
+  when the target version is older than the installed one. Stable-channel
+  downgrades from a pre-release also point at `--prerelease` as the likely
+  intent.
+
+### Fixed
+- `bridgectl` `api_latest_tag` no longer fails under `set -o pipefail`. The
+  awk fallback parser used `exit` on the first match, which triggered
+  SIGPIPE on the upstream `printf` when the response was large (≈50KB for
+  the `/releases` endpoint behind `--prerelease`), causing `status` to
+  print "could not query GitHub" despite a successful fetch.
+
 ## [0.3.0-rc.1] — Python 0.2.0-rc.1
 
 ### Added
