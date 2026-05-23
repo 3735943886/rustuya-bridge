@@ -35,6 +35,7 @@ SELF_PATH="${INSTALL_DIR}/bridgectl"
 SELF_URL="https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/master/scripts/bridgectl.sh"
 
 ASSUME_YES=0
+PRERELEASE=0
 
 # ── Logging helpers ────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -97,15 +98,31 @@ detect_target() {
 }
 
 api_latest_tag() {
-    local url="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/latest"
-    local body
-    # Stream curl output via grep -m1 trips pipefail when grep closes early.
-    # Buffer the response into a variable first, then parse it.
-    body="$(curl -fsSL "$url" 2>/dev/null)" || return 1
-    if command -v jq >/dev/null 2>&1; then
-        printf '%s' "$body" | jq -r '.tag_name'
+    # Default: stable only (`releases/latest` excludes pre-releases by design).
+    # With PRERELEASE=1: query the full release list and pick the first entry
+    # whose tag matches `v*` (the binary-publish tag scheme). GitHub orders
+    # `/releases` by created_at desc, so the first match is the newest release
+    # of either kind — pre-release or stable. Use this when you want the
+    # absolute newest build (e.g. installing/upgrading to an RC).
+    local url body
+    if [ "$PRERELEASE" -eq 1 ]; then
+        url="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases"
+        body="$(curl -fsSL "$url" 2>/dev/null)" || return 1
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$body" | jq -r '[.[] | select(.tag_name | startswith("v"))][0].tag_name // empty'
+        else
+            # Fallback: take the first tag_name starting with "v" (no py-v* etc.).
+            printf '%s' "$body" \
+                | awk -F'"' '/"tag_name"/ { if ($4 ~ /^v/) { print $4; exit } }'
+        fi
     else
-        printf '%s' "$body" | awk -F'"' '/"tag_name"/ { print $4; exit }'
+        url="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/latest"
+        body="$(curl -fsSL "$url" 2>/dev/null)" || return 1
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$body" | jq -r '.tag_name'
+        else
+            printf '%s' "$body" | awk -F'"' '/"tag_name"/ { print $4; exit }'
+        fi
     fi
 }
 
@@ -259,18 +276,29 @@ cmd_status() {
         printf '  Binary:    %snot installed%s\n' "$C_YELLOW" "$C_RESET"
     fi
 
+    local label upgrade_hint install_hint
+    if [ "$PRERELEASE" -eq 1 ]; then
+        label="Pre-release"
+        upgrade_hint="sudo bridgectl upgrade --prerelease"
+        install_hint="sudo bridgectl install --prerelease"
+    else
+        label="Latest"
+        upgrade_hint="sudo bridgectl upgrade"
+        install_hint="sudo bridgectl install"
+    fi
+
     if latest="$(api_latest_tag 2>/dev/null)" && [ -n "$latest" ]; then
         latest_ver="${latest#v}"
         if [ -n "$cur" ] && [ "$cur" = "$latest_ver" ]; then
-            printf '  Latest:    %s  %s(up to date)%s\n' "$latest_ver" "$C_GREEN" "$C_RESET"
+            printf '  %-9s  %s  %s(up to date)%s\n' "$label:" "$latest_ver" "$C_GREEN" "$C_RESET"
         elif [ -n "$cur" ]; then
-            printf '  Latest:    %s  %s⬆ upgrade available%s  (run: sudo bridgectl upgrade)\n' \
-                "$latest_ver" "$C_YELLOW" "$C_RESET"
+            printf '  %-9s  %s  %s⬆ upgrade available%s  (run: %s)\n' \
+                "$label:" "$latest_ver" "$C_YELLOW" "$C_RESET" "$upgrade_hint"
         else
-            printf '  Latest:    %s  (run: sudo bridgectl install)\n' "$latest_ver"
+            printf '  %-9s  %s  (run: %s)\n' "$label:" "$latest_ver" "$install_hint"
         fi
     else
-        printf '  Latest:    %s(could not query GitHub)%s\n' "$C_YELLOW" "$C_RESET"
+        printf '  %-9s  %s(could not query GitHub)%s\n' "$label:" "$C_YELLOW" "$C_RESET"
     fi
 
     if [ -f "$UNIT_PATH" ]; then
@@ -464,6 +492,9 @@ ${C_BOLD}USAGE${C_RESET}
 
 ${C_BOLD}OPTIONS${C_RESET}
   --yes, -y          Skip confirmation prompts (required for non-interactive shells)
+  --prerelease       Target the newest release including pre-releases (RC/alpha/beta).
+                     Applies to: status, install, upgrade. Without this flag,
+                     the stable channel (\`releases/latest\`) is used.
 
 ${C_BOLD}FILES MANAGED${C_RESET}
   Binary:   ${BIN_PATH}
@@ -485,6 +516,7 @@ main() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --yes|-y)     ASSUME_YES=1 ;;
+            --prerelease) PRERELEASE=1 ;;
             -h|--help)    cmd_help; exit 0 ;;
             -*)           die "Unknown flag: $1" ;;
             *)

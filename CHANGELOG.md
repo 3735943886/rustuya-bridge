@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.0-rc.1] — Python 0.2.0-rc.1
 
+### Added
+- `bridgectl --prerelease` flag (applies to `status` / `install` / `upgrade`)
+  — opt-in channel for installing or upgrading to the newest release including
+  pre-releases. Without the flag, the stable channel (`releases/latest`,
+  which excludes pre-releases) is used.
+
 ### Changed
 - **Bumped to `rustuya` 0.3.0-rc.1** (release candidate). Picks up the new
   `DeviceBuilder::build` API; the deprecated `DeviceBuilder::run` is replaced
@@ -33,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unit tests for `IdentifierSet`, `tpl_to_wildcard`, `compile_topic_regex`,
   `match_topic`, `render_template`, and `BridgeContext::parse_mqtt_payload`.
 - `CHANGELOG.md` (this file) in Keep a Changelog format.
+
+### CI
+- `binary-publish.yml` auto-detects pre-release tags (`-rc` / `-alpha` /
+  `-beta`) and creates the GitHub Release as `prerelease=true`, so RC builds
+  do not become `releases/latest`.
+- `docker-publish.yml` skips `latest` / `stable` raw tags for pre-release
+  versions; only the exact semver tag is published. Prevents `docker pull`
+  default from silently shipping an RC.
 
 ### Documentation
 - Comment on the post-disconnect eventloop drain explaining its dependence on

@@ -28,10 +28,15 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: 3735943886/rustuya
+          # `latest` / `stable` are skipped for pre-release tags (e.g. v0.3.0-rc.1)
+          # so an RC build does not become the default `docker pull` target.
+          # The exact semver tag (e.g. 0.3.0-rc.1) is always published.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=stable
-            type=raw,value=latest
+            type=raw,value=stable,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
