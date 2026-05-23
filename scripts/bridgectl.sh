@@ -104,6 +104,12 @@ api_latest_tag() {
     # `/releases` by created_at desc, so the first match is the newest release
     # of either kind — pre-release or stable. Use this when you want the
     # absolute newest build (e.g. installing/upgrading to an RC).
+    #
+    # The awk fallback intentionally avoids `exit` after the first match: under
+    # `set -o pipefail`, closing the pipe early triggers SIGPIPE on the printf
+    # writer (which matters for the ~50KB `/releases` response) and fails the
+    # whole pipeline. Instead we read all input and gate the print on a `found`
+    # flag.
     local url body
     if [ "$PRERELEASE" -eq 1 ]; then
         url="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases"
@@ -111,9 +117,8 @@ api_latest_tag() {
         if command -v jq >/dev/null 2>&1; then
             printf '%s' "$body" | jq -r '[.[] | select(.tag_name | startswith("v"))][0].tag_name // empty'
         else
-            # Fallback: take the first tag_name starting with "v" (no py-v* etc.).
             printf '%s' "$body" \
-                | awk -F'"' '/"tag_name"/ { if ($4 ~ /^v/) { print $4; exit } }'
+                | awk -F'"' '!found && /"tag_name"/ && $4 ~ /^v/ { print $4; found=1 }'
         fi
     else
         url="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/latest"
@@ -121,7 +126,8 @@ api_latest_tag() {
         if command -v jq >/dev/null 2>&1; then
             printf '%s' "$body" | jq -r '.tag_name'
         else
-            printf '%s' "$body" | awk -F'"' '/"tag_name"/ { print $4; exit }'
+            printf '%s' "$body" \
+                | awk -F'"' '!found && /"tag_name"/ { print $4; found=1 }'
         fi
     fi
 }
