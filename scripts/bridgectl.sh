@@ -138,6 +138,41 @@ current_version() {
     fi
 }
 
+# Echoes one of: `equal`, `newer` (when $1 is newer than $2), `older`.
+# Semver-aware: a pre-release (`X.Y.Z-rc.N`) sorts BEFORE the base
+# release (`X.Y.Z`), which plain `sort -V` gets wrong. Strategy: split
+# `base[-pre]`, compare bases via `sort -V`, then apply semver rule that
+# any pre-release is older than its base release; if both sides have pre,
+# fall back to `sort -V` over the full strings (handles `rc.1` < `rc.2`,
+# `alpha` < `beta` < `rc` alphabetically — same direction as semver).
+version_direction() {
+    if [ "$1" = "$2" ]; then
+        printf 'equal'
+        return
+    fi
+
+    local a_base="${1%%-*}" b_base="${2%%-*}" a_pre="" b_pre=""
+    case "$1" in *-*) a_pre="${1#*-}" ;; esac
+    case "$2" in *-*) b_pre="${2#*-}" ;; esac
+
+    local first
+    if [ "$a_base" != "$b_base" ]; then
+        first="$(printf '%s\n%s\n' "$a_base" "$b_base" | sort -V | head -n1)"
+        [ "$first" = "$a_base" ] && printf 'older' || printf 'newer'
+        return
+    fi
+
+    # Bases equal — apply semver pre-release rules.
+    if [ -z "$a_pre" ]; then
+        printf 'newer'  # release > pre-release
+    elif [ -z "$b_pre" ]; then
+        printf 'older'  # pre-release < release
+    else
+        first="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)"
+        [ "$first" = "$1" ] && printf 'older' || printf 'newer'
+    fi
+}
+
 # ── Download + verify ──────────────────────────────────────────────────────────
 download_release() {
     local tag="$1" target="$2" tmpdir="$3"
@@ -295,13 +330,31 @@ cmd_status() {
 
     if latest="$(api_latest_tag 2>/dev/null)" && [ -n "$latest" ]; then
         latest_ver="${latest#v}"
-        if [ -n "$cur" ] && [ "$cur" = "$latest_ver" ]; then
-            printf '  %-9s  %s  %s(up to date)%s\n' "$label:" "$latest_ver" "$C_GREEN" "$C_RESET"
-        elif [ -n "$cur" ]; then
-            printf '  %-9s  %s  %s⬆ upgrade available%s  (run: %s)\n' \
-                "$label:" "$latest_ver" "$C_YELLOW" "$C_RESET" "$upgrade_hint"
-        else
+        if [ -z "$cur" ]; then
             printf '  %-9s  %s  (run: %s)\n' "$label:" "$latest_ver" "$install_hint"
+        else
+            case "$(version_direction "$cur" "$latest_ver")" in
+                equal)
+                    printf '  %-9s  %s  %s(up to date)%s\n' \
+                        "$label:" "$latest_ver" "$C_GREEN" "$C_RESET"
+                    ;;
+                older)
+                    printf '  %-9s  %s  %s⬆ upgrade available%s  (run: %s)\n' \
+                        "$label:" "$latest_ver" "$C_YELLOW" "$C_RESET" "$upgrade_hint"
+                    ;;
+                newer)
+                    # Installed version is ahead of this channel — happens when an
+                    # RC is installed and `status` is run in stable mode (or vice
+                    # versa). Don't push the user toward a downgrade.
+                    if [ "$PRERELEASE" -ne 1 ]; then
+                        printf '  %-9s  %s  (you are on pre-release %s; check %s --prerelease status%s for newer RCs)\n' \
+                            "$label:" "$latest_ver" "$cur" "$C_BOLD" "$C_RESET"
+                    else
+                        printf '  %-9s  %s  (you are on %s — newer than this channel)\n' \
+                            "$label:" "$latest_ver" "$cur"
+                    fi
+                    ;;
+            esac
         fi
     else
         printf '  %-9s  %s(could not query GitHub)%s\n' "$label:" "$C_YELLOW" "$C_RESET"
@@ -403,7 +456,22 @@ cmd_upgrade() {
         return 0
     fi
 
-    confirm "Upgrade rustuya-bridge ${cur} → ${latest_ver}?" || { log "Aborted."; return 0; }
+    # Detect downgrade — e.g. an RC is installed and `upgrade` (stable channel)
+    # is run, where `latest_ver` is the older last-stable. Surface this clearly
+    # so the user doesn't yes-through a regression.
+    local direction prompt
+    direction="$(version_direction "$cur" "$latest_ver")"
+    if [ "$direction" = "newer" ]; then
+        warn "Installed ${cur} is NEWER than the ${PRERELEASE:+pre-release }channel's latest (${latest_ver})."
+        if [ "$PRERELEASE" -ne 1 ]; then
+            warn "For the newest pre-release instead, re-run: sudo bridgectl upgrade --prerelease"
+        fi
+        prompt="Downgrade rustuya-bridge ${cur} → ${latest_ver}?"
+    else
+        prompt="Upgrade rustuya-bridge ${cur} → ${latest_ver}?"
+    fi
+
+    confirm "$prompt" || { log "Aborted."; return 0; }
 
     tmpdir="$(mktemp -d)"
     # Bake the path into the trap (double-quoted) so it survives `local`
@@ -419,7 +487,11 @@ cmd_upgrade() {
 
     install_binary "${tmpdir}/rustuya-bridge"
     install_self
-    ok "Upgraded to ${latest_ver}."
+    if [ "$direction" = "newer" ]; then
+        ok "Downgraded to ${latest_ver}."
+    else
+        ok "Upgraded to ${latest_ver}."
+    fi
 
     if [ "$was_active" -eq 1 ]; then
         systemctl start "$SERVICE"
