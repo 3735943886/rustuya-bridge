@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.2] — Python 0.2.0-rc.2 — 2026-05-24
+
 ### Changed
 - **Bumped `rustuya` dep to 0.3.0-rc.2.** rc.2 is API-compatible — the only
   removed surface (`DeviceBuilder::run`) was already migrated to
