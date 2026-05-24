@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.3] — Python 0.2.0-rc.3 — 2026-05-25
+
+### Changed
+- **Bumped `rustuya` dep to 0.3.0-rc.3.** Scanner-only patch release with
+  no API change. The bridge calls only
+  [`rustuya::Scanner::scan_stream()`](src/handlers.rs#L178) (singleton
+  entry point), so the rc.3 setter behaviour fixes (`set_ports` /
+  `set_bind_address`) don't apply directly; what does apply, without any
+  bridge code change, is the underlying scanner robustness:
+  - `ensure_passive_listener` now serializes startup behind a mutex
+    guard, so two MQTT-triggered `scan_stream()` calls landing close
+    together can no longer race to spawn duplicate dispatcher tasks.
+  - `PACKET_CHANNEL_CAPACITY` 100 → 1024, removing the headroom shortage
+    that fleet-scale scans could hit when many devices respond in the
+    same broadcast window.
+  - Internal discovery-loop cleanup after `MAX_BROADCASTS` (no timing
+    change).
+
 ## [0.3.0-rc.2] — Python 0.2.0-rc.2 — 2026-05-24
 
 ### Changed
