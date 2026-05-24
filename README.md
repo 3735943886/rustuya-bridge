@@ -70,6 +70,28 @@ All `install` / `upgrade` / `remove` / `purge` accept `--yes` (`-y`) to skip
 confirmation prompts — required when running non-interactively (e.g. via
 `curl | sudo bash`).
 
+#### Pre-release channel
+
+`bridgectl` defaults to the stable channel (GitHub's `releases/latest`,
+which excludes pre-releases). Pass `--prerelease` to target the newest
+release including `-rc` / `-alpha` / `-beta` builds:
+
+```bash
+sudo bridgectl install   --prerelease   # install the latest RC
+sudo bridgectl upgrade   --prerelease   # upgrade to a newer RC
+bridgectl status         --prerelease   # show the newest RC vs installed
+```
+
+`status` and `upgrade` are semver-aware: if you have an RC installed and
+run them without `--prerelease`, the channel's latest stable is reported
+honestly, but the prompt is reframed as a **downgrade** so you don't yes
+through a regression. To roll back from a problematic RC to the last
+stable build:
+
+```bash
+sudo bridgectl upgrade   # detects RC > stable, prompts "Downgrade ... ?"
+```
+
 ### Build from Source
 Clone and run directly with cargo, or produce a release binary you can copy
 elsewhere:

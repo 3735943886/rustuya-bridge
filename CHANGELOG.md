@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Bumped `rustuya` dep to 0.3.0-rc.2.** rc.2 is API-compatible — the only
+  removed surface (`DeviceBuilder::run`) was already migrated to
+  `.build()` in `[0.3.0-rc.1]`. The bridge's
+  [`rustuya::device::unified_listener`](src/bridge.rs#L407) path is
+  preserved through rc.2's `device.rs → device/` module split, and
+  [`rustuya::Scanner::scan_stream()`](src/handlers.rs#L178) still routes
+  through the singleton after the `ScannerBuilder` removal.
+- Behaviour gained from rc.2 without code change:
+  - **`persist=false` burst collapse** benefits the bridge directly —
+    every device is registered with `nowait(true)`, so queued requests
+    against an unreachable device now reject in milliseconds instead of
+    waiting through full per-request exponential backoffs.
+  - **`Device::listener` broadcast-lag visibility**: rc.2 emits a
+    synthetic `{errorCode: 906, reason: "listener_lagged", skipped: n}`
+    event when a listener falls behind. The bridge's existing
+    error-path handler (`handle_device_event`) already routes any
+    payload with `errorCode/errorMsg` to the MQTT `error` topic, so
+    lag becomes observable without extra code — previously these
+    events were silently swallowed by rustuya.
 - `rustuya-bridge` binary now suppresses `env_logger`'s UTC timestamp prefix
   when launched by systemd/journald (detected via the `$JOURNAL_STREAM`
   env var that systemd.exec sets on the inherited stderr). Journald
