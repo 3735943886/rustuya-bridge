@@ -78,6 +78,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both `id` and `name` are provided in the same request (id wins, name
   is silently ignored).
 
+### Documentation
+- `docs/internals.md` — added operational caveats that aren't visible
+  from code alone: partial-failure semantics in name fan-out, what
+  silently breaks when a broker strips retain/LWT, fsync cost on slow
+  flash, state-file corruption recovery (there isn't one — back up
+  yourself), and the "stuck at 1280s retry" gotcha during long broker
+  outages. Also: corrected the `last_error_code` example from the
+  fictional `1106` to a real rustuya code (`905`, with a table of the
+  `900..=914` codes the bridge actually surfaces).
+
 ## [0.3.0-rc.3] — Python 0.2.0-rc.3 — 2026-05-25
 
 ### Changed

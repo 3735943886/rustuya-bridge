@@ -89,6 +89,15 @@ name match, no fan-out). This is on purpose: cascading is the bridge's
 choice, not a result of the name lookup, so it doesn't represent
 ambiguity in the caller's selector.
 
+> **Operational caveat — partial failure in name fan-out.** The handler
+> walks targets sequentially via `execute_per_target` and returns on the
+> first device-level error. So if `set` matches 3 devices by name and
+> device #2 times out, device #3 is never tried, the response is an
+> `error` with no `matched` annotation, and the caller can't easily tell
+> that part of the fleet was set and part wasn't. If you control fleets
+> by name and need atomicity, query `status` after a name-set to verify
+> all targets actually applied.
+
 If a payload provides both `id` and `name`, `id` wins and `name` is silently
 ignored — see the early-return in `find_device_ids`. A debug log is
 emitted in that case so operators tracking down a confused selector can
@@ -105,12 +114,25 @@ spot it.
 | Sub-device (cid set), parent_id set, parent not registered| `"no parent"`                                |
 | Has `cid` but no `parent_id` (only via hand-edited state) | `"invalid subdevice"`                        |
 | Direct, in `instances`, no error history                  | `"online"`                                   |
-| Direct, in `instances`, errored before                    | the raw error code as string (e.g. `"1106"`) |
+| Direct, in `instances`, errored before                    | the raw error code as string (e.g. `"905"`)  |
 | Direct, *not* in `instances` (rare; broken state)         | `"offline"`                                  |
 
 `"invalid subdevice"` can only appear if you hand-edit the state file or
 load one from a buggy producer — `add_device` rejects `cid` without
 `parent_id`. If you see it, fix the config.
+
+Error codes shown for direct devices come from rustuya
+([rustuya/src/error.rs](../../rustuya/src/error.rs)) and live in the
+`0` and `900..=914` range. The ones you'll most likely see in
+production:
+
+| Code | Constant         | Meaning                                |
+| ---- | ---------------- | -------------------------------------- |
+| 901  | `ERR_CONNECT`    | Network error — couldn't reach device  |
+| 902  | `ERR_TIMEOUT`    | Device didn't respond within timeout   |
+| 905  | `ERR_OFFLINE`    | Device unreachable                     |
+| 906  | `ERR_STATE`      | Unknown state (e.g. listener lagged)   |
+| 914  | `ERR_KEY_OR_VER` | Wrong `key` or wrong protocol `version`|
 
 `last_error_code` is **stored in memory only** — `#[serde(skip)]` in
 `DeviceConfig` ([config.rs](../src/config.rs), field `last_error_code`) means
@@ -497,6 +519,25 @@ and waits for the PubAck before disconnecting
  — the LWT is a backup, not the
 normal path.
 
+### 4.5 When the broker doesn't honor retain or LWT
+
+Several bridge features assume the broker treats `retain=true` and Last
+Will messages the way the MQTT spec describes. Some hosted MQTT services,
+strict broker ACL policies, or older brokers may strip one or both. The
+silent failure modes:
+
+| Broker behavior        | What breaks                                                      |
+| ---------------------- | ---------------------------------------------------------------- |
+| Retain stripped        | Scavenger has nothing to clear (no retained messages to begin with — but also no stale ones to worry about). Status dashboards subscribing to `{root}/bridge/config` see nothing until the next bridge restart publishes live. |
+| LWT stripped (only)    | If the bridge crashes, the retained `bridge/config` from the prior run stays on the broker forever. The next bridge restart sees a different `session_id` → §7 startup check fails → **bridge refuses to start**. Manual recovery: `mosquitto_pub -r -t '<root>/bridge/config' -m ''`. |
+| Both stripped          | Duplicate-instance detection effectively no-ops (nothing to see). Scavenger no-ops. The bridge will start under any conditions. |
+
+The retain check in §4.1 only verifies that the *templates* allow
+scavenging — it can't detect a broker that drops retain. If you have
+`mqtt_retain = true` set but no retained messages ever accumulate on the
+broker after running for a while, your broker is probably stripping
+retain.
+
 ---
 
 ## 5. Sub-device routing
@@ -612,6 +653,15 @@ For durability across unclean shutdown:
    boot. On Windows this fsync is silently skipped (opening a directory
    handle isn't supported there).
 
+**Operational cost on slow flash.** `fsync` on a Raspberry Pi SD card or
+similar low-end flash can block for tens to hundreds of milliseconds. The
+debounce (default 30s) means this hits at most once per debounce window,
+not per device change — but if you set `save_debounce_secs` very low on
+slow storage, the bridge will spend visible time in IO. If you see
+unexpected latency on commands during state-save bursts, this is the
+likely cause; raise the debounce or move the state file to faster
+storage.
+
 ### 6.4 The state file format quirk
 
 [load_state](../src/config.rs) accepts *two* shapes via
@@ -650,6 +700,26 @@ uses the same precedence as `add_device` (sub-branch first, then direct):
 If a device appears in `status` with these markers after a restart,
 check the bridge's startup logs.
 
+### 6.5 Corruption recovery — there isn't one
+
+`load_state` falls back to an **empty `HashMap`** if the JSON parse fails,
+logging an `error!` and continuing. The next `save_state` then overwrites
+the (corrupt) file with the empty config — losing every device
+registration. The fsync logic in §6.3 protects against this for clean
+shutdown sequences, but doesn't help against disk-level corruption
+(bad sectors, FS errors, manual mis-edits).
+
+There is **no backup mechanism** in the bridge. If you can't afford to
+re-register your fleet on a corrupt-file event, copy the state file
+into version control or a backup target on a schedule (`cron` +
+`cp /var/lib/rustuya/rustuya.json` somewhere safe). The file is small
+(JSON, one entry per device) so this is cheap.
+
+A `mosquitto_pub -t 'rustuya/command' -m '{"action":"status"}'` against
+a running bridge gives you a JSON snapshot of every registered device
+that you can pipe into a backup — handy as a periodic check that the
+state-on-disk matches state-in-memory.
+
 ---
 
 ## 7. Duplicate-instance detection
@@ -683,6 +753,13 @@ topic. The next bridge to start sees nothing and proceeds.
 - The 500ms window is a heuristic. On a very slow broker connection,
   startup may falsely succeed before the retained message arrives. The
   runtime check catches this within seconds.
+- **The whole mechanism assumes the broker honors LWT.** If your broker
+  strips Last Will messages and your bridge crashes (kill -9, OOM,
+  power loss), the prior session's retained config stays on the broker
+  forever, and the next bridge startup will see it and refuse to start
+  (different `session_id`). Recovery: clear the topic by hand —
+  `mosquitto_pub -r -t '<root>/bridge/config' -m ''` — before
+  restarting. See §4.5 for the broader broker-compatibility picture.
 
 ---
 
@@ -703,6 +780,13 @@ backoff loop. On any error:
 The 1280-second cap is high enough that a long broker outage won't burn
 CPU reconnecting, but low enough that recovery happens within ~20 minutes
 once the broker is back.
+
+**Operational gotcha**: there's no manual "reconnect now" trigger. If
+the broker was down long enough to push the delay to 1280s and then
+comes back, the bridge can sit idle for up to ~21 minutes before its
+next attempt — even though the broker is healthy. If you need faster
+recovery during an incident, restart the bridge (`systemctl restart
+rustuya-bridge`) — startup resets the delay to 10s.
 
 ### 8.2 Outbound channel: 100-deep buffer
 
@@ -935,8 +1019,16 @@ sensible. `{timestamp}` is for publish-side templates only.
 
 If you have 20 devices to register at boot, send one array payload, not 20
 publishes. The bridge processes each element as an independent
-`BridgeRequest` in its own task — same effect, fewer MQTT round trips, less
-log noise.
+`BridgeRequest` in its own task — same effect, fewer MQTT round trips,
+less log noise.
+
+The bigger win is **listener-refresh coalescing** (§2.2). 20 separate
+adds = 20 distinct refresh signals; with a 1-capacity refresh channel
+that still produces several listener rebuilds (and N TCP reconnects per
+rebuild). An array of 20 adds = 20 spawned tasks all racing to call
+`try_send` on the same 1-capacity channel; most fail silently, the
+listener typically rebuilds once or twice instead of ~20 times. The
+difference is dramatic for fleets of dozens of devices.
 
 ### 10.9 Watch `mqtt_drop_count` in status
 
@@ -952,6 +1044,11 @@ mosquitto_pub -t 'rustuya/command' -m '{"action":"status"}'
 If this number is non-zero and growing, your broker or downstream consumers
 can't keep up. Reduce event volume (consolidate to one event per device
 update rather than per DP) or fix the consumer.
+
+The counter is **cumulative since process start** — there's no rolling
+window or reset API. For monitoring, scrape it on a schedule and chart
+the delta rather than the absolute value. A bridge restart resets it
+to 0.
 
 ### 10.10 Tune `scavenger_timeout_secs` on slow brokers
 
