@@ -338,11 +338,16 @@ extraction.
 
 [handle_device_event](../src/bridge.rs) decides `is_passive` by
 whether the payload had any `dps` field (root or nested under `data`). Active
-events are deliberate device-driven state pushes; passive events are
-"something happened, here's the raw payload" — typically heartbeats or
-non-DP messages that the bridge synthesizes a DPS dict from
- so downstream consumers see a
-uniform format.
+events are deliberate device-driven state pushes (the device telling you
+"this just changed"); passive events are everything else that came over
+the wire with a non-empty JSON payload but no `dps` field — typically
+`DP_QUERY` responses (state read-back after you called `get`), periodic
+device-initiated status reports that use a non-standard shape, or
+sub-device messages with custom layouts. The bridge synthesizes a DPS
+dict from the raw payload so downstream consumers see a uniform format.
+
+(Heartbeats don't show up here — rustuya's per-device listener filters
+out empty-payload messages before they reach the bridge.)
 
 The default event topic includes `{type}` (`active` or `passive`) so you can
 subscribe selectively. If you use the HA-style topic without `{type}`, both
