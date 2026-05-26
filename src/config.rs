@@ -129,15 +129,54 @@ impl Cli {
     /// Parses CLI/env arguments and merges any JSON config file specified by `--config`.
     /// If the file does not exist, the current settings are written there for future runs.
     ///
-    /// Resolution priority (highest first): CLI/env > config file > [`Cli::default`].
+    /// Resolution priority (highest first): CLI/env > config file > config-relative
+    /// default (for `state_file` only, see [`Cli::resolve_default_state_file`]) >
+    /// [`Cli::default`].
     ///
     /// # Errors
     /// Returns an error if the config file cannot be read, parsed, or written.
     pub async fn load() -> Result<Self> {
         let mut cli = Self::parse();
         cli.apply_config_file().await?;
+        cli.resolve_default_state_file();
         cli.merge(Self::default());
         Ok(cli)
+    }
+
+    /// Resolves `state_file` against the directory of `--config` when both apply:
+    ///   - `state_file` is unset → defaults to `<config-dir>/rustuya.json`.
+    ///   - `state_file` is set but **relative** (`"mystate.json"`,
+    ///     `"data/state.json"`, etc.) → reinterpreted as
+    ///     `<config-dir>/<state_file>`.
+    ///   - `state_file` is **absolute** → left untouched.
+    ///
+    /// Without this hook, a CWD-relative path would surprise anyone launching
+    /// the bridge from a different directory than its config lives in. With
+    /// `--config` provided, the user almost certainly means "next to the
+    /// config", not "wherever I happened to `cd` first".
+    pub fn resolve_default_state_file(&mut self) {
+        let Some(cfg) = &self.config else { return };
+        let Some(parent) = Path::new(cfg).parent() else {
+            return;
+        };
+        if parent.as_os_str().is_empty() {
+            return;
+        }
+        match &self.state_file {
+            None => {
+                self.state_file = Some(
+                    parent
+                        .join(DEFAULT_STATE_FILE)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Some(p) if !Path::new(p).is_absolute() => {
+                self.state_file =
+                    Some(parent.join(p).to_string_lossy().into_owned());
+            }
+            Some(_) => {} // absolute path — respect as-is
+        }
     }
 
     /// Reads the JSON config file at `self.config` and merges it into `self`.
@@ -165,6 +204,10 @@ impl Cli {
         } else {
             info!("Config file {config_path} not found, creating a new one from current settings");
 
+            // Resolve state_file relative to the new config's directory BEFORE
+            // merging defaults, so the written file captures the resolved path
+            // explicitly instead of the literal CWD-relative "rustuya.json".
+            self.resolve_default_state_file();
             self.merge(Self::default());
 
             if let Some(parent) = path.parent() {
@@ -446,5 +489,79 @@ mod tests {
         };
         a.merge(b);
         assert_eq!(a.scavenger_timeout_secs(), 99);
+    }
+
+    // ── resolve_default_state_file ──────────────────────────────────────
+
+    fn make_cli(config: Option<&str>, state_file: Option<&str>) -> Cli {
+        Cli {
+            config: config.map(String::from),
+            state_file: state_file.map(String::from),
+            ..Cli::default()
+        }
+    }
+
+    #[test]
+    fn resolve_state_file_no_op_without_config() {
+        let mut cli = make_cli(None, None);
+        cli.resolve_default_state_file();
+        assert_eq!(cli.state_file, None);
+    }
+
+    #[test]
+    fn resolve_state_file_defaults_to_config_dir_when_unset() {
+        let mut cli = make_cli(Some("/etc/rustuya/config.json"), None);
+        cli.resolve_default_state_file();
+        assert_eq!(
+            cli.state_file.as_deref(),
+            Some("/etc/rustuya/rustuya.json")
+        );
+    }
+
+    #[test]
+    fn resolve_state_file_rewrites_relative_path_against_config_dir() {
+        // User wrote just a filename in config.json — they almost certainly
+        // mean "next to the config", not "wherever I cd-ed first".
+        let mut cli = make_cli(Some("/etc/rustuya/config.json"), Some("mystate.json"));
+        cli.resolve_default_state_file();
+        assert_eq!(
+            cli.state_file.as_deref(),
+            Some("/etc/rustuya/mystate.json")
+        );
+    }
+
+    #[test]
+    fn resolve_state_file_rewrites_multi_segment_relative_path() {
+        let mut cli = make_cli(
+            Some("/etc/rustuya/config.json"),
+            Some("data/state.json"),
+        );
+        cli.resolve_default_state_file();
+        assert_eq!(
+            cli.state_file.as_deref(),
+            Some("/etc/rustuya/data/state.json")
+        );
+    }
+
+    #[test]
+    fn resolve_state_file_leaves_absolute_path_untouched() {
+        let mut cli = make_cli(
+            Some("/etc/rustuya/config.json"),
+            Some("/var/lib/foo/state.json"),
+        );
+        cli.resolve_default_state_file();
+        assert_eq!(
+            cli.state_file.as_deref(),
+            Some("/var/lib/foo/state.json")
+        );
+    }
+
+    #[test]
+    fn resolve_state_file_no_op_for_bare_config_filename() {
+        // `--config config.json` has no parent dir → no config-dir context to
+        // attach to; fall through to Cli::default behaviour.
+        let mut cli = make_cli(Some("config.json"), None);
+        cli.resolve_default_state_file();
+        assert_eq!(cli.state_file, None);
     }
 }
