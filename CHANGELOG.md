@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- New config option `scavenger_timeout_secs` / `--scavenger-timeout-secs` /
+  `SCAVENGER_TIMEOUT_SECS` (default `1`). Controls how long the retained-MQTT
+  scavenger waits for messages before exiting after a `remove`/`clear`. Raise
+  this on slow brokers if retained device state isn't being cleared.
+- `status` responses now include `mqtt_drop_count`, a cumulative counter of
+  MQTT messages dropped because the outbound channel stayed full past the
+  500ms timeout. Watch this to detect a wedged broker or downstream consumer
+  that can't keep up.
+- Name-based lookups (`set`/`get`/`remove`/`request`/`sub_discover` by `name`)
+  that resolve to more than one device now publish a response containing
+  `matched: N` and `targets: [...]` so the caller can detect fan-out — even
+  for successful `set`/`get` which would normally be suppressed.
+- New internals documentation at [`docs/internals.md`](docs/internals.md)
+  covering device lifecycle, the unified listener, the template engine,
+  retain semantics, sub-device routing, and operator tips.
+
+### Changed
+- **Saved state files are now `fsync`'d** before and after rename, so an
+  unclean shutdown after `save_state` returns can no longer revert the
+  state file to its pre-save contents on next boot (Unix). Windows
+  silently skips the directory fsync (not supported by the OS).
+- **`add_device` is now idempotent for the listener.** Re-adding a direct
+  device with identical `key`/`ip`/`version` no longer rebuilds the
+  internal `Device` or triggers a `request_refresh`; only metadata
+  bookkeeping runs. Scripted "reapply config" flows no longer churn TCP
+  connections.
+- **MQTT outbound drops are now logged at `error`** (was `warn`) and the
+  cumulative drop count is included in the message and exposed via
+  `mqtt_drop_count` in `status`.
+- **Per-event retain warnings are now `debug`-level** (was `warn`) to avoid
+  log flooding when a fleet has devices without `name`/`cid` and the
+  template references them. The structurally-impossible case (no
+  identifier in any template) is still warned **once at startup**.
+- **`apply_set_heuristic` deny-list** now covers every `BridgeRequest`
+  field (`action`/`id`/`name`/`key`/`ip`/`version`/`cid`/`parent_id`/
+  `cmd`/`data`/`dps`/`dp`/`payload`), preventing a typo'd reserved field
+  from accidentally becoming a DP write.
+- **`replace_vars` now resolves missing optional variables to empty
+  string** (was: left the literal `{key}` placeholder). Affects `{dp}`,
+  `{type}`, `{level}`, `{cid}`, `{name}`, `{value}` — symmetry across
+  all optional vars and avoids `{"dp": "{dp}", ...}`-shaped payload
+  breakage when payload-template variables aren't in scope.
+- **`publish_device_message` now wraps non-object payloads** before
+  injecting `id`/`name`/`cid`, so the scavenger's payload-fallback search
+  can always locate retained messages by id regardless of caller-provided
+  payload shape.
+
+### Fixed
+- **Scavenger race**: the `tokio::select!` driving the retain scavenger
+  now uses `biased;` ordering so a simultaneous new-target arrival and
+  deadline expiry cannot lose the deadline extension. Previously, with
+  unlucky timing, a device added to an in-flight scavenger could have its
+  retained messages left orphaned.
+- **`remove_device` now refreshes the listener only when a direct device
+  was evicted.** Sub-device-only removals no longer trigger gratuitous
+  TCP reconnects of unrelated gateways. (Matches the selective-refresh
+  treatment `add_device` already received.)
+- **`remove` response's `matched` count now reflects name-matched
+  devices only, not cascaded sub-devices.** Previously, removing a
+  single gateway by name that cascaded to N sub-devices reported
+  `matched: N+1`, conflating cascading with name fan-out. The
+  `targets` extra now also lists only the name-matched ids.
+
+### Diagnostics
+- `find_device_ids` now logs a `warn` when an `id` selector contains an
+  empty string (a common symptom of `{id}` placeholders being merged
+  from a topic when name-based lookup was intended), and a `debug` when
+  both `id` and `name` are provided in the same request (id wins, name
+  is silently ignored).
+
 ## [0.3.0-rc.3] — Python 0.2.0-rc.3 — 2026-05-25
 
 ### Changed

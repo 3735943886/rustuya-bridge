@@ -26,6 +26,9 @@ thiserror = "2.0"
 url = "2.5"
 tokio-util = "0.7"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = true

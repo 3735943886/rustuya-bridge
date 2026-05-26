@@ -7,6 +7,7 @@ use std::path::Path;
 
 pub const DEFAULT_STATE_FILE: &str = "rustuya.json";
 pub const DEFAULT_SAVE_DEBOUNCE_SECS: u64 = 30;
+pub const DEFAULT_SCAVENGER_TIMEOUT_SECS: u64 = 1;
 pub const DEFAULT_MQTT_ROOT_TOPIC: &str = "rustuya";
 pub const DEFAULT_MQTT_COMMAND_TOPIC: &str = "{root}/command";
 pub const DEFAULT_MQTT_EVENT_TOPIC: &str = "{root}/event/{type}/{id}";
@@ -76,6 +77,12 @@ pub struct Cli {
     #[arg(long, env = "SAVE_DEBOUNCE_SECS")]
     pub save_debounce_secs: Option<u64>,
 
+    /// Seconds the retain scavenger waits for retained messages before exiting.
+    /// Raise this on slow brokers if retained device state isn't being cleared
+    /// after `remove`/`clear`.
+    #[arg(long, env = "SCAVENGER_TIMEOUT_SECS")]
+    pub scavenger_timeout_secs: Option<u64>,
+
     /// Log level (error, warn, info, debug, trace)
     #[arg(short = 'l', long, env = "LOG_LEVEL")]
     pub log_level: Option<String>,
@@ -110,6 +117,7 @@ impl Default for Cli {
             mqtt_retain: Some(false),
             state_file: Some(DEFAULT_STATE_FILE.into()),
             save_debounce_secs: Some(DEFAULT_SAVE_DEBOUNCE_SECS),
+            scavenger_timeout_secs: Some(DEFAULT_SCAVENGER_TIMEOUT_SECS),
             log_level: Some(DEFAULT_LOG_LEVEL.into()),
             no_signals: Some(false),
             session_id: None,
@@ -190,6 +198,7 @@ impl Cli {
             mqtt_retain,
             state_file,
             save_debounce_secs,
+            scavenger_timeout_secs,
             log_level,
             no_signals,
             session_id,
@@ -211,6 +220,7 @@ impl Cli {
             mqtt_retain,
             state_file,
             save_debounce_secs,
+            scavenger_timeout_secs,
             log_level,
             no_signals,
             session_id,
@@ -262,6 +272,12 @@ impl Cli {
     pub fn save_debounce_secs(&self) -> u64 {
         self.save_debounce_secs
             .unwrap_or(DEFAULT_SAVE_DEBOUNCE_SECS)
+    }
+
+    #[must_use]
+    pub fn scavenger_timeout_secs(&self) -> u64 {
+        self.scavenger_timeout_secs
+            .unwrap_or(DEFAULT_SCAVENGER_TIMEOUT_SECS)
     }
 
     #[must_use]
@@ -362,5 +378,73 @@ pub async fn load_state(path: &str) -> HashMap<String, DeviceConfig> {
             error!("Failed to load state file {path:?}: {e}");
             HashMap::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── #8: scavenger_timeout_secs plumbing ──────────────────────────────
+
+    #[test]
+    fn scavenger_timeout_secs_returns_default_when_unset() {
+        let cli = Cli {
+            scavenger_timeout_secs: None,
+            ..Cli::default()
+        };
+        assert_eq!(cli.scavenger_timeout_secs(), DEFAULT_SCAVENGER_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn scavenger_timeout_secs_returns_override_when_set() {
+        let cli = Cli {
+            scavenger_timeout_secs: Some(7),
+            ..Cli::default()
+        };
+        assert_eq!(cli.scavenger_timeout_secs(), 7);
+    }
+
+    #[test]
+    fn scavenger_timeout_secs_round_trips_through_config_json() {
+        // The bridge persists/reloads Cli via serde_json. Make sure the new
+        // field survives that round-trip (catches a missing serde attribute).
+        let cli = Cli {
+            scavenger_timeout_secs: Some(42),
+            ..Cli::default()
+        };
+        let json = serde_json::to_string(&cli).expect("serialize");
+        let back: Cli = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.scavenger_timeout_secs(), 42);
+    }
+
+    #[test]
+    fn merge_preserves_scavenger_timeout_secs_when_set() {
+        // `merge` only fills None fields from `other` — an explicit Some
+        // must survive.
+        let mut a = Cli {
+            scavenger_timeout_secs: Some(10),
+            ..Cli::default()
+        };
+        let b = Cli {
+            scavenger_timeout_secs: Some(99),
+            ..Cli::default()
+        };
+        a.merge(b);
+        assert_eq!(a.scavenger_timeout_secs(), 10);
+    }
+
+    #[test]
+    fn merge_fills_scavenger_timeout_secs_from_other_when_none() {
+        let mut a = Cli {
+            scavenger_timeout_secs: None,
+            ..Cli::default()
+        };
+        let b = Cli {
+            scavenger_timeout_secs: Some(99),
+            ..Cli::default()
+        };
+        a.merge(b);
+        assert_eq!(a.scavenger_timeout_secs(), 99);
     }
 }

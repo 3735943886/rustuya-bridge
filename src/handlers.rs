@@ -12,6 +12,20 @@ use crate::error::BridgeError;
 use crate::types::{ApiResponse, BridgeRequest, SingleOrList};
 use futures_util::StreamExt;
 
+/// Builds a successful `ApiResponse` and, when a name-based lookup resolved
+/// to more than one device, surfaces the fan-out via `matched` + `targets`
+/// extras so the caller can detect collisions instead of silently affecting
+/// multiple devices.
+fn build_targets_response(action: &str, targets: &[String], by_name: bool) -> ApiResponse {
+    let mut res = ApiResponse::ok(action, targets.join(","));
+    if by_name && targets.len() > 1 {
+        res = res
+            .with_extra("matched", Value::from(targets.len() as u64))
+            .with_extra("targets", Value::from(targets.to_vec()));
+    }
+    res
+}
+
 /// Main entry point for processing bridge requests
 pub async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> ApiResponse {
     let action = req.action_name().to_string();
@@ -97,6 +111,8 @@ async fn handle_request_inner(
             .await
         }
         BridgeRequest::Remove { id, name } => {
+            // `remove_device` owns the `matched` annotation itself because the
+            // cascaded sub-device list would otherwise inflate the count.
             ctx.remove_device(
                 id.map(SingleOrList::into_vec),
                 name.map(SingleOrList::into_vec),
@@ -106,6 +122,7 @@ async fn handle_request_inner(
         BridgeRequest::Clear => ctx.clear_devices().await,
         BridgeRequest::Status => Ok(ctx.get_bridge_status().await),
         BridgeRequest::Get { id, name, cid } => {
+            let by_name = id.is_none() && name.is_some();
             let targets = ctx
                 .get_targets(
                     id.map(SingleOrList::into_vec),
@@ -116,9 +133,10 @@ async fn handle_request_inner(
                 dev.request(CommandType::DpQuery, None, actual_cid).await
             })
             .await?;
-            Ok(ApiResponse::ok("get", targets.join(",")))
+            Ok(build_targets_response("get", &targets, by_name))
         }
         BridgeRequest::Set { id, name, dps, cid } => {
+            let by_name = id.is_none() && name.is_some();
             let targets = ctx
                 .get_targets(
                     id.map(SingleOrList::into_vec),
@@ -133,7 +151,7 @@ async fn handle_request_inner(
                 }
             })
             .await?;
-            Ok(ApiResponse::ok("set", targets.join(",")))
+            Ok(build_targets_response("set", &targets, by_name))
         }
         BridgeRequest::Request {
             id,
@@ -142,6 +160,7 @@ async fn handle_request_inner(
             data,
             cid,
         } => {
+            let by_name = id.is_none() && name.is_some();
             let command = CommandType::from_u32(cmd).ok_or(BridgeError::InvalidCommand(cmd))?;
             let targets = ctx
                 .get_targets(
@@ -154,12 +173,14 @@ async fn handle_request_inner(
                 async move { dev.request(command, data, actual_cid).await }
             })
             .await?;
-            Ok(ApiResponse::ok(
-                format!("{command:?}").to_lowercase(),
-                targets.join(","),
+            Ok(build_targets_response(
+                &format!("{command:?}").to_lowercase(),
+                &targets,
+                by_name,
             ))
         }
         BridgeRequest::SubDiscover { id, name } => {
+            let by_name = id.is_none() && name.is_some();
             let targets = ctx
                 .get_targets(
                     id.map(SingleOrList::into_vec),
@@ -170,7 +191,7 @@ async fn handle_request_inner(
                 dev.sub_discover().await
             })
             .await?;
-            Ok(ApiResponse::ok("sub_discover", targets.join(",")))
+            Ok(build_targets_response("sub_discover", &targets, by_name))
         }
         BridgeRequest::Scan => {
             let ctx_scan = ctx.clone();
@@ -205,4 +226,57 @@ async fn handle_request_inner(
             ))
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn targets_of(res: &ApiResponse) -> Option<Vec<String>> {
+        res.extra.get("targets").and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+        })
+    }
+
+    // ── #4: build_targets_response — name fan-out annotation ──────────────
+
+    #[test]
+    fn build_targets_response_adds_matched_when_name_lookup_fans_out() {
+        let targets = vec!["dev-a".to_string(), "dev-b".to_string()];
+        let res = build_targets_response("set", &targets, /* by_name= */ true);
+        assert_eq!(
+            res.extra.get("matched").and_then(|v| v.as_u64()),
+            Some(2),
+            "matched count must reflect target list length"
+        );
+        assert_eq!(
+            targets_of(&res),
+            Some(vec!["dev-a".into(), "dev-b".into()])
+        );
+        assert_eq!(res.id.as_deref(), Some("dev-a,dev-b"));
+    }
+
+    #[test]
+    fn build_targets_response_omits_matched_when_lookup_was_by_id() {
+        // Even if id-based lookup returns multiple targets (e.g. caller passed a
+        // list of ids), we don't annotate — the caller already knew the count.
+        let targets = vec!["dev-a".to_string(), "dev-b".to_string()];
+        let res = build_targets_response("set", &targets, /* by_name= */ false);
+        assert!(!res.extra.contains_key("matched"));
+        assert!(!res.extra.contains_key("targets"));
+    }
+
+    #[test]
+    fn build_targets_response_omits_matched_when_single_target() {
+        // Unambiguous name → no fan-out info needed.
+        let targets = vec!["dev-only".to_string()];
+        let res = build_targets_response("set", &targets, /* by_name= */ true);
+        assert!(!res.extra.contains_key("matched"));
+        assert!(!res.extra.contains_key("targets"));
+    }
+
 }

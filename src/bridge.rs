@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
@@ -20,7 +21,6 @@ pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
 pub const LISTENER_TIMEOUT_SECS: u64 = 300;
 pub const REQUEST_TIMEOUT_SECS: u64 = 15;
-pub const SCAVENGER_TIMEOUT_SECS: u64 = 1;
 
 fn unix_millis() -> u128 {
     std::time::SystemTime::now()
@@ -76,6 +76,9 @@ pub struct BridgeContext {
     pub refresh_tx: mpsc::Sender<()>,
     pub scavenger_tx:
         tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<crate::types::ScavengerTarget>>>>,
+    /// Count of MQTT messages dropped because the outbound channel stayed
+    /// full past `try_send_mqtt`'s timeout. Exposed in `status` responses.
+    pub mqtt_drop_count: AtomicU64,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -342,6 +345,7 @@ impl BridgeContext {
             save_tx,
             refresh_tx,
             scavenger_tx: tokio::sync::Mutex::new(None),
+            mqtt_drop_count: AtomicU64::new(0),
             cancel: tokio_util::sync::CancellationToken::new(),
         });
 
@@ -648,8 +652,13 @@ impl BridgeContext {
                                     let ctx_h = self.clone();
                                     tokio::spawn(async move {
                                         let res = crate::handlers::handle_request(ctx_h.clone(), req).await;
-                                        // Suppress response for successful set/get actions to avoid redundancy
-                                        if res.status != crate::types::Status::Ok || !matches!(res.action.as_deref(), Some("set" | "get")) {
+                                        // Suppress response for successful set/get actions to avoid
+                                        // redundancy — unless the response carries fan-out info
+                                        // (`matched` extra), which the caller needs to see.
+                                        let suppress = res.status == crate::types::Status::Ok
+                                            && matches!(res.action.as_deref(), Some("set" | "get"))
+                                            && !res.extra.contains_key("matched");
+                                        if !suppress {
                                             ctx_h.publish_api_response(res).await;
                                         }
                                     });
@@ -784,7 +793,8 @@ impl BridgeContext {
                 .await
                 .is_err()
         {
-            warn!("MQTT queue full, dropping message");
+            let n = self.mqtt_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+            error!("MQTT queue full, dropping message (cumulative drops: {n})");
         }
     }
 
@@ -930,16 +940,26 @@ impl BridgeContext {
         val
     }
 
-    /// Helper to apply 'set' command heuristic to an object
+    /// Helper to apply 'set' command heuristic to an object.
+    ///
+    /// Treats every top-level field that is *not* a known `BridgeRequest`
+    /// field as a DP id/value pair. The deny-list must cover every field used
+    /// by any `BridgeRequest` variant (plus topic-merged keys like `dp` and the
+    /// scalar-wrap key `payload`) — adding a new field to `BridgeRequest`
+    /// without updating this list will silently turn it into a DP write.
     fn apply_set_heuristic(obj: &mut serde_json::Map<String, Value>) {
+        const RESERVED_FIELDS: &[&str] = &[
+            // BridgeRequest variants' fields:
+            "action", "id", "name", "key", "ip", "version", "cid", "parent_id",
+            "cmd", "data", "dps",
+            // Topic-merged / scalar-wrap synthetic keys:
+            "dp", "payload",
+        ];
         if !obj.contains_key("dps") && !obj.contains_key("data") {
             let mut dps = obj.clone();
-            dps.remove("id");
-            dps.remove("name");
-            dps.remove("cid");
-            dps.remove("action");
-            dps.remove("dp");
-            dps.remove("payload");
+            for f in RESERVED_FIELDS {
+                dps.remove(*f);
+            }
             obj.insert("dps".to_string(), Value::Object(dps));
         }
     }
@@ -949,6 +969,8 @@ impl BridgeContext {
     /// # Errors
     /// Returns an error if the state file cannot be serialized, written, or atomically renamed.
     pub async fn save_state(&self) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
         let json = {
             let state = self.state.read().await;
             serde_json::to_string_pretty(&state.configs)?
@@ -961,12 +983,32 @@ impl BridgeContext {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        // Atomic write: write + fsync temp file, rename, then fsync parent
+        // dir so the rename itself survives an unclean shutdown.
         let tmp_path = path.with_extension("tmp");
-        tokio::fs::write(&tmp_path, json).await?;
+        {
+            let mut f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .await?;
+            f.write_all(json.as_bytes()).await?;
+            f.sync_all().await?;
+        }
 
         if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             anyhow::bail!("Failed to commit state file {}: {}", self.state_file, e);
+        }
+
+        // Fsync the directory entry (Unix). On Windows this is a no-op and
+        // `File::open` on a directory fails — silently ignore.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && let Ok(dir) = tokio::fs::File::open(parent).await
+        {
+            let _ = dir.sync_all().await;
         }
 
         info!("State persisted to {}", self.state_file);
@@ -989,10 +1031,27 @@ impl BridgeContext {
         id: Option<Vec<String>>,
         name: Option<Vec<String>>,
     ) -> Vec<String> {
+        // Both selectors provided: id wins, name is silently ignored. Log so
+        // operators tracking down "why didn't my name lookup fire" can spot it.
+        if id.is_some() && name.is_some() {
+            debug!(
+                "find_device_ids: both `id` and `name` provided; `id` takes priority and `name` is ignored"
+            );
+        }
+
         let state = self.state.read().await;
 
         // 1. Match by ID
         if let Some(ids) = id {
+            // Empty strings in the id list are a common symptom of "I wanted
+            // name-based lookup but the topic merged an empty {id} segment in".
+            // `find_device_ids` short-circuits on `id` regardless, so an empty
+            // string can't fall through to the name path — warn loudly.
+            if ids.iter().any(String::is_empty) {
+                warn!(
+                    "find_device_ids: `id` selector contains an empty string; the lookup will short-circuit to id-only and fail. If you want name-based lookup with an {{id}} placeholder in the topic, send `\"id\": null` (not `\"\"`) in the payload — see docs/internals.md §10.1"
+                );
+            }
             return ids
                 .into_iter()
                 .filter(|id_val| state.configs.contains_key(id_val))
@@ -1105,14 +1164,17 @@ impl BridgeContext {
             // Retain is structurally safe only when the topic/payload templates
             // reference an identifier the scavenger can later use to clear the
             // retained message. `{id}` is always available; `{name}`/`{cid}` only
-            // when this specific device has them.
+            // when this specific device has them. The structurally-impossible
+            // case (templates reference no identifier at all) is warned once at
+            // startup in `BridgeContext::new`; per-device shortfalls are debug
+            // only to avoid log flooding.
             let retain = self.mqtt_retain
                 && self
                     .event_identifiers
                     .satisfied_by(name.as_deref(), cid.as_deref());
             if self.mqtt_retain && !retain {
-                warn!(
-                    "Ignoring retain for event from '{id}': event_topic/payload_template have no identifier resolvable for this device (name={name:?}, cid={cid:?})"
+                debug!(
+                    "Ignoring retain for event from '{id}': no template identifier resolvable for this device (name={name:?}, cid={cid:?})"
                 );
             }
 
@@ -1149,6 +1211,20 @@ impl BridgeContext {
                 },
             );
 
+            // Force the payload into an object so we can always inject `id` —
+            // the scavenger's payload-fallback match (`"<id>"`) relies on this
+            // and is the reason `message_topic` doesn't need its own
+            // `IdentifierSet` retain gate (unlike `event_topic`, which is
+            // gated in `publish_device_event`).
+            if !payload.is_object() {
+                let inner = std::mem::replace(
+                    &mut payload,
+                    Value::Object(serde_json::Map::new()),
+                );
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("payload".to_string(), inner);
+                }
+            }
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("id".to_string(), id.into());
                 if let Some(n) = name {
@@ -1158,11 +1234,6 @@ impl BridgeContext {
                     obj.insert("cid".to_string(), c.into());
                 }
             }
-
-            // We just injected `id` into the payload object above, so the
-            // scavenger's payload-fallback match (`"<id>"`) always finds it —
-            // no extra retain gate needed here. Non-object payloads (e.g. plain
-            // strings) skip the injection; in practice all callers pass objects.
             self.try_send_mqtt(Some(MqttMessage {
                 topic,
                 payload: payload.to_string(),
@@ -1213,33 +1284,30 @@ impl BridgeContext {
                 out.push_str(vars.cid.unwrap_or(""));
                 true
             }
-            "level" => vars.level.is_some_and(|v| {
-                out.push_str(v);
+            "level" => {
+                out.push_str(vars.level.unwrap_or(""));
                 true
-            }),
-            "type" => vars.event_type.is_some_and(|v| {
-                out.push_str(v);
+            }
+            "type" => {
+                out.push_str(vars.event_type.unwrap_or(""));
                 true
-            }),
-            "dp" => vars.dp.is_some_and(|v| {
-                out.push_str(v);
+            }
+            "dp" => {
+                out.push_str(vars.dp.unwrap_or(""));
                 true
-            }),
+            }
             "value" => {
                 if let Some(val) = vars.val {
                     let _ = write!(out, "{val}");
-                    true
                 } else if let Some(dps_str) = vars.dps_str {
                     out.push_str(dps_str);
-                    true
-                } else {
-                    false
                 }
-            }
-            "dps" => vars.dps_str.is_some_and(|s| {
-                out.push_str(s);
                 true
-            }),
+            }
+            "dps" => {
+                out.push_str(vars.dps_str.unwrap_or(""));
+                true
+            }
             "timestamp" => {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1343,6 +1411,7 @@ impl BridgeContext {
         let msg_tpl = templates[1].clone();
         let event_re = compile_topic_regex(&event_tpl);
         let msg_re = compile_topic_regex(&msg_tpl);
+        let scavenger_timeout_secs = self.cli.scavenger_timeout_secs();
 
         tokio::spawn(async move {
             let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
@@ -1357,15 +1426,18 @@ impl BridgeContext {
 
             let mut active_targets = targets;
             let mut deadline =
-                tokio::time::Instant::now() + Duration::from_secs(SCAVENGER_TIMEOUT_SECS);
+                tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
 
             loop {
                 tokio::select! {
+                    // Biased: process new-target arrivals before the deadline branch
+                    // so a simultaneous send + expiry can't lose the extension.
+                    biased;
                     new_targets_opt = rx.recv() => {
                         if let Some(new_targets) = new_targets_opt {
                             let count = new_targets.len();
                             active_targets.extend(new_targets);
-                            deadline = tokio::time::Instant::now() + Duration::from_secs(SCAVENGER_TIMEOUT_SECS);
+                            deadline = tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
                             debug!("Scavenger added {count} new targets, extended timeout");
                         } else {
                             break;
@@ -1481,8 +1553,25 @@ impl BridgeContext {
         let id = cfg.id.clone();
         let name = cfg.name.clone();
 
+        // Tracks whether the listener needs to be rebuilt. Direct-device
+        // additions/removals/key changes flip it; pure metadata changes
+        // (name, sub-device cid_map) do not.
+        let mut listener_changed = false;
+
         {
             let mut state = self.state.write().await;
+
+            // Snapshot old config (key/ip/version) to decide whether the
+            // direct-device branch needs to rebuild its `Device` and refresh
+            // the listener.
+            let old_direct = state.configs.get(&id).map(|c| {
+                (
+                    c.cid.is_some() && c.parent_id.is_some(),
+                    c.key.clone(),
+                    c.ip.clone(),
+                    c.version.clone(),
+                )
+            });
 
             // Clean up old mappings if device already exists
             let old_mapping = state
@@ -1509,24 +1598,41 @@ impl BridgeContext {
             if let Some(cid) = &cfg.cid
                 && let Some(parent_id) = &cfg.parent_id
             {
-                // Register as sub-device
+                // Register as sub-device. If the old shape was a direct device,
+                // the listener loses an instance and must refresh.
+                if old_direct.as_ref().is_some_and(|(was_sub, ..)| !was_sub) {
+                    listener_changed = true;
+                }
                 state
                     .cid_map
                     .insert((parent_id.clone(), cid.clone()), id.clone());
                 state.instances.remove(&id);
             } else if let Some(key) = &cfg.key {
-                // Register as direct device
-                let dev = DeviceBuilder::new(&id, key.as_bytes().to_vec())
-                    .address(cfg.ip.as_deref().unwrap_or("Auto"))
-                    .version(
-                        cfg.version
-                            .as_deref()
-                            .and_then(|s| s.parse::<rustuya::Version>().ok())
-                            .unwrap_or_default(),
-                    )
-                    .nowait(true)
-                    .build();
-                state.instances.insert(id.clone(), dev);
+                // Register as direct device. Rebuild the Device only when key,
+                // ip, version, or shape changed; otherwise keep the existing
+                // connection and avoid the listener refresh.
+                let unchanged = matches!(
+                    &old_direct,
+                    Some((false, Some(old_key), old_ip, old_ver))
+                        if old_key == key
+                            && old_ip == &cfg.ip
+                            && old_ver == &cfg.version
+                            && state.instances.contains_key(&id)
+                );
+                if !unchanged {
+                    let dev = DeviceBuilder::new(&id, key.as_bytes().to_vec())
+                        .address(cfg.ip.as_deref().unwrap_or("Auto"))
+                        .version(
+                            cfg.version
+                                .as_deref()
+                                .and_then(|s| s.parse::<rustuya::Version>().ok())
+                                .unwrap_or_default(),
+                        )
+                        .nowait(true)
+                        .build();
+                    state.instances.insert(id.clone(), dev);
+                    listener_changed = true;
+                }
             } else {
                 return Err(BridgeError::InvalidRequest(
                     "Device must have either (cid & parent_id) for sub-device or (key) for direct device"
@@ -1542,7 +1648,9 @@ impl BridgeContext {
 
         info!("Device registered/updated: {id}");
         self.request_save();
-        self.request_refresh();
+        if listener_changed {
+            self.request_refresh();
+        }
         Ok(ApiResponse::ok("add", id))
     }
 
@@ -1555,7 +1663,12 @@ impl BridgeContext {
         id: Option<Vec<String>>,
         name: Option<Vec<String>>,
     ) -> Result<ApiResponse, BridgeError> {
-        let mut targets = self.get_targets(id, name).await?;
+        // Capture caller intent before consuming the selectors so we can decide
+        // whether to annotate the response with `matched` fan-out info.
+        let by_name = id.is_none() && name.is_some();
+        let direct_matches = self.get_targets(id, name).await?;
+        let name_matched = direct_matches.len();
+        let mut targets = direct_matches.clone();
 
         // Cascade removal to sub-devices
         let sub_targets: Vec<String> = {
@@ -1574,6 +1687,10 @@ impl BridgeContext {
         targets.sort();
         targets.dedup();
 
+        // Track whether the unified listener needs to rebuild. Removing a
+        // sub-device doesn't affect the listener (subs aren't in `instances`),
+        // so only direct-device removals flip this flag.
+        let mut listener_changed = false;
         let mut scavenger_targets = Vec::new();
         {
             let mut state = self.state.write().await;
@@ -1606,19 +1723,34 @@ impl BridgeContext {
                         cid: None,
                     });
                 }
-                state.instances.remove(target_id);
+                if state.instances.remove(target_id).is_some() {
+                    listener_changed = true;
+                }
             }
         }
 
-        // Send refresh signal to kill the listener stream and drop physical connections
-        self.request_refresh();
+        // Only refresh when a direct device was actually evicted — sub-device
+        // removals don't appear in the listener stream.
+        if listener_changed {
+            self.request_refresh();
+        }
 
         // Scavenge retained messages for removed devices
         self.spawn_retain_scavenger(scavenger_targets).await;
 
         info!("Devices removed: {}", targets.join(", "));
         self.request_save();
-        Ok(ApiResponse::ok("remove", targets.join(",")))
+
+        let mut res = ApiResponse::ok("remove", targets.join(","));
+        // Annotate fan-out only for name-based lookups that resolved to
+        // multiple *directly-matched* devices. Cascaded sub-devices are not
+        // counted — the caller's name didn't match those.
+        if by_name && name_matched > 1 {
+            res = res
+                .with_extra("matched", Value::from(name_matched as u64))
+                .with_extra("targets", Value::from(direct_matches));
+        }
+        Ok(res)
     }
 
     /// Clears all registered devices and scavenges their retained MQTT messages.
@@ -1673,7 +1805,10 @@ impl BridgeContext {
         }
         drop(state);
 
-        ApiResponse::ok_action("status").with_extra("devices", Value::Object(devices))
+        let mqtt_drop_count = self.mqtt_drop_count.load(Ordering::Relaxed);
+        ApiResponse::ok_action("status")
+            .with_extra("devices", Value::Object(devices))
+            .with_extra("mqtt_drop_count", Value::from(mqtt_drop_count))
     }
 
     fn determine_device_status(cfg: &DeviceConfig, instances: &HashMap<String, Device>) -> String {
@@ -1919,6 +2054,469 @@ mod tests {
         assert!(!dps.contains_key("id"));
         assert!(!dps.contains_key("action"));
     }
+
+    #[test]
+    fn parse_payload_set_heuristic_excludes_all_bridge_request_fields() {
+        // Regression guard for the extended deny-list: when the heuristic runs
+        // (no explicit `dps` / `data`), every BridgeRequest top-level field
+        // (key/ip/version/cid/parent_id/cmd + the existing core ones) must be
+        // stripped from auto-built dps, so a typo'd/misplaced reserved field
+        // can't silently become a DP write.
+        let vars: HashMap<String, String> = HashMap::new();
+        let val = BridgeContext::parse_mqtt_payload(
+            r#"{"action":"set","id":"dev","name":"n","key":"k","ip":"1.2.3.4",
+                "version":"3.3","cid":"c","parent_id":"p","cmd":7,
+                "dp":"99","payload":"x","1":true}"#,
+            &vars,
+        );
+        let dps = val.get("dps").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(dps.get("1"), Some(&json!(true)));
+        for reserved in [
+            "action", "id", "name", "key", "ip", "version", "cid", "parent_id",
+            "cmd", "dp", "payload", "dps",
+        ] {
+            assert!(
+                !dps.contains_key(reserved),
+                "reserved field `{reserved}` leaked into auto-built dps"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_payload_set_heuristic_skips_when_data_present() {
+        // Documented behavior: `data` opts out of the auto-wrap, so the
+        // payload is passed through unchanged (no `dps` synthesized).
+        let vars: HashMap<String, String> = HashMap::new();
+        let val = BridgeContext::parse_mqtt_payload(
+            r#"{"action":"set","id":"dev","data":{"x":1}}"#,
+            &vars,
+        );
+        assert!(val.get("dps").is_none());
+        assert_eq!(val.get("data"), Some(&json!({"x": 1})));
+    }
+
+// ── Async / context-bound behavior tests ─────────────────────────────────
+// Tests below construct a full BridgeContext over a tempdir so they exercise
+// add_device, publish_device_event, etc. end-to-end with a captured MQTT
+// receiver. Kept in a separate module so the heavy setup helper doesn't
+// leak into the pure-function test module above.
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    /// Constructs a BridgeContext writing state to a fresh tempdir, with the
+    /// MQTT channel wired (so `publish_*` actually sends) but no real broker.
+    /// `customize` can override Cli fields like event_topic / payload_template.
+    async fn make_ctx(
+        customize: impl FnOnce(&mut Cli),
+    ) -> (
+        Arc<BridgeContext>,
+        TempDir,
+        mpsc::Receiver<Option<MqttMessage>>,
+        mpsc::Receiver<()>,
+        mpsc::Receiver<()>,
+    ) {
+        let tmp = TempDir::new().expect("create tempdir");
+        let state_path = tmp.path().join("state.json");
+        // `mqtt_tx` is wired iff mqtt_broker is Some — value never dialed.
+        let mut cli = Cli {
+            mqtt_broker: Some("mqtt://noop.invalid:1883".to_string()),
+            state_file: Some(state_path.to_string_lossy().into_owned()),
+            ..Cli::default()
+        };
+        customize(&mut cli);
+        let (ctx, mqtt_rx, save_rx, refresh_rx) =
+            BridgeContext::new(&cli).await.expect("new context");
+        (ctx, tmp, mqtt_rx, save_rx, refresh_rx)
+    }
+
+    fn direct_device(id: &str, key: &str, ip: Option<&str>) -> DeviceConfig {
+        DeviceConfig {
+            id: id.into(),
+            name: None,
+            ip: ip.map(str::to_string),
+            key: Some(key.into()),
+            version: None,
+            cid: None,
+            parent_id: None,
+            last_error_code: None,
+        }
+    }
+
+    // ── #10: add_device idempotency ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_device_skips_refresh_when_re_added_identically() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+        ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
+            .await
+            .expect("first add");
+        assert_eq!(
+            refresh_rx.try_recv(),
+            Ok(()),
+            "first add must trigger refresh"
+        );
+
+        ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
+            .await
+            .expect("idempotent re-add");
+        assert!(
+            refresh_rx.try_recv().is_err(),
+            "identical re-add must not trigger refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_device_refreshes_when_key_changes() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+        ctx.add_device(direct_device("dev-1", "aaaaaaaaaaaaaaaa", None))
+            .await
+            .unwrap();
+        let _ = refresh_rx.try_recv();
+
+        ctx.add_device(direct_device("dev-1", "bbbbbbbbbbbbbbbb", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            refresh_rx.try_recv(),
+            Ok(()),
+            "key change must trigger refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_device_refreshes_when_ip_changes() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+        ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
+            .await
+            .unwrap();
+        let _ = refresh_rx.try_recv();
+
+        ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.2")))
+            .await
+            .unwrap();
+        assert_eq!(
+            refresh_rx.try_recv(),
+            Ok(()),
+            "ip change must trigger refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_device_refreshes_when_shape_changes_direct_to_sub() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+        ctx.add_device(direct_device("dev-1", "0123456789abcdef", None))
+            .await
+            .unwrap();
+        let _ = refresh_rx.try_recv();
+
+        // Re-add as sub-device — direct instance must drop, listener must refresh.
+        ctx.add_device(DeviceConfig {
+            id: "dev-1".into(),
+            name: None,
+            ip: None,
+            key: None,
+            version: None,
+            cid: Some("sub-1".into()),
+            parent_id: Some("gateway-A".into()),
+            last_error_code: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            refresh_rx.try_recv(),
+            Ok(()),
+            "direct→sub conversion must trigger refresh"
+        );
+    }
+
+    // ── #2: optional template vars fall back to empty string ──────────────
+
+    /// Collects all `MqttMessage`s sent within a short window from the captured
+    /// receiver — `publish_device_event` returns immediately after queuing, so
+    /// a tiny yield is enough.
+    async fn drain_mqtt(rx: &mut mpsc::Receiver<Option<MqttMessage>>) -> Vec<MqttMessage> {
+        // Yield once so any pending sends land in the channel.
+        tokio::task::yield_now().await;
+        let mut out = Vec::new();
+        while let Ok(Some(msg)) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn publish_event_multi_dp_renders_missing_dp_as_empty() {
+        // Multi-DP mode (event_topic has no {dp}/{value}) + a payload template
+        // that references {dp} → {dp} must render as empty string, not the
+        // literal `{dp}` placeholder.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_event_topic = Some("{root}/event/{id}".to_string());
+            cli.mqtt_payload_template = Some(r#"{"dp":"{dp}","val":{value}}"#.to_string());
+        })
+        .await;
+
+        ctx.publish_device_event(
+            "dev-1".to_string(),
+            None,
+            None,
+            json!({"1": true, "2": 50}),
+            false,
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(msgs.len(), 1, "multi-DP mode emits one message");
+        assert_eq!(msgs[0].topic, "rustuya/event/dev-1");
+        assert!(
+            !msgs[0].payload.contains("{dp}"),
+            "literal {{dp}} must not leak into payload, got: {}",
+            msgs[0].payload
+        );
+        // Concrete shape: `{"dp":"","val":{"1":true,"2":50}}` (key order
+        // depends on serde_json::Map's preservation, so check fragments).
+        assert!(msgs[0].payload.contains(r#""dp":"""#));
+    }
+
+    #[tokio::test]
+    async fn publish_event_single_dp_renders_dp_and_value_per_dp() {
+        // Sanity: with {dp} in event_topic, single-DP mode fires and emits one
+        // message per dp with both {dp} and {value} resolved.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_event_topic = Some("{root}/event/{id}/{dp}".to_string());
+            cli.mqtt_payload_template = Some(r#"{"v":{value}}"#.to_string());
+        })
+        .await;
+
+        ctx.publish_device_event(
+            "dev-1".to_string(),
+            None,
+            None,
+            json!({"1": true, "2": 50}),
+            false,
+            true,
+        )
+        .await;
+
+        let mut msgs = drain_mqtt(&mut mqtt_rx).await;
+        msgs.sort_by(|a, b| a.topic.cmp(&b.topic));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].topic, "rustuya/event/dev-1/1");
+        assert_eq!(msgs[0].payload, r#"{"v":true}"#);
+        assert_eq!(msgs[1].topic, "rustuya/event/dev-1/2");
+        assert_eq!(msgs[1].payload, r#"{"v":50}"#);
+    }
+
+    #[tokio::test]
+    async fn publish_event_empty_string_for_missing_name_in_topic() {
+        // {name} in event_topic with a device that has no name → must render
+        // as empty (not the literal `{name}`), producing `rustuya/event//1`.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_event_topic = Some("{root}/event/{name}/{dp}".to_string());
+            cli.mqtt_payload_template = Some("{value}".to_string());
+        })
+        .await;
+
+        ctx.publish_device_event(
+            "dev-1".to_string(),
+            None,
+            None,
+            json!({"1": true}),
+            false,
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].topic, "rustuya/event//1");
+    }
+
+    // ── #6: publish_device_message wraps non-object payloads ──────────────
+
+    #[tokio::test]
+    async fn publish_message_wraps_non_object_payload_and_injects_id() {
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+
+        // Pass a plain JSON string — exercises the wrap+inject path.
+        ctx.publish_device_message(
+            "dev-1",
+            None,
+            None,
+            "error",
+            Value::String("kaboom".to_string()),
+            false,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(msgs.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&msgs[0].payload).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("dev-1"));
+        // Original payload is preserved under the `payload` field.
+        assert_eq!(
+            obj.get("payload").and_then(|v| v.as_str()),
+            Some("kaboom")
+        );
+    }
+
+    // ── #7: mqtt_drop_count is exposed in status response ─────────────────
+
+    // ── B1/B2: remove_device matched annotation + selective refresh ──────
+
+    fn sub_device(id: &str, parent_id: &str, cid: &str) -> DeviceConfig {
+        DeviceConfig {
+            id: id.into(),
+            name: None,
+            ip: None,
+            key: None,
+            version: None,
+            cid: Some(cid.into()),
+            parent_id: Some(parent_id.into()),
+            last_error_code: None,
+        }
+    }
+
+    fn named_direct(id: &str, name: &str) -> DeviceConfig {
+        DeviceConfig {
+            id: id.into(),
+            name: Some(name.into()),
+            ip: None,
+            key: Some("0123456789abcdef".into()),
+            version: None,
+            cid: None,
+            parent_id: None,
+            last_error_code: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_by_name_with_cascade_reports_name_match_count_not_total() {
+        // Regression for the matched-count semantic: removing a single
+        // gateway by name that cascades to sub-devices must report
+        // `matched: 1` (or omit it), NOT the total removed including subs.
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+
+        ctx.add_device(named_direct("gw-1", "kitchen-gateway"))
+            .await
+            .unwrap();
+        for cid in ["s1", "s2", "s3"] {
+            ctx.add_device(sub_device(&format!("sub-{cid}"), "gw-1", cid))
+                .await
+                .unwrap();
+        }
+
+        let res = ctx
+            .remove_device(None, Some(vec!["kitchen-gateway".into()]))
+            .await
+            .expect("remove by name");
+
+        // Single name match → no `matched` annotation should be added.
+        assert!(
+            !res.extra.contains_key("matched"),
+            "single name match must not be annotated as fan-out, got: {:?}",
+            res.extra
+        );
+        // But all 4 devices (gateway + 3 subs) should appear in the comma-joined id.
+        let removed: Vec<&str> = res.id.as_deref().unwrap_or("").split(',').collect();
+        assert_eq!(removed.len(), 4, "cascade should remove gateway + 3 subs");
+    }
+
+    #[tokio::test]
+    async fn remove_by_name_with_real_fanout_reports_only_name_matched_count() {
+        // Two devices share a name → name lookup fans out to both. Each is a
+        // direct device (no subs). matched should be exactly 2.
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+
+        ctx.add_device(named_direct("dev-a", "kitchen")).await.unwrap();
+        ctx.add_device(named_direct("dev-b", "kitchen")).await.unwrap();
+
+        let res = ctx
+            .remove_device(None, Some(vec!["kitchen".into()]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.extra.get("matched").and_then(|v| v.as_u64()),
+            Some(2),
+            "two name matches must report matched: 2"
+        );
+        let targets = res
+            .extra
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remove_sub_device_only_skips_listener_refresh() {
+        // Removing a sub-device alone must NOT trigger refresh — subs aren't
+        // in the listener stream, so killing the parent's TCP connection is
+        // gratuitous churn.
+        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+        ctx.add_device(named_direct("gw-1", "gw")).await.unwrap();
+        ctx.add_device(sub_device("sub-A", "gw-1", "cid-A"))
+            .await
+            .unwrap();
+        // Drain refresh signals from the adds.
+        while refresh_rx.try_recv().is_ok() {}
+
+        ctx.remove_device(Some(vec!["sub-A".into()]), None)
+            .await
+            .unwrap();
+
+        assert!(
+            refresh_rx.try_recv().is_err(),
+            "removing a sub-device only must not refresh the listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_direct_device_triggers_listener_refresh() {
+        // Sanity-check the inverse — direct-device removal MUST refresh so
+        // the unified listener stops trying to read from a dropped Device.
+        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+        ctx.add_device(named_direct("gw-1", "gw")).await.unwrap();
+        while refresh_rx.try_recv().is_ok() {}
+
+        ctx.remove_device(Some(vec!["gw-1".into()]), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            refresh_rx.try_recv(),
+            Ok(()),
+            "direct-device removal must refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_response_includes_mqtt_drop_count() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+        // Simulate a drop having happened.
+        ctx.mqtt_drop_count.store(3, Ordering::Relaxed);
+
+        let res = ctx.get_bridge_status().await;
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(
+            v.get("mqtt_drop_count").and_then(|n| n.as_u64()),
+            Some(3),
+            "status must surface the cumulative MQTT drop count"
+        );
+    }
+}
 
     #[test]
     fn parse_payload_array_merges_vars_per_item() {

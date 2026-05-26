@@ -136,6 +136,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-retain` | `MQTT_RETAIN` | `false` | Retain flag for device state messages |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
+| `--scavenger-timeout-secs`| `SCAVENGER_TIMEOUT_SECS` | `1` | Seconds the retain scavenger waits for retained MQTT messages before exiting after `remove`/`clear`. Raise on slow brokers. |
 | `--log-level`, `-l` | `LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Configuration File
@@ -312,3 +313,10 @@ when running under systemd.
 > stale retained messages on the broker for devices it no longer knows
 > about. Send a `clear` command (or per-device `remove`) first. With the
 > default `mqtt_retain = false`, deleting the file is harmless.
+
+## Further Reading
+
+[`docs/internals.md`](docs/internals.md) — deep dive on internals: device
+lifecycle, unified listener, template engine, retain scavenger, sub-device
+routing, MQTT reconnection, state persistence, and operator tips. For
+advanced users only; not needed to use the bridge.
