@@ -346,9 +346,6 @@ device-initiated status reports that use a non-standard shape, or
 sub-device messages with custom layouts. The bridge synthesizes a DPS
 dict from the raw payload so downstream consumers see a uniform format.
 
-(Heartbeats don't show up here — rustuya's per-device listener filters
-out empty-payload messages before they reach the bridge.)
-
 The default event topic includes `{type}` (`active` or `passive`) so you can
 subscribe selectively. If you use the HA-style topic without `{type}`, both
 kinds collapse onto the same topic and you lose the distinction (the
