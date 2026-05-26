@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.4] — Python 0.2.0-rc.4 — 2026-05-26
+
+Internals-review release. No rustuya dep bump; ships 10 bridge-side
+behavior fixes uncovered while writing the new [internals.md](docs/internals.md)
+deep-dive doc, plus operational caveats that the doc was previously
+silent on (broker retain/LWT compatibility, fsync cost on slow flash,
+state-file corruption recovery, name fan-out partial-failure
+semantics, and the 1280s-retry-cap gotcha).
+
 ### Added
 - New config option `scavenger_timeout_secs` / `--scavenger-timeout-secs` /
   `SCAVENGER_TIMEOUT_SECS` (default `1`). Controls how long the retained-MQTT
