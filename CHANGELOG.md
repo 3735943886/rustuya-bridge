@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `state_file` resolution is now anchored to the config file's directory
+  whenever `--config` is given:
+  - **Unset** → defaults to `<config-dir>/rustuya.json` (previously fell
+    through to the literal `"rustuya.json"` against CWD — a UX trap when
+    the bridge was launched from a directory other than the config's).
+  - **Relative** (e.g. `"mystate.json"` or `"data/state.json"` in the
+    config file) → reinterpreted as `<config-dir>/<state_file>`. Anyone
+    writing just a filename almost certainly means "next to the config",
+    not "whatever CWD I started from".
+  - **Absolute** → left untouched.
+
+  Implemented in [`Cli::resolve_default_state_file`](src/config.rs);
+  six new unit tests cover the absolute / relative / unset / no-config
+  combinations. Default `bridgectl install` is unaffected because it
+  writes an absolute `state_file` into `config.json`.
+- `bridgectl purge` now reads `state_file` from `config.json` and
+  resolves it the same way as the bridge. When the resolved path falls
+  outside `${DATA_DIR}`, the confirmation message lists it explicitly
+  and the file is removed after the data dir is wiped — closes the gap
+  where a hand-edited `state_file` pointing outside `/var/lib/rustuya/`
+  was orphaned by purge.
 - `bridgectl upgrade` now warns when it leaves the service inactive
   after an upgrade. Previous behavior preserved: a service that was
   stopped before the upgrade stays stopped (don't override operator

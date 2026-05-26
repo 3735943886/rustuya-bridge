@@ -138,6 +138,24 @@ current_version() {
     fi
 }
 
+# Echoes the absolute `state_file` path implied by $CONFIG_FILE, or empty
+# when the config file is missing/unreadable or the field is unset.
+# Resolution mirrors `Cli::resolve_default_state_file` on the bridge:
+#   - absolute path   → as-is
+#   - relative path   → joined onto the config file's directory
+# The bridgectl-managed install writes an absolute path during `install`, so
+# this matters mainly when an operator has hand-edited the config.
+resolve_state_file_from_config() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    local raw
+    raw="$(awk -F'"' '/"state_file"/ { print $4; exit }' "$CONFIG_FILE" 2>/dev/null || true)"
+    [ -n "$raw" ] && [ "$raw" != "null" ] || return 0
+    case "$raw" in
+        /*) printf '%s' "$raw" ;;
+        *)  printf '%s/%s' "$(dirname "$CONFIG_FILE")" "$raw" ;;
+    esac
+}
+
 # Echoes one of: `equal`, `newer` (when $1 is newer than $2), `older`.
 # Semver-aware: a pre-release (`X.Y.Z-rc.N`) sorts BEFORE the base
 # release (`X.Y.Z`), which plain `sort -V` gets wrong. Strategy: split
@@ -531,6 +549,15 @@ cmd_purge() {
     require_root purge
     require_systemd
 
+    # Detect a state_file that lives outside the bridgectl-managed data dir.
+    # `rm -rf "$DATA_DIR"` alone would orphan it, so we surface it in the
+    # confirmation and delete it explicitly below.
+    local external_state="" resolved_state
+    resolved_state="$(resolve_state_file_from_config)"
+    if [ -n "$resolved_state" ] && [[ "$resolved_state" != "$DATA_DIR"/* ]]; then
+        external_state="$resolved_state"
+    fi
+
     cat <<EOF
 
 ${C_YELLOW}PURGE will permanently delete:${C_RESET}
@@ -538,6 +565,11 @@ ${C_YELLOW}PURGE will permanently delete:${C_RESET}
   • unit         ${UNIT_PATH}
   • helper       ${SELF_PATH}
   • data dir     ${DATA_DIR}/   (config.json, rustuya.json, all device state)
+EOF
+    if [ -n "$external_state" ]; then
+        printf '  • state file   %s   (configured outside data dir)\n' "$external_state"
+    fi
+    cat <<EOF
   • user         ${SVC_USER}
 
 ${C_YELLOW}Heads-up about retained MQTT messages:${C_RESET}
@@ -561,6 +593,10 @@ EOF
     rm -f "$UNIT_PATH" "$BIN_PATH" "$SELF_PATH"
     systemctl daemon-reload || true
     rm -rf "$DATA_DIR"
+    if [ -n "$external_state" ] && [ -e "$external_state" ]; then
+        rm -f "$external_state"
+        log "  Removed external state file: ${external_state}"
+    fi
 
     if id -u "$SVC_USER" >/dev/null 2>&1; then
         userdel "$SVC_USER" 2>/dev/null || warn "Could not remove user '${SVC_USER}' (still has running processes?)."
