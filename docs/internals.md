@@ -121,10 +121,10 @@ spot it.
 load one from a buggy producer — `add_device` rejects `cid` without
 `parent_id`. If you see it, fix the config.
 
-Error codes shown for direct devices come from rustuya
-([rustuya/src/error.rs](../../rustuya/src/error.rs)) and live in the
-`0` and `900..=914` range. The ones you'll most likely see in
-production:
+Error codes shown for direct devices are inherited from
+[tinytuya](https://github.com/jasonacox/tinytuya) (rustuya keeps the
+same numbering for compatibility) and live in the `0` and `900..=914`
+range. The ones you'll most likely see in production:
 
 | Code | Constant         | Meaning                                |
 | ---- | ---------------- | -------------------------------------- |
@@ -355,14 +355,14 @@ onto two different kinds of DP semantics:
 - **State DPs** — values describing the *current* state of the device
   (on/off, current temperature, brightness, etc). Active and passive
   carry the same meaning here: "the device is currently in this state".
-  A passive replay of `temperature=23.5` after a heartbeat is fine —
+  A passive replay of `temperature=23.5` after a query is fine —
   it's still true. Downstream consumers can treat both interchangeably.
 - **Event DPs** — values describing a *moment-in-time event*
-  (`single_click`, `double_click`, `motion_detected`, scene buttons).
+  (`single_click`, `double_click`, `motion_detected`, etc).
   The DP value is essentially "the last thing that happened", and the
   active event is the only one that means "it happened *now*". Passive
   events for these DPs are dangerous — they re-deliver the last event
-  value on every heartbeat / reconnect / query, so an automation that
+  value on reconnect / query, so an automation that
   triggers on `single_click` will fire spuriously unless you filter to
   `type == "active"` only.
 
