@@ -496,6 +496,18 @@ cmd_upgrade() {
     if [ "$was_active" -eq 1 ]; then
         systemctl start "$SERVICE"
         ok "Service restarted."
+    else
+        # Upgrade preserves user intent: a service that was stopped before
+        # the upgrade stays stopped after. But a service that's `enabled`
+        # is one the operator wanted running at boot — if it's been
+        # inactive for a while they may have forgotten. Surface a hint
+        # rather than silently leaving them with the old "why isn't it
+        # running" puzzle.
+        if systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; then
+            warn "Service is enabled but inactive — not auto-started by upgrade."
+            printf '    Start it with: %ssudo systemctl start %s%s\n' \
+                "$C_BOLD" "$SERVICE" "$C_RESET"
+        fi
     fi
 }
 

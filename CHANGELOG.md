@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `bridgectl upgrade` now warns when it leaves the service inactive
+  after an upgrade. Previous behavior preserved: a service that was
+  stopped before the upgrade stays stopped (don't override operator
+  intent). New behavior: if the service is also `enabled` (i.e. set to
+  start at boot), print a yellow hint with the `systemctl start`
+  command instead of silently finishing. Avoids the "I upgraded, why
+  isn't it running?" confusion.
+
 ## [0.3.0-rc.4] — Python 0.2.0-rc.4 — 2026-05-26
 
 Internals-review release. No rustuya dep bump; ships 10 bridge-side
