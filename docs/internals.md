@@ -319,12 +319,12 @@ extraction.
    The bridge iterates the DPS object and emits one message per key.
 2. For DP `1`:
    - Topic: `rustuya/event/ebabc.../1`
-   - Payload: `{"type": "active", "value": true}` (with `is_passive=false`)
+   - Payload: `{"type": "active", "value": true}`
 3. For DP `2`: `rustuya/event/ebabc.../2`, payload `{"type": "active", "value": 50}`.
 4. Each message: QoS 1, `retain: true` (since `{id}` resolves and retain is
    structurally safe — see §4).
 
-**Outbound error** — device reports `{"errorCode": 1106}`:
+**Outbound error** — device reports `{"errorCode": xxx}`:
 
 1. `handle_device_event` takes the error branch
   .
@@ -348,6 +348,28 @@ The default event topic includes `{type}` (`active` or `passive`) so you can
 subscribe selectively. If you use the HA-style topic without `{type}`, both
 kinds collapse onto the same topic and you lose the distinction (the
 `"type"` field is still in the payload template if you kept it).
+
+**When the distinction actually matters.** The active/passive split maps
+onto two different kinds of DP semantics:
+
+- **State DPs** — values describing the *current* state of the device
+  (on/off, current temperature, brightness, etc). Active and passive
+  carry the same meaning here: "the device is currently in this state".
+  A passive replay of `temperature=23.5` after a heartbeat is fine —
+  it's still true. Downstream consumers can treat both interchangeably.
+- **Event DPs** — values describing a *moment-in-time event*
+  (`single_click`, `double_click`, `motion_detected`, scene buttons).
+  The DP value is essentially "the last thing that happened", and the
+  active event is the only one that means "it happened *now*". Passive
+  events for these DPs are dangerous — they re-deliver the last event
+  value on every heartbeat / reconnect / query, so an automation that
+  triggers on `single_click` will fire spuriously unless you filter to
+  `type == "active"` only.
+
+If your fleet has any event-style DPs (scene controllers, wall-switch
+buttons, PIR sensors), keep `{type}` in the event topic — or filter on
+the `"type"` field in payloads — and route only active events to
+automations. State-only fleets can collapse the topics without harm.
 
 ### 3.4 Single-DP vs multi-DP mode — the trap
 

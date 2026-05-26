@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- `docs/internals.md` §3.3: spelled out *when* active vs passive
+  matters in practice. State DPs (on/off, temperature) can treat both
+  types interchangeably; event DPs (single_click, motion_detected,
+  scene buttons) MUST filter to `type == "active"` only, or
+  automations re-fire spuriously on every heartbeat / reconnect.
+
 ### Changed
 - `state_file` resolution is now anchored to the config file's directory
   whenever `--config` is given:
