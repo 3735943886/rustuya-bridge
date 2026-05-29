@@ -1,0 +1,5 @@
+# The repo-root .gitignore ignores *.py across the Rust tree; re-include
+# the Python test sources that live in this directory.
+!*.py
+__pycache__/
+*.so

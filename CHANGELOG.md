@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Python binding: programmatic shutdown no longer deadlocks.** The
+  binding held the internal `BridgeServer` mutex across `run()` for the
+  server's entire lifetime, so `close()` could not acquire it to stop a
+  running server. On the OS-signal path `run()`'s own handler returned
+  and released the lock (racy, but worked); on the **non-signal path**
+  (host app stops the bridge programmatically) nothing told `run()` to
+  return — `close()` blocked forever on the lock, MQTT retained-message
+  cleanup never ran, and the daemon thread was hard-killed at process
+  exit (retained-state leak).
+
+  Fix: the server's `CancellationToken` (which `run()` already selects
+  on) is now created by the caller and shared *outside* the mutex.
+  `PyBridgeServer.close()` trips it before awaiting the lock — so a
+  running `run()` returns, performs graceful cleanup, and releases the
+  lock, which `close()` then acquires for final (idempotent) cleanup.
+  Verified: threaded `start()` → `stop()` joins in ~10 ms with state
+  flushed, no signal involved.
+
+### Added
+- **`PyBridgeServer.stop()`** — synchronous, lock-free "request shutdown"
+  that trips the cancel token and returns immediately (use `close()` if
+  you need to await cleanup completion). Recommended embedded pattern:
+  construct with `no_signals=True` (host owns SIGINT/SIGTERM) and drive
+  shutdown via `stop()`/`close()`.
+- **`BridgeServer::with_cancel(cli, token)`** and
+  **`BridgeServer::cancellation_token()`** in the core crate, so an
+  embedding application can own the shutdown signal. `BridgeServer::new`
+  is unchanged in behavior (allocates a fresh token internally) but is no
+  longer `const`.
+
 ### Documentation
 - `docs/internals.md` §3.3: spelled out *when* active vs passive
   matters in practice. State DPs (on/off, temperature) can treat both

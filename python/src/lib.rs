@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// Recursively converts a `serde_json::Value` into a Python object.
 fn json_value_to_py<'py>(py: Python<'py>, val: &Value) -> PyResult<Bound<'py, PyAny>> {
@@ -101,6 +102,15 @@ pub struct PyBridgeServer {
     /// Snapshot of the merged `Cli` at construction time. Used by
     /// `config_snapshot()` for inspection without locking `inner`.
     cli_snapshot: Cli,
+    /// Out-of-band shutdown handle, shared with the wrapped `BridgeServer`.
+    ///
+    /// `start()`/`start_async()` hold the `inner` mutex for the server's
+    /// ENTIRE lifetime (it's locked across `run()`), so `close()` cannot
+    /// reach the server through that mutex to stop it. This token, held
+    /// outside the mutex, lets `stop()`/`close()` trip the same
+    /// `CancellationToken` that `run()` selects on — making shutdown work
+    /// on the non-signal path (programmatic stop) and not just on SIGINT.
+    cancel: CancellationToken,
 }
 
 #[pymethods]
@@ -164,9 +174,13 @@ impl PyBridgeServer {
         cli.merge(Cli::default());
 
         let cli_snapshot = cli.clone();
+        // Create the shutdown token here and wire the same clone into the
+        // server, so we keep a handle reachable without the `inner` mutex.
+        let cancel = CancellationToken::new();
         Ok(Self {
-            inner: Arc::new(Mutex::new(BridgeServer::new(cli))),
+            inner: Arc::new(Mutex::new(BridgeServer::with_cancel(cli, cancel.clone()))),
             cli_snapshot,
+            cancel,
         })
     }
 
@@ -179,9 +193,19 @@ impl PyBridgeServer {
         json_value_to_py(py, &val)
     }
 
-    /// Start the server and block the current thread until it exits (e.g. on Ctrl+C).
-    /// The Python GIL is released while running. Cleans up MQTT before returning.
+    /// Start the server and block the current thread until it exits — either
+    /// via SIGINT/SIGTERM (unless `no_signals=True`) or a `stop()`/`close()`
+    /// call from another thread. The Python GIL is released while running.
+    /// `run()` performs graceful MQTT cleanup before returning.
+    ///
+    /// For embedded use (the host app owns signals), pass `no_signals=True`
+    /// at construction and drive shutdown with `stop()`/`close()`.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
+        if self.cancel.is_cancelled() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "server already stopped; construct a new PyBridgeServer to start again",
+            ));
+        }
         let inner = self.inner.clone();
 
         py.detach(move || {
@@ -193,7 +217,8 @@ impl PyBridgeServer {
                     .setup()
                     .await
                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                // run() now calls close() internally, which waits for MQTT task to finish
+                // run() selects on the shared cancel token and calls close()
+                // internally on shutdown, waiting for the MQTT task to flush.
                 server
                     .run()
                     .await
@@ -203,7 +228,13 @@ impl PyBridgeServer {
     }
 
     /// Start the server asynchronously in the Python asyncio event loop.
+    /// Resolves when the server shuts down (via signal or `stop()`/`close()`).
     fn start_async<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        if self.cancel.is_cancelled() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "server already stopped; construct a new PyBridgeServer to start again",
+            ));
+        }
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
@@ -212,7 +243,7 @@ impl PyBridgeServer {
                 .setup()
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            // run() now calls close() internally
+            // run() calls close() internally on shutdown.
             server
                 .run()
                 .await
@@ -222,9 +253,32 @@ impl PyBridgeServer {
         })
     }
 
-    /// Stop the bridge and clean up MQTT retained messages.
+    /// Request a graceful shutdown without blocking. Trips the shared
+    /// cancellation token; a concurrently-running `start()`/`start_async()`
+    /// returns and performs MQTT cleanup (retained-message removal, broker
+    /// disconnect, state flush).
+    ///
+    /// This is synchronous and lock-free — it does NOT wait for cleanup to
+    /// finish. Use `close()` (or join the start thread) if you need to await
+    /// completion. Safe to call before `start()` (no-op until something runs)
+    /// and idempotent.
+    fn stop(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Stop the bridge and wait for graceful MQTT cleanup to complete.
+    ///
+    /// Trips the shared cancellation token first (lock-free), so a running
+    /// `run()` returns and releases the server lock; then acquires the lock
+    /// and runs final cleanup (idempotent if `run()` already did it). This
+    /// is what makes programmatic shutdown work even when no OS signal is
+    /// delivered — the previous implementation could deadlock waiting for a
+    /// lock that `run()` held for the whole server lifetime.
     fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let inner = self.inner.clone();
+        // Trip the token BEFORE awaiting the lock: this unblocks run(), which
+        // releases `inner` once it has finished its own graceful close.
+        self.cancel.cancel();
         future_into_py(py, async move {
             inner
                 .lock()

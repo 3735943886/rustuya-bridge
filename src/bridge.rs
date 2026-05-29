@@ -250,10 +250,16 @@ impl BridgeContext {
     /// Constructs a new bridge context. Verifies write permission to the state
     /// file, then loads existing device configs and prepares background channels.
     ///
+    /// The `cancel` token is owned by the caller (e.g. [`crate::server::BridgeServer`]
+    /// or a language binding) so shutdown can be requested from outside this
+    /// context — `run()` selects on it. Pass a fresh `CancellationToken::new()`
+    /// if you have no external handle to wire up.
+    ///
     /// # Errors
     /// Returns an error if the state file directory is not writable.
     pub async fn new(
         cli: &Cli,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(
         Arc<Self>,
         mpsc::Receiver<Option<MqttMessage>>,
@@ -346,7 +352,7 @@ impl BridgeContext {
             refresh_tx,
             scavenger_tx: tokio::sync::Mutex::new(None),
             mqtt_drop_count: AtomicU64::new(0),
-            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel,
         });
 
         Ok((ctx, mqtt_tx_receiver, save_rx, refresh_rx))
@@ -2128,7 +2134,9 @@ mod context_tests {
         };
         customize(&mut cli);
         let (ctx, mqtt_rx, save_rx, refresh_rx) =
-            BridgeContext::new(&cli).await.expect("new context");
+            BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                .await
+                .expect("new context");
         (ctx, tmp, mqtt_rx, save_rx, refresh_rx)
     }
 

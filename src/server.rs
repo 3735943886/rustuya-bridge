@@ -2,11 +2,16 @@ use crate::bridge::BridgeContext;
 use crate::config::Cli;
 use anyhow::Result;
 use log::info;
+use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
 pub struct BridgeServer {
     cli: Cli,
+    /// Shutdown signal. `run()` selects on this; anything holding a clone
+    /// (a signal handler, a language binding, an embedding application) can
+    /// request a graceful shutdown without owning the `BridgeServer` itself.
+    cancel: CancellationToken,
     ctx: Option<Arc<BridgeContext>>,
     /// Handles for `state_saver` and `device_listener` - aborted on close
     background_handles: Vec<tokio::task::JoinHandle<()>>,
@@ -15,14 +20,34 @@ pub struct BridgeServer {
 }
 
 impl BridgeServer {
+    /// Creates a server with a freshly-allocated shutdown token. Use
+    /// [`Self::with_cancel`] if you need to hold a clone of the token (e.g.
+    /// to request shutdown from another thread or an FFI boundary).
     #[must_use]
-    pub const fn new(cli: Cli) -> Self {
+    pub fn new(cli: Cli) -> Self {
+        Self::with_cancel(cli, CancellationToken::new())
+    }
+
+    /// Creates a server that shuts down when `cancel` is tripped. The caller
+    /// keeps a clone of `cancel` to request shutdown out-of-band — crucially,
+    /// without contending for any lock that wraps the server (the running
+    /// `run()` future would otherwise hold it for the whole server lifetime).
+    #[must_use]
+    pub fn with_cancel(cli: Cli, cancel: CancellationToken) -> Self {
         Self {
             cli,
+            cancel,
             ctx: None,
             background_handles: Vec::new(),
             mqtt_handle: None,
         }
+    }
+
+    /// Returns a clone of the shutdown token. Tripping it (`.cancel()`) makes
+    /// a running `run()` return and perform graceful MQTT cleanup.
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     /// Initializes the bridge context, starts background tasks (state saver, device
@@ -44,7 +69,8 @@ impl BridgeServer {
         );
         self.cli.session_id = Some(session_id);
 
-        let (ctx, mqtt_tx_rx, save_rx, refresh_rx) = BridgeContext::new(&self.cli).await?;
+        let (ctx, mqtt_tx_rx, save_rx, refresh_rx) =
+            BridgeContext::new(&self.cli, self.cancel.clone()).await?;
 
         ctx.check_existing_instance().await?;
 
@@ -145,5 +171,74 @@ impl BridgeServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Standalone (no-broker) config writing state into `tmp`, in embedded
+    /// mode (`no_signals`) so shutdown is driven purely by the cancel token —
+    /// the same path the Python binding's `stop()`/`close()` use.
+    fn standalone_cli(tmp: &TempDir) -> Cli {
+        Cli {
+            mqtt_broker: None,
+            no_signals: Some(true),
+            state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
+            ..Cli::default()
+        }
+    }
+
+    /// The core of the embedded-shutdown fix: tripping the externally-held
+    /// cancellation token must make a running `run()` return AND perform its
+    /// graceful close — with no OS signal, and without the caller holding the
+    /// server. Bounds the whole thing in a timeout so a regression (run()
+    /// hanging) fails loudly instead of deadlocking the suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_cancel_stops_run_without_signal() {
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("state.json");
+        let token = CancellationToken::new();
+        let mut server = BridgeServer::with_cancel(standalone_cli(&tmp), token.clone());
+        server.setup().await.expect("setup");
+
+        let run = tokio::spawn(async move { server.run().await });
+
+        // Simulate an external close()/stop() from another thread/loop.
+        token.cancel();
+
+        let res = tokio::time::timeout(Duration::from_secs(5), run).await;
+        res.expect("run() did not return within 5s of external cancel")
+            .expect("run task panicked")
+            .expect("run() returned Err");
+
+        // Graceful close ran end-to-end: ctx.close() → save_state() flushed
+        // the state file (in a real broker setup this is also where retained
+        // messages get cleared and the broker disconnect happens).
+        assert!(
+            state_path.exists(),
+            "graceful shutdown should have flushed the state file"
+        );
+    }
+
+    /// A token already tripped before `run()` starts must make `run()` return
+    /// promptly rather than block — a closed server never hangs the caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_before_run_returns_promptly() {
+        let tmp = TempDir::new().unwrap();
+        let mut server = BridgeServer::new(standalone_cli(&tmp));
+        let token = server.cancellation_token();
+        server.setup().await.expect("setup");
+
+        token.cancel(); // pre-cancelled
+
+        let run = tokio::spawn(async move { server.run().await });
+        let res = tokio::time::timeout(Duration::from_secs(5), run).await;
+        res.expect("run() hung on an already-cancelled token")
+            .expect("run task panicked")
+            .expect("run() returned Err");
     }
 }
