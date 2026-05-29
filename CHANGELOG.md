@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.5] — Python 0.2.0-rc.5 — 2026-05-29
+
+Embedded-shutdown release. The headline fix lets a host application
+(e.g. rustuya-manager) stop the bridge programmatically — without an OS
+signal — and have graceful MQTT cleanup actually run. Also folds in the
+`state_file` resolution / `bridgectl` polish that had accumulated under
+[Unreleased]. No rustuya dep bump; no on-the-wire MQTT/topic change.
+
 ### Fixed
 - **Python binding: programmatic shutdown no longer deadlocks.** The
   binding held the internal `BridgeServer` mutex across `run()` for the
