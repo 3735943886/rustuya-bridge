@@ -65,6 +65,55 @@ def test_threaded_start_then_stop_no_signal(tmp_path):
     assert os.path.exists(state_file), "graceful close should have flushed state file"
 
 
+def test_start_async_then_close(tmp_path):
+    """asyncio path: start_async() task + await close() → graceful shutdown.
+
+    Sync test driving asyncio.run so it needs no pytest-asyncio plugin.
+    Proves close() (which trips the shared token synchronously at call
+    time) unblocks a run() launched via start_async(), and the task
+    resolves with state flushed.
+    """
+    import asyncio
+
+    async def scenario():
+        srv, state_file = _standalone_server(str(tmp_path))
+
+        # start_async() returns a pyo3 awaitable (not a coroutine); wrap it.
+        async def _await(aw):
+            return await aw
+
+        task = asyncio.create_task(_await(srv.start_async()))
+        await asyncio.sleep(1.0)
+        assert not task.done(), "start_async ended before close()"
+        await srv.close()
+        await asyncio.wait_for(task, timeout=5)
+        assert task.exception() is None, f"start_async errored: {task.exception()}"
+        assert os.path.exists(state_file), "graceful close should have flushed state"
+
+    asyncio.run(scenario())
+
+
+def test_start_async_then_stop(tmp_path):
+    """asyncio path: start_async() task + sync stop() → graceful shutdown."""
+    import asyncio
+
+    async def scenario():
+        srv, state_file = _standalone_server(str(tmp_path))
+
+        async def _await(aw):
+            return await aw
+
+        task = asyncio.create_task(_await(srv.start_async()))
+        await asyncio.sleep(1.0)
+        assert not task.done()
+        srv.stop()  # synchronous trip, then let the task observe it
+        await asyncio.wait_for(task, timeout=5)
+        assert task.exception() is None, f"start_async errored: {task.exception()}"
+        assert os.path.exists(state_file)
+
+    asyncio.run(scenario())
+
+
 def test_stop_is_idempotent(tmp_path):
     """stop() before start and twice in a row must not raise."""
     srv, _ = _standalone_server(str(tmp_path))
