@@ -20,7 +20,10 @@ use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex as StdMutex;
 
-pub const MQTT_CHANNEL_CAPACITY: usize = 100;
+// 200 (not 100) because cache mode doubles per-active-event push count
+// (active delta + state snapshot). At 100, a sustained 50-msg/sec active
+// burst against a slow broker could trip `try_send_mqtt`'s 500ms timeout.
+pub const MQTT_CHANNEL_CAPACITY: usize = 200;
 pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
 pub const LISTENER_TIMEOUT_SECS: u64 = 300;
