@@ -133,7 +133,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
 | `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
 | `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | `{value}` | MQTT payload template (e.g., `{"val": {value}}`) |
-| `--mqtt-retain` | `MQTT_RETAIN` | `false` | `true` enables the cache + snapshot retain model: live deltas publish to `{type}=active` no-retain, merged state snapshots to `{type}=passive` retained — recommended for HA-style state recovery. `false` (default) passes events through with no retain. See [docs/internals.md §4](docs/internals.md). |
+| `--mqtt-retain` | `MQTT_RETAIN` | `false` | `true` enables the cache + snapshot retain model: live deltas publish to `{type}=active` no-retain, merged state snapshots to `{type}=passive` retained — recommended when subscribers need to recover device state immediately on reconnect. `false` (default) passes events through with no retain. See [docs/internals.md §4](docs/internals.md). |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
 | `--scavenger-timeout-secs`| `SCAVENGER_TIMEOUT_SECS` | `1` | Seconds the retain scavenger waits for retained MQTT messages before exiting after `remove`/`clear`. Raise on slow brokers. |
@@ -170,15 +170,15 @@ Run with:
 
 #### Why a single state change can show up as two messages
 
-With `--mqtt-retain true` (recommended for HA-style state recovery), a single DP change publishes **two** event messages — this is intentional, not a duplicate:
+With `--mqtt-retain true` (recommended when subscribers need to recover device state on reconnect), a single DP change publishes **two** event messages — this is intentional, not a duplicate:
 
 ```text
 rustuya/event/active/aabbccdd11223344eeff   →  {"1":true}                  (no retain)
 rustuya/event/passive/aabbccdd11223344eeff  →  {"1":true,"2":50,"9":0}     (retain)
 ```
 
-- **`active`** — the **delta** that just changed (only the DPs that moved). Published without retain so each event fires exactly once — useful as an automation trigger (e.g., HA "on state change" rules) when you want to react to the moment of change.
-- **`passive`** — the **full merged snapshot** of the device, retained. A subscriber that connects late (HA reconnect, manager restart) reads it once and immediately knows the current state without waiting for the next device update.
+- **`active`** — the **delta** that just changed (only the DPs that moved). Published without retain so each event fires exactly once — useful as an automation trigger when you want to react to the moment of change.
+- **`passive`** — the **full merged snapshot** of the device, retained. A subscriber that connects late (after a reconnect or restart) reads it once and immediately knows the current state without waiting for the next device update.
 
 If you only need *current state*, subscribing to `passive` is sufficient. If you need *event semantics*, watch `active`. Many consumers want both — `active` for the moment, `passive` for state at rest.
 
