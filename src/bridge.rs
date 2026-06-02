@@ -602,17 +602,32 @@ impl BridgeContext {
             return;
         }
 
-        // Locate DPS either at the root or nested under "data" (sub-device/gateway).
-        let root_dps = payload_obj.and_then(|o| o.get("dps"));
+        // Locate DPS either nested under "data" or at the root.
+        //
+        // Active vs passive is determined by the wrapper shape, which maps to
+        // the underlying Tuya cmd:
+        //   Active  — device-initiated push (cmd 8 / DP_STATUS, similar).
+        //             Payload: {"data": {"dps": {...}}, "protocol": ..., "t": ...}
+        //   Passive — DP_QUERY response (cmd 16), periodic status reports, or
+        //             other non-push events.
+        //             Payload: {"dps": {...}}  (no `data` wrapper)
+        //
+        // The presence of `data.dps` is what distinguishes active. When
+        // `data` is present its `dps` is the canonical source; when only the
+        // root `dps` exists, that is the source. If neither is present we
+        // fall through to a synthesis path that uses `data` directly (older
+        // sub-device firmwares occasionally emit periodic status this way).
         let data_dps = payload_obj
             .and_then(|o| o.get("data"))
             .and_then(|d| d.as_object())
             .and_then(|do_| do_.get("dps"));
+        let root_dps = payload_obj.and_then(|o| o.get("dps"));
 
-        let is_passive = root_dps.is_none() && data_dps.is_none();
-        let mut dps = root_dps.or(data_dps).cloned().unwrap_or_else(|| {
-            // Passive path: synthesise DPS from "data" (flattening nested "data.data"),
-            // falling back to the raw payload.
+        let is_passive = data_dps.is_none();
+        let mut dps = data_dps.or(root_dps).cloned().unwrap_or_else(|| {
+            // Fallback: no `dps` field anywhere. Synthesise from `data`
+            // (flattening nested `data.data`) so downstream sees a uniform
+            // shape. Always treated as passive (no `data.dps` push).
             if let Some(obj) = payload.as_object()
                 && let Some(data) = obj.get("data")
             {
@@ -3399,6 +3414,59 @@ mod context_tests {
             snapshots[0].topic.ends_with("/1"),
             "snapshot must be for the changed DP only (got '{}')",
             snapshots[0].topic
+        );
+    }
+
+    // ── active/passive detection ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_event_classifies_data_dps_wrapper_as_active() {
+        // User-confirmed wire shape: device-initiated DP_STATUS (cmd 8)
+        // wraps the dps under `data`. Bridge must classify as active and
+        // publish to {type}=active.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        let payload = r#"{"data":{"dps":{"1":false,"2":false}},"protocol":4,"t":1780376055}"#;
+        ctx.handle_device_event("dev-1", payload.into()).await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert!(
+            msgs.iter().any(|m| m.topic.contains("/active/")),
+            "data.dps wrapper must produce an active publish (got topics: {:?})",
+            msgs.iter().map(|m| &m.topic).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_classifies_root_dps_as_passive() {
+        // User-confirmed wire shape: DP_QUERY response (cmd 16) puts dps
+        // at the root with no `data` wrapper. Must be classified as
+        // passive: snapshot publish only, no active.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        let payload = r#"{"dps":{"1":false,"14":"off","2":false,"7":0,"8":0}}"#;
+        ctx.handle_device_event("dev-1", payload.into()).await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert!(
+            !msgs.iter().any(|m| m.topic.contains("/active/")),
+            "root dps without data wrapper must NOT produce active publish"
+        );
+        assert!(
+            msgs.iter().any(|m| m.topic.contains("/passive/")),
+            "passive must still produce a snapshot publish"
         );
     }
 

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.9] — Python 0.2.0-rc.9 — 2026-06-02
+
+Long-standing active/passive misclassification corrected during
+rc.8 field testing.
+
+### Fixed
+- **DP_QUERY responses (root `dps`) were silently labeled as active.**
+  The detection rule `is_passive = root_dps.is_none() && data_dps.is_none()`
+  in `handle_device_event` treated *any* dps presence as active, but
+  the Tuya wire shape is:
+    - Active push (cmd 8 / DP_STATUS-like): `{"data":{"dps":...},...}`
+    - Passive (cmd 16 / DP_QUERY response):  `{"dps":{...}}`
+  Discriminator is the `data` wrapper, not the presence of `dps`. As
+  a result every periodic status report and every `get` response was
+  being routed to `{type}=active`, while `{type}=passive` only ever
+  saw the rare no-dps fallback path. HA event automations subscribed
+  to active received noisy query-response replays. Bug pre-dated
+  rc.6 cache mode; the cache-mode split made it newly visible
+  because user-side filtering on `{type}` started to matter.
+
+  Fix: `is_passive = data_dps.is_none()`. Source preference now
+  `data.dps` then root `dps` (was the other way around).
+
+### Documentation
+- `docs/internals.md` §3.3 already describes the active/passive
+  semantics correctly — no change there. Inline code comments
+  in `handle_device_event` clarified to spell out the wire shapes.
+
 ## [0.3.0-rc.8] — Python 0.2.0-rc.8 — 2026-06-02
 
 Hot-fix on top of rc.7 for a cache-mode bug discovered in field
