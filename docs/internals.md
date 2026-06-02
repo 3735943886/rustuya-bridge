@@ -363,7 +363,7 @@ active/passive split maps onto two different kinds of DP semantics:
   `single_click` from a heartbeat or query means nothing happened — the
   device just kept its last value cached. Automations that trigger on
   `single_click` must filter to `type == "active"` only, or use the
-  ☆ retain model (§4) which only retains snapshots, never event-style
+  cache-mode retain model (§4) which only retains snapshots, never event-style
   deltas.
 
 ### 3.4 Single-DP vs multi-DP mode — the trap
@@ -422,24 +422,24 @@ Empty-string substitutions can produce slightly surprising shapes:
 
 ---
 
-## 4. Retain semantics — ★/☆ modes
+## 4. Retain semantics — pass-through and cache modes
 
 The bridge has **two distinct retain models** selected by `mqtt_retain`:
 
-- ★ mode (`mqtt_retain=false`, default) — historical pass-through. Each
+- pass-through mode (`mqtt_retain=false`, default) — historical pass-through. Each
   device event publishes one MQTT message with `retain=false`. No
   in-memory cache, no seed phase. State recovery on consumer reload is
   the consumer's problem.
-- ☆ mode (`mqtt_retain=true`) — separates **live deltas** (active events,
+- cache mode (`mqtt_retain=true`) — separates **live deltas** (active events,
   no retain) from **retained state snapshots** (the merged cache,
   published with retain). HA-style state recovery works automatically
   without spuriously re-firing event automations on reconnect.
 
-The rest of this section is about ☆.
+The rest of this section is about cache mode.
 
-### 4.1 Why ☆ exists — the partial-overwrite bug it fixes
+### 4.1 Why cache mode exists — the partial-overwrite bug it fixes
 
-Before ☆, retain=true users hit a silent data-loss bug: in **multi-DP
+Before cache mode, retain=true users hit a silent data-loss bug: in **multi-DP
 mode** (event topic without `{dp}`) the bridge published one MQTT
 message per device update containing the *incoming* DPS dict. When a
 device sent a partial passive update (battery report only, RSSI only,
@@ -448,7 +448,7 @@ partial dict — wiping out the full state the previous heartbeat had
 established. HA reload after a partial would then see "switch state =
 unknown" until the next full heartbeat (sometimes minutes).
 
-☆ fixes this by keeping a **per-device merged DPS cache** in the bridge
+Cache mode fixes this by keeping a **per-device merged DPS cache** in the bridge
 and publishing snapshots from the cache, not from the incoming message.
 A battery-only passive merges into the cache; the published snapshot
 still contains the cached switch state, temperature, etc.
@@ -478,16 +478,16 @@ returns the keys that actually changed, and the snapshot publish is
 gated on that being non-empty. A device hammering the same heartbeat
 every 30s won't generate snapshot publishes after the first.
 
-### 4.3 `{type}` is mandatory in ☆
+### 4.3 `{type}` is mandatory in cache mode
 
 Because the active delta and the snapshot must land on different
 topics (otherwise HA receives the active twice — once live, once via
 the retained snapshot — and re-fires automations), the event topic
 **must contain `{type}`**. If `mqtt_retain=true` is set with a topic
 that doesn't, the bridge logs an `ERROR` at startup and **downgrades
-to ★** rather than refusing to start. The bridge stays operational
+to pass-through mode** rather than refusing to start. The bridge stays operational
 with safe (no-retain) semantics; the user fixes the template and
-restarts to enable ☆.
+restarts to enable cache mode.
 
 ### 4.4 The retain gate (`IdentifierSet`) — unchanged
 
@@ -496,7 +496,7 @@ whether `retain=true` is safe. The rule:
 
 - Scan the event topic and payload templates once at startup, record which
   of `{id}`/`{name}`/`{cid}` they reference → `event_identifiers`.
-- For each retained publish (snapshot in ☆): retain only if at least
+- For each retained publish (snapshot in cache mode): retain only if at least
   one referenced identifier *actually has a value for this device*.
 - `{id}` is always satisfiable (every device has an id). `{name}` and
   `{cid}` are only satisfiable when the device's config has a non-empty
@@ -515,7 +515,7 @@ retain becomes structurally impossible to scavenge — the bridge warns
 
 ### 4.5 The seed phase — recovering broker state on startup
 
-On bridge startup in ☆ mode, the cache is empty. If the bridge starts
+On bridge startup in cache mode, the cache is empty. If the bridge starts
 publishing snapshots immediately, the first publish for each device
 contains only whatever DPs that device has reported so far in this
 session — usually one (whatever active fired first). That partial

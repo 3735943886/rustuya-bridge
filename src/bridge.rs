@@ -86,10 +86,10 @@ pub struct BridgeContext {
     pub cancel: tokio_util::sync::CancellationToken,
 
     /// Per-device merged DPS cache. `Some` only when `mqtt_retain=true` and the
-    /// event topic carries `{type}` (☆ mode). `None` in ★ mode (pass-through).
+    /// event topic carries `{type}` (cache mode). `None` in pass-through mode (pass-through).
     pub cache: Option<Arc<DpsCache>>,
 
-    /// Set when the broker-retained seed phase has completed (☆ only). While
+    /// Set when the broker-retained seed phase has completed (cache mode only). While
     /// `false`, cache-driven snapshot publishes are deferred and the
     /// device id is recorded in `seed_pending` for a single flush at seed end.
     pub seed_done: AtomicBool,
@@ -100,7 +100,7 @@ pub struct BridgeContext {
     pub seed_pending: StdMutex<BTreeSet<String>>,
 
     /// MQTT wildcard topic used to recover cached state from the broker on
-    /// startup (☆ only, default payload template only). Derived from the event
+    /// startup (cache mode only, default payload template only). Derived from the event
     /// topic with `{type}=passive` and other placeholders as `+`.
     pub seed_state_wildcard: Option<String>,
 
@@ -374,13 +374,13 @@ impl BridgeContext {
             );
         }
 
-        // ☆ mode (mqtt_retain=true) splits each device update across a no-retain
+        // cache mode (mqtt_retain=true) splits each device update across a no-retain
         // delta on `{type}=active` and a retained snapshot on `{type}=passive`,
         // so the event topic *must* contain `{type}` to separate them. If it
         // doesn't, both publishes would collide on the same topic — the live
         // active would be received twice by HA event automations (once
         // no-retain, once via the retained snapshot), spuriously re-firing.
-        // Rather than refuse to start, log loudly and downgrade to ★ so the
+        // Rather than refuse to start, log loudly and downgrade to pass-through mode so the
         // bridge stays operational with safe (no-retain) semantics.
         let event_has_type = mqtt_event_topic.contains("{type}");
         let effective_retain = if cli.mqtt_retain() && !event_has_type {
@@ -426,7 +426,7 @@ impl BridgeContext {
             (None, None)
         };
 
-        // If we can't seed (★ or unsupported template), pre-flip seed_done so
+        // If we can't seed (pass-through mode or unsupported template), pre-flip seed_done so
         // publish_device_event doesn't defer snapshots indefinitely.
         let initial_seed_done = !seed_supported;
 
@@ -703,7 +703,7 @@ impl BridgeContext {
         let config_topic =
             crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
 
-        // ── Seed phase (☆ only) ──────────────────────────────────────────
+        // ── Seed phase (cache mode only) ──────────────────────────────────────────
         // After the first ConnAck the bridge subscribes to its own retained
         // state topic to recover prior-session snapshots, then unsubscribes
         // and calls `on_seed_complete()` once either the broker quiets (200ms
@@ -762,14 +762,14 @@ impl BridgeContext {
                                 if let Err(e) = client.subscribe(&config_topic, rumqttc::QoS::AtLeastOnce).await {
                                     error!("Config subscription failed: {e}");
                                 }
-                                // First-connect seed bootstrap (☆ only).
+                                // First-connect seed bootstrap (cache mode only).
                                 if let Some(w) = &seed_wildcard
                                     && !self.seed_done.load(Ordering::Acquire)
                                     && !seed_active
                                 {
                                     match client.subscribe(w, rumqttc::QoS::AtLeastOnce).await {
                                         Ok(()) => {
-                                            info!("Seeding ☆ cache from broker via '{w}'");
+                                            info!("Seeding cache from broker via '{w}'");
                                             seed_active = true;
                                             seed_deadline = Some(Instant::now() + SEED_HARD_CAP);
                                         }
@@ -1308,8 +1308,8 @@ impl BridgeContext {
 
     /// Renders the configured event topic / payload templates for a device
     /// update and pushes each rendered (topic, payload) onto the MQTT outbound
-    /// channel. Single low-level publish helper used by both ★ pass-through
-    /// and ☆ active/snapshot publishes; retain is decided by the caller.
+    /// channel. Single low-level publish helper used by both pass-through
+    /// and cache-mode active/snapshot publishes; retain is decided by the caller.
     async fn publish_event_templates(
         &self,
         id: &str,
@@ -1335,11 +1335,11 @@ impl BridgeContext {
 
     /// Publishes a device event.
     ///
-    /// ★ mode (`mqtt_retain=false`): pass-through — render templates with the
+    /// pass-through mode (`mqtt_retain=false`): pass-through — render templates with the
     /// incoming `is_passive` and publish a single MQTT message without retain.
     /// This preserves the historical bridge behavior for retain-off users.
     ///
-    /// ☆ mode (`mqtt_retain=true`): two parallel routes.
+    /// cache mode (`mqtt_retain=true`): two parallel routes.
     /// 1. *Direct route* (active only): publish the incoming delta on
     ///    `{type}=active`, no retain — for HA event automations etc.
     /// 2. *Cache route*: merge the incoming DPs into the in-memory cache; if
@@ -1371,7 +1371,7 @@ impl BridgeContext {
         let name_opt = name.as_deref();
         let cid_opt = cid.as_deref();
 
-        // ★ pass-through. mqtt_retain=false here either by user choice or by
+        // pass-through. mqtt_retain=false here either by user choice or by
         // the {type}-missing downgrade in `BridgeContext::new`.
         if !self.mqtt_retain {
             self.publish_event_templates(&id, name_opt, cid_opt, &dps, is_passive, false)
@@ -1379,13 +1379,13 @@ impl BridgeContext {
             return;
         }
 
-        // ☆ direct route: active delta to {type}=active, no retain.
+        // cache-mode direct route: active delta to {type}=active, no retain.
         if !is_passive {
             self.publish_event_templates(&id, name_opt, cid_opt, &dps, false, false)
                 .await;
         }
 
-        // ☆ cache route: merge then publish snapshot (gated by seed_done).
+        // cache-mode cache route: merge then publish snapshot (gated by seed_done).
         let Some(cache) = &self.cache else { return };
         let Some(dps_obj) = dps.as_object() else { return };
         let changed = cache.merge(&id, dps_obj);
@@ -1403,7 +1403,7 @@ impl BridgeContext {
     }
 
     /// Match an incoming topic against the seed wildcard regex and return
-    /// `(id, optional_dp)`. Returns `None` if not in ☆ seed-enabled mode or
+    /// `(id, optional_dp)`. Returns `None` if not in cache-mode seed-enabled mode or
     /// the topic doesn't match.
     fn match_seed_topic(&self, topic: &str) -> Option<(String, Option<String>)> {
         let regex = self.seed_state_regex.as_ref()?;
@@ -1415,7 +1415,7 @@ impl BridgeContext {
 
     /// Drives the seed-phase transition: flip `seed_done`, drain `seed_pending`,
     /// and publish one snapshot per device whose cache changed during the seed
-    /// window. No-op if seed_done was already true (e.g. star-mode bypass).
+    /// window. No-op if seed_done was already true (e.g. pass-through bypass).
     pub async fn on_seed_complete(self: &Arc<Self>) {
         if self.seed_done.swap(true, Ordering::AcqRel) {
             return;
@@ -2015,8 +2015,8 @@ impl BridgeContext {
             self.request_refresh();
         }
 
-        // Drop any cached DPS snapshot for removed devices (☆ mode only —
-        // ★ has no cache). Done before scavenger so we don't republish a
+        // Drop any cached DPS snapshot for removed devices (cache mode only —
+        // pass-through mode has no cache). Done before scavenger so we don't republish a
         // snapshot in a race with the cleanup.
         if let Some(cache) = &self.cache {
             for target_id in &targets {
@@ -2067,7 +2067,7 @@ impl BridgeContext {
             targets
         };
 
-        // Drop the full ☆-mode cache alongside config wipe.
+        // Drop the full cache-mode cache alongside config wipe.
         if let Some(cache) = &self.cache {
             for t in &scavenger_targets {
                 cache.remove(&t.id);
@@ -2815,31 +2815,31 @@ mod context_tests {
         );
     }
 
-    // ── ☆ mode bring-up ────────────────────────────────────────────────────
+    // ── cache mode bring-up ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn star_mode_skips_cache_when_retain_off() {
+    async fn passthrough_mode_skips_cache_when_retain_off() {
         let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(false);
         })
         .await;
         assert!(!ctx.mqtt_retain);
-        assert!(ctx.cache.is_none(), "★ mode must not allocate a cache");
+        assert!(ctx.cache.is_none(), "pass-through mode must not allocate a cache");
     }
 
     #[tokio::test]
-    async fn star2_mode_allocates_cache_with_type_in_topic() {
+    async fn cache_mode_allocates_cache_with_type_in_topic() {
         let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
-            // Default event topic contains {type}, so ☆ stays enabled.
+            // Default event topic contains {type}, so cache mode stays enabled.
         })
         .await;
         assert!(ctx.mqtt_retain);
-        assert!(ctx.cache.is_some(), "☆ mode must allocate a cache");
+        assert!(ctx.cache.is_some(), "cache mode must allocate a cache");
     }
 
     #[tokio::test]
-    async fn star2_mode_downgrades_to_star_when_type_missing() {
+    async fn cache_mode_downgrades_to_passthrough_when_type_missing() {
         let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
             // Topic without {type} would let active/snapshot publishes
@@ -2857,7 +2857,7 @@ mod context_tests {
         );
     }
 
-    // ── ☆ publish routing ──────────────────────────────────────────────────
+    // ── cache-mode publish routing ──────────────────────────────────────────────────
 
     async fn add_named_direct(ctx: &Arc<BridgeContext>, id: &str) {
         ctx.add_device(DeviceConfig {
@@ -2875,7 +2875,7 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star2_active_publishes_delta_then_snapshot_after_seed() {
+    async fn cache_mode_active_publishes_delta_then_snapshot_after_seed() {
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })
@@ -2901,7 +2901,7 @@ mod context_tests {
         assert_eq!(
             msgs.len(),
             2,
-            "active in ☆ must produce a delta + a snapshot publish"
+            "active in cache mode must produce a delta + a snapshot publish"
         );
         let active = msgs.iter().find(|m| !m.retain).expect("active no-retain");
         let snapshot = msgs.iter().find(|m| m.retain).expect("snapshot retained");
@@ -2910,7 +2910,7 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star2_passive_publishes_only_snapshot_after_seed() {
+    async fn cache_mode_passive_publishes_only_snapshot_after_seed() {
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })
@@ -2933,13 +2933,13 @@ mod context_tests {
         .await;
 
         let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(msgs.len(), 1, "passive in ☆ must produce snapshot only");
+        assert_eq!(msgs.len(), 1, "passive in cache mode must produce snapshot only");
         assert!(msgs[0].retain, "snapshot must be retained");
         assert!(msgs[0].topic.contains("/passive/"));
     }
 
     #[tokio::test]
-    async fn star2_partial_passive_preserves_other_cached_keys() {
+    async fn cache_mode_partial_passive_preserves_other_cached_keys() {
         // The bug this whole redesign fixes: a battery-only passive update
         // must not wipe the previously-known state DPs from the retained
         // snapshot. The cache merges, so the snapshot we publish still has
@@ -2983,7 +2983,7 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star2_snapshot_publish_deferred_during_seed() {
+    async fn cache_mode_snapshot_publish_deferred_during_seed() {
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })
@@ -3015,7 +3015,7 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star2_dedupes_unchanged_values() {
+    async fn cache_mode_dedupes_unchanged_values() {
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })
@@ -3054,8 +3054,8 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star_mode_publishes_single_passthrough() {
-        // Sanity: ★ retains the historical one-publish-per-event shape.
+    async fn passthrough_mode_publishes_single_message() {
+        // Sanity: pass-through mode retains the historical one-publish-per-event shape.
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(false);
         })
@@ -3074,22 +3074,22 @@ mod context_tests {
         .await;
 
         let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(msgs.len(), 1, "★ must publish exactly one message");
-        assert!(!msgs[0].retain, "★ never retains");
+        assert_eq!(msgs.len(), 1, "pass-through must publish exactly one message");
+        assert!(!msgs[0].retain, "pass-through never retains");
         assert!(msgs[0].topic.contains("/active/"));
     }
 
-    // ── ☆ seed phase ───────────────────────────────────────────────────────
+    // ── cache-mode seed phase ───────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn star2_default_template_arms_seed_wildcard() {
+    async fn cache_mode_default_template_arms_seed_wildcard() {
         let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })
         .await;
         assert!(
             ctx.seed_state_wildcard.is_some(),
-            "default template + ☆ must produce a seed wildcard"
+            "default template + cache mode must produce a seed wildcard"
         );
         assert!(ctx.seed_state_regex.is_some());
         assert!(
@@ -3099,7 +3099,7 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star2_custom_template_disables_seed() {
+    async fn cache_mode_custom_template_disables_seed() {
         let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
             cli.mqtt_payload_template = Some("{\"v\":{value}}".into());
@@ -3217,7 +3217,7 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star2_runtime_added_device_publishes_immediately_after_seed() {
+    async fn cache_mode_runtime_added_device_publishes_immediately_after_seed() {
         // Devices added after seed_done flips should not be silently queued
         // for an already-finished flush — their first cache change must
         // publish right away.
@@ -3254,7 +3254,7 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star2_single_dp_mode_publishes_snapshot_per_dp() {
+    async fn cache_mode_single_dp_mode_publishes_snapshot_per_dp() {
         // Single-DP topic template → each DP gets its own snapshot message.
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
@@ -3288,7 +3288,7 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn star2_remove_drops_cached_snapshot() {
+    async fn cache_mode_remove_drops_cached_snapshot() {
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })

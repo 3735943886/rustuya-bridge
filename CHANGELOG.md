@@ -30,28 +30,28 @@ on HA reconnect. Retain-off users (the default) are unaffected.
   published with `retain=false` to a dedicated `{type}=active` topic.
 
 ### Added
-- **☆ mode** (`mqtt_retain=true`): in-memory DPS cache + two publish
+- **cache mode** (`mqtt_retain=true`): in-memory DPS cache + two publish
   routes — direct (active deltas, no retain, `{type}=active`) and cache
   (merged snapshots, retain, `{type}=passive`).
-- **Seed phase** (☆ only): on first MQTT connect the bridge subscribes
+- **Seed phase** (cache mode only): on first MQTT connect the bridge subscribes
   to its own state wildcard to recover prior-session snapshots from the
   broker, drains them into the cache, then unsubscribes. Hard cap 5s,
   quiet 200ms. Snapshot publishes are deferred for any device that
   changes during the seed window; one batched flush at seed end.
-- **`{type}` validation** at startup: ☆ requires `{type}` in
+- **`{type}` validation** at startup: cache mode requires `{type}` in
   `mqtt_event_topic` to separate active from snapshot publishes. If
-  missing, bridge logs ERROR and downgrades to ★ (`mqtt_retain=false`)
+  missing, bridge logs ERROR and downgrades to pass-through mode (`mqtt_retain=false`)
   rather than refusing to start.
 - **`src/dps_cache.rs`** — new module housing `DpsCache` with
   `merge`/`fill_missing`/`snapshot`/`remove`.
 
 ### Changed
-- **`mqtt_retain` semantic clarified:** in ☆ mode the flag now means
+- **`mqtt_retain` semantic clarified:** in cache mode the flag now means
   "publish full state snapshots on `{type}=passive` retained, and live
   deltas on `{type}=active` no-retain." Active deltas are no longer
   retained even when the flag is on. Previously `mqtt_retain=true`
   applied retain uniformly to every publish.
-- **Default `mqtt_retain` stays `false`** (★ mode, current behavior).
+- **Default `mqtt_retain` stays `false`** (pass-through mode, current behavior).
   No silent breaking change for the majority of users.
 
 ### Migration
@@ -60,12 +60,12 @@ on HA reconnect. Retain-off users (the default) are unaffected.
 | `mqtt_retain=false` (default) | No change. |
 | `mqtt_retain=true`, default topic | Auto-enrolls into the new model. Broker-resident retained from the old (buggy) layout is overwritten by the first full publish per device. Snapshot publishes are deferred ≤5s on startup to absorb broker retained. |
 | `mqtt_retain=true`, custom event topic *with* `{type}` | Same as above. |
-| `mqtt_retain=true`, custom event topic *without* `{type}` | Bridge logs ERROR, runs in ★ mode (no retain). Add `{type}` to enable ☆. |
-| `mqtt_retain=true`, custom `mqtt_payload_template` | Bridge logs WARN, runs in ☆ mode but **skips the seed phase**. First publish per device overwrites broker retained until next full heartbeat. |
+| `mqtt_retain=true`, custom event topic *without* `{type}` | Bridge logs ERROR, runs in pass-through mode (no retain). Add `{type}` to enable cache mode. |
+| `mqtt_retain=true`, custom `mqtt_payload_template` | Bridge logs WARN, runs in cache mode but **skips the seed phase**. First publish per device overwrites broker retained until next full heartbeat. |
 
 ### Documentation
 - `docs/internals.md` §3.3 (active vs passive) and §4 (retain
-  semantics) rewritten around the ★/☆ split. New §4.5 covers the seed
+  semantics) rewritten around the pass-through/cache split. New §4.5 covers the seed
   phase mechanics; §4.6 documents known seed limitations.
 
 ## [0.3.0-rc.5] — Python 0.2.0-rc.5 — 2026-05-29

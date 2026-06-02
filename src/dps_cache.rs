@@ -1,6 +1,6 @@
 //! Per-device merged DPS cache.
 //!
-//! Only instantiated in ☆ mode (`mqtt_retain=true`); ★ mode passes device
+//! Only instantiated in cache mode (`mqtt_retain=true`); pass-through mode passes device
 //! messages straight through without caching. The cache is the source of truth
 //! for retained state snapshots published on the `type=passive` topic.
 //!
