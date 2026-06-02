@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`bridgectl --prerelease` now correctly picks the newest pre-release.**
+  GitHub's `GET /repos/.../releases` is documented as `created_at desc`
+  but in practice can return entries out of order — observed with
+  `v0.3.0-rc.10` landing 5th in the response despite being the newest.
+  `api_latest_tag()` now sorts the filtered tags by GitHub's monotonic
+  release `id` (largest = newest) instead of trusting the response order.
+  Both the `jq` path and the `awk` fallback are fixed; the awk path
+  extracts the release id from the top-level `url` field (ends in
+  `/releases/<id>`) rather than the `author.id` that sits between it
+  and `tag_name` in the JSON.
+
 ## [0.3.0-rc.10] — Python 0.2.0-rc.10 — 2026-06-02
 
 Seed phase no longer restricted to the default payload template.

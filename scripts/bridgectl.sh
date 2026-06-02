@@ -99,26 +99,40 @@ detect_target() {
 
 api_latest_tag() {
     # Default: stable only (`releases/latest` excludes pre-releases by design).
-    # With PRERELEASE=1: query the full release list and pick the first entry
-    # whose tag matches `v*` (the binary-publish tag scheme). GitHub orders
-    # `/releases` by created_at desc, so the first match is the newest release
-    # of either kind — pre-release or stable. Use this when you want the
-    # absolute newest build (e.g. installing/upgrading to an RC).
+    # With PRERELEASE=1: query the full release list and pick the newest entry
+    # whose tag matches `v*` (the binary-publish tag scheme). We sort by the
+    # numeric release id (GitHub's monotonic counter — largest = newest)
+    # rather than trusting the API's response order: `/releases` is documented
+    # as created_at desc but in practice can return entries out of order
+    # (e.g. a release whose assets were uploaded after creation can land below
+    # older releases). The id-based sort is stable regardless.
     #
-    # The awk fallback intentionally avoids `exit` after the first match: under
-    # `set -o pipefail`, closing the pipe early triggers SIGPIPE on the printf
-    # writer (which matters for the ~50KB `/releases` response) and fails the
-    # whole pipeline. Instead we read all input and gate the print on a `found`
-    # flag.
+    # The awk fallback (when jq is unavailable) does the same: it pairs each
+    # release's id (extracted from its top-level `url` ending in
+    # `/releases/<id>`, NOT the per-asset URL ending in
+    # `/releases/assets/<id>`, NOT the `author.id` that appears between the
+    # release id and tag_name in the JSON) with its tag_name and prints the
+    # tag with the highest id. It also avoids `exit` after a match: under
+    # `set -o pipefail`, closing the pipe early triggers SIGPIPE on the
+    # printf writer (matters for the ~50KB `/releases` response) and fails
+    # the whole pipeline.
     local url body
     if [ "$PRERELEASE" -eq 1 ]; then
         url="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases"
         body="$(curl -fsSL "$url" 2>/dev/null)" || return 1
         if command -v jq >/dev/null 2>&1; then
-            printf '%s' "$body" | jq -r '[.[] | select(.tag_name | startswith("v"))][0].tag_name // empty'
+            printf '%s' "$body" \
+                | jq -r '[.[] | select(.tag_name | startswith("v"))] | sort_by(.id) | last.tag_name // empty'
         else
             printf '%s' "$body" \
-                | awk -F'"' '!found && /"tag_name"/ && $4 ~ /^v/ { print $4; found=1 }'
+                | awk -F'"' '
+                    $2 == "url" && $4 ~ /\/releases\/[0-9]+$/ {
+                        n = split($4, parts, "/"); cur_id = parts[n] + 0
+                    }
+                    $2 == "tag_name" && $4 ~ /^v/ {
+                        if (cur_id > max_id) { max_id = cur_id; max_tag = $4 }
+                    }
+                    END { if (max_tag != "") print max_tag }'
         fi
     else
         url="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/latest"
