@@ -2983,7 +2983,7 @@ mod context_tests {
             Some("name-dev-1".into()),
             None,
             serde_json::json!({"1": true, "2": 50}),
-            true, // passive heartbeat
+            true, // passive periodic status report
             true,
         )
         .await;

@@ -16,13 +16,13 @@ on HA reconnect. Retain-off users (the default) are unaffected.
 ### Fixed
 - **`mqtt_retain=true` no longer overwrites the retained snapshot with a
   partial passive update.** Previously, in multi-DP mode (event topic
-  without `{dp}`), a battery-only or RSSI-only passive heartbeat would
-  publish *that single field* as the device's retained snapshot — wiping
-  the switch state, temperature, brightness etc. that the previous full
-  heartbeat had established. HA reload would then show "unknown" until
-  the next full report (sometimes minutes). The bridge now keeps a
-  per-device merged DPS cache and publishes snapshots from the cache,
-  so partial updates merge instead of replacing.
+  without `{dp}`), a battery-only or RSSI-only periodic device-initiated
+  report would publish *that single field* as the device's retained
+  snapshot — wiping the switch state, temperature, brightness etc. that
+  the previous full status report had established. HA reload would then
+  show "unknown" until the next full report (sometimes minutes). The
+  bridge now keeps a per-device merged DPS cache and publishes snapshots
+  from the cache, so partial updates merge instead of replacing.
 - **Active events no longer re-fire HA event automations on reconnect.**
   Active deltas (button presses, motion fires) used to be published
   retained; on HA reload the broker re-delivered the retained active
@@ -62,7 +62,7 @@ on HA reconnect. Retain-off users (the default) are unaffected.
 | `mqtt_retain=true`, default topic | Auto-enrolls into the new model. Broker-resident retained from the old (buggy) layout is overwritten by the first full publish per device. Snapshot publishes are deferred ≤5s on startup to absorb broker retained. |
 | `mqtt_retain=true`, custom event topic *with* `{type}` | Same as above. |
 | `mqtt_retain=true`, neither topic nor payload template has `{type}` | Cache mode still enabled (reload path safe). Bridge logs WARN about potential live double-fire on event automations subscribed to the snapshot topic. Add `{type}` to either template if event automations matter. |
-| `mqtt_retain=true`, custom `mqtt_payload_template` | Bridge logs WARN, runs in cache mode but **skips the seed phase**. First publish per device overwrites broker retained until next full heartbeat. |
+| `mqtt_retain=true`, custom `mqtt_payload_template` | Bridge logs WARN, runs in cache mode but **skips the seed phase**. First publish per device overwrites broker retained until the next full device status report (active push or DP_QUERY response). |
 
 ### Documentation
 - `docs/internals.md` §3.3 (active vs passive) and §4 (retain
@@ -113,7 +113,8 @@ signal — and have graceful MQTT cleanup actually run. Also folds in the
   matters in practice. State DPs (on/off, temperature) can treat both
   types interchangeably; event DPs (single_click, motion_detected,
   scene buttons) MUST filter to `type == "active"` only, or
-  automations re-fire spuriously on every heartbeat / reconnect.
+  automations re-fire spuriously on every periodic status report or
+  reconnect.
 
 ### Changed
 - `state_file` resolution is now anchored to the config file's directory

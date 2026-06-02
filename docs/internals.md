@@ -360,7 +360,8 @@ active/passive split maps onto two different kinds of DP semantics:
 - **Event DPs** — values describing a *moment-in-time event*
   (`single_click`, `double_click`, `motion_detected`, etc). Only an
   active event means "this happened *now*"; a passive replay of
-  `single_click` from a heartbeat or query means nothing happened — the
+  `single_click` from a periodic status report or DP_QUERY response
+  means nothing happened — the
   device just kept its last value cached. Automations that trigger on
   `single_click` must filter to `type == "active"` only, or use the
   cache-mode retain model (§4) which only retains snapshots, never event-style
@@ -444,9 +445,9 @@ mode** (event topic without `{dp}`) the bridge published one MQTT
 message per device update containing the *incoming* DPS dict. When a
 device sent a partial passive update (battery report only, RSSI only,
 periodic timer tick) the retained snapshot on the broker shrank to that
-partial dict — wiping out the full state the previous heartbeat had
-established. HA reload after a partial would then see "switch state =
-unknown" until the next full heartbeat (sometimes minutes).
+partial dict — wiping out the full state the previous full status report
+had established. HA reload after a partial would then see "switch state =
+unknown" until the next full device status report (sometimes minutes).
 
 Cache mode fixes this by keeping a **per-device merged DPS cache** in the bridge
 and publishing snapshots from the cache, not from the incoming message.
@@ -475,8 +476,9 @@ a snapshot publish too. Passive events skip the direct route entirely.
 
 Identical-value updates are deduped at the cache layer — `cache.merge()`
 returns the keys that actually changed, and the snapshot publish is
-gated on that being non-empty. A device hammering the same heartbeat
-every 30s won't generate snapshot publishes after the first.
+gated on that being non-empty. A device sending the same periodic
+status report every 30s won't generate snapshot publishes after the
+first.
 
 ### 4.3 `{type}` and live double-fire
 
@@ -576,8 +578,8 @@ of truth at that point.
   the bridge warns at startup, **skips the seed phase**, and pre-flips
   `seed_done=true`. The first publish per device will overwrite the
   broker's prior retained — a one-time partial state until the device
-  reports its full state via heartbeat. Not catastrophic, but
-  documented.
+  reports its full state via an active push or DP_QUERY response.
+  Not catastrophic, but documented.
 - **Hard cap can truncate large fleets.** With 1000+ devices on a slow
   broker, 5s may not be enough to receive all retained messages.
   Uncached devices get the same first-publish overwrite as the custom
