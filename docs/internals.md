@@ -574,7 +574,7 @@ of truth at that point.
 
 - **Non-JSON payload templates disable seed.** The seed parser uses a
   sentinel-substitution + JSON-tree-walk reverse parser
-  ([src/payload_parse.rs](../src/payload_parse.rs)), so any
+  ([src/payload.rs](../src/payload.rs)), so any
   *JSON-shaped* `mqtt_payload_template` works:
   `{value}` (default), `{"v":{value}}`, `{"type":"{type}","value":{value}}`,
   `{"id":"{id}","data":{"dps":{dps}}}`, etc. Only text-style templates
@@ -1214,6 +1214,86 @@ Bump it via config:
 
 or CLI: `--scavenger-timeout-secs 5`. Cost is just a 5-second delay after
 `remove`/`clear` before the temporary scavenger client disconnects.
+
+---
+
+## 11. Python binding API — `pyrustuyabridge`
+
+Besides the `PyBridgeServer` class, the [pyrustuyabridge](../python/src/lib.rs)
+module exposes six free functions so any Python code can interpret the
+bridge's wire format **identically to the bridge itself**. Every one is a thin wrapper over the canonical Rust implementation
+in [src/template.rs](../src/template.rs) / [src/payload.rs](../src/payload.rs)
+— there is no second implementation to drift out of sync. If you need to match
+the bridge's topic/payload behavior from Python, call these rather than
+re-deriving the logic.
+
+They split into two groups: **forward/topic helpers** (build outbound, match
+inbound topics) and **parsers** (interpret payloads).
+
+| Function | Signature | Group | Role |
+| --- | --- | --- | --- |
+| `tpl_to_wildcard` | `(template, root_topic) -> str` | forward | Topic template → MQTT subscription wildcard (known keys → `+`). Mirrors what the bridge subscribes with. |
+| `render_template` | `(template, vars: dict) -> str` | forward | Substitute `{key}` placeholders from `vars`. Unknown keys are left as the literal `{key}` (same as the bridge). |
+| `match_topic` | `(topic, template) -> dict \| None` | parser (topic) | Extract `{id}`/`{dp}`/… from a received topic; `None` if it doesn't match. Variable-free templates do exact-string compare. |
+| `parse_payload` | `(payload, vars: dict) -> value` | parser (command) | The bridge's permissive **inbound command** parser (`parse_mqtt_payload`): merges topic vars, wraps scalars under `dps` when `{dp}` is present, applies the `set` heuristic (§9). |
+| `parse_payload_with_template` | `(payload, template) -> dict \| None` | parser (reverse) | **Reverse of `render_template` for payloads** — given a payload the bridge rendered and the template, recover each placeholder's captured value. `None` when not reversible (see below). This is the seed-phase parser (§4.5–4.6). |
+| `validate_payload_template` | `(template) -> (ok: bool, message: str)` | parser (reverse) | Pre-flight check: can this payload template be reverse-parsed at all? `message` is human-readable and explains the failure when `ok` is false. |
+
+### 11.1 The reverse parser is a *partial* inverse
+
+`parse_payload_with_template` is **not** a total inverse of `render_template`,
+and that's by design. It recovers placeholder values by walking the template
+and payload as parallel JSON trees and capturing whatever the payload holds at
+each placeholder slot. This is mathematically exact **only when** the template
+is JSON-shaped (valid JSON after each placeholder is replaced by a value slot)
+and every placeholder occupies a complete JSON value — then JSON's own
+delimiters make each placeholder's boundary unambiguous and round-tripping is
+lossless and type-exact.
+
+Outside that domain it **fails closed** (`None`) rather than guessing:
+
+- non-JSON / text-style templates (`v={value};ts={timestamp}`) — not valid
+  JSON even after sentinel substitution;
+- placeholders concatenated or embedded in a string literal (`"pre-{value}"`,
+  `"{a}{b}"`) — boundary is genuinely ambiguous, so the substituted result
+  isn't valid JSON and the parse declines;
+- payload structure doesn't match the template (different keys, array length,
+  literal mismatch);
+- no recognized placeholders in the template.
+
+There is no path that returns a *wrong* answer — the structural walk matches
+object size/keys, array length, and literals strictly. Use
+`validate_payload_template` at startup to surface a non-reversible
+`mqtt_payload_template` before it silently disables the seed phase.
+
+What forward rendering injects but the reverse can't (and needn't) recover —
+`{timestamp}` (generated at render time, not input state), the per-DP identity
+in single-DP mode (it lives in the **topic**, not the payload — recovered
+separately from `match_topic`), and optional metadata vars that render to `""`
+— is either re-derivable elsewhere or irrelevant to DPS state, so seed recovery
+isn't affected. See §4.5–4.6 for how the seed phase uses this.
+
+### 11.2 Example
+
+```python
+import pyrustuyabridge as rb
+
+# Forward: build what the bridge would publish
+topic = rb.render_template("{root}/event/{id}/{dp}",
+                           {"root": "rustuya", "id": "ebabc", "dp": "1"})
+# -> "rustuya/event/ebabc/1"
+
+# Reverse: recover placeholders from a rendered payload
+caps = rb.parse_payload_with_template(
+    '{"type":"passive","value":true}',
+    '{"type":"{type}","value":{value}}',
+)
+# -> {"type": "passive", "value": True}
+
+# Pre-flight a user's template
+ok, msg = rb.validate_payload_template("v={value};ts={timestamp}")
+# -> (False, "payload template '...' isn't valid JSON after placeholder ...")
+```
 
 ---
 

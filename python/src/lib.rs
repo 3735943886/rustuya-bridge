@@ -82,8 +82,8 @@ fn render_template_py(template: &str, vars: HashMap<String, String>) -> String {
 /// Parses an MQTT payload into a structured value, merging in topic variables.
 ///
 /// Mirrors `rustuyabridge::payload::parse_mqtt_payload` — the bridge's own
-/// command parser — so the manager interprets custom payload templates
-/// identically to the bridge.
+/// command parser — so custom payload templates are interpreted identically
+/// to the bridge.
 #[pyfunction]
 #[pyo3(name = "parse_payload")]
 #[allow(clippy::needless_pass_by_value)]
@@ -104,11 +104,6 @@ fn parse_payload_py<'py>(
 /// Returns `None` when the template can't be reverse-parsed — non-JSON
 /// shape (e.g. `v={value};ts={timestamp}`), payload structure doesn't
 /// match the template, no recognized placeholders, or malformed JSON.
-///
-/// This is the canonical Rust implementation of the algorithm formerly
-/// duplicated as `rustuya_manager.payload.parse_payload_with_template` —
-/// downstream tooling should prefer this binding for consistency with the
-/// bridge's own seed phase.
 #[pyfunction]
 #[pyo3(name = "parse_payload_with_template")]
 fn parse_payload_with_template_py<'py>(

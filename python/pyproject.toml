@@ -39,8 +39,8 @@ text = """
 Python bindings for [rustuya-bridge](https://github.com/3735943886/rustuya-bridge),
 an MQTT bridge for managing Tuya devices via the Tuya Local API.
 
-This package exposes the bridge server as an embeddable component so a Python
-manager can run alongside it and interpret MQTT topics/payloads identically to
+This package exposes the bridge server as an embeddable component, so Python
+code can run it alongside and interpret MQTT topics/payloads identically to
 the native bridge.
 
 ## Install
@@ -72,13 +72,17 @@ asyncio.run(main())
 
 ## Helpers
 
-The module also exposes topic/payload utilities for managers that need to
+The module also exposes topic/payload utilities for code that needs to
 match the bridge's wire format:
 
 - `tpl_to_wildcard(template, root_topic)` — template → MQTT wildcard.
 - `match_topic(topic, template)` — returns extracted variables or `None`.
 - `render_template(template, vars)` — substitutes `{key}` placeholders.
 - `parse_payload(payload, vars)` — parses an MQTT payload into a structured value.
+- `parse_payload_with_template(payload, template)` — reverse of `render_template`:
+  recovers placeholder values from a rendered payload, or `None` if not reversible.
+- `validate_payload_template(template)` — `(ok, message)`; checks whether a payload
+  template can be reverse-parsed.
 
 See the [project repository](https://github.com/3735943886/rustuya-bridge)
 for full documentation.
