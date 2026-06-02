@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.10] — Python 0.2.0-rc.10 — 2026-06-02
+
+Seed phase no longer restricted to the default payload template.
+
+### Added
+- **`payload_parse` module** — Rust port of the reverse-template parser
+  that has been living standalone in `rustuya-manager/payload.py`.
+  Algorithm: sentinel-substitute every recognized `{var}` placeholder in
+  the template, JSON-parse the sentinelled template and the incoming
+  payload, walk both trees in parallel, capture each sentinel position's
+  payload value. Handles arbitrary JSON-shaped templates — nested
+  objects, arrays, multiple placeholders. Returns `None` on structural
+  mismatch or non-JSON templates.
+- **Python bindings** for the new helpers:
+  `pyrustuyabridge.parse_payload_with_template(payload, template)` and
+  `pyrustuyabridge.validate_payload_template(template) -> (ok, msg)`.
+  These will eventually replace the duplicate Python implementation in
+  `rustuya-manager.payload` — manager refactor is a separate step.
+
+### Changed
+- **Cache-mode seed phase now works with any JSON-shaped
+  `mqtt_payload_template`**, not just the default `{value}`. Previously
+  any custom template (e.g. `{"type":"{type}","value":{value}}`) would
+  log a WARN and skip seed entirely, leaving the first publish per
+  device to overwrite the broker's prior retained. Now those templates
+  feed `parse_payload_with_template` and seed runs normally.
+  Only text-style templates (`v={value};ts={timestamp}` — not valid
+  JSON after sentinel substitution) still skip seed; the WARN now
+  spells out the specific reason.
+
+### Documentation
+- `docs/internals.md` §4.6 (Seed limitations) updated — "custom payload
+  templates disable seed" reframed as "non-JSON payload templates
+  disable seed", with the new module linked.
+
 ## [0.3.0-rc.9] — Python 0.2.0-rc.9 — 2026-06-02
 
 Long-standing active/passive misclassification corrected during

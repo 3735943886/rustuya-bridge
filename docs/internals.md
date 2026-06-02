@@ -572,19 +572,22 @@ of truth at that point.
 
 ### 4.6 Seed limitations
 
-- **Custom payload templates disable seed.** The seed parser only
-  reverses the default `{value}` template. If you set
-  `mqtt_payload_template` to anything else (e.g. `{"v":{value}}`),
-  the bridge warns at startup, **skips the seed phase**, and pre-flips
-  `seed_done=true`. The first publish per device will overwrite the
+- **Non-JSON payload templates disable seed.** The seed parser uses a
+  sentinel-substitution + JSON-tree-walk reverse parser
+  ([src/payload_parse.rs](../src/payload_parse.rs)), so any
+  *JSON-shaped* `mqtt_payload_template` works:
+  `{value}` (default), `{"v":{value}}`, `{"type":"{type}","value":{value}}`,
+  `{"id":"{id}","data":{"dps":{dps}}}`, etc. Only text-style templates
+  (`v={value};ts={timestamp}` — not valid JSON even after sentinel
+  substitution) can't be reversed. Those skip the seed phase, pre-flip
+  `seed_done=true`, and the first publish per device overwrites the
   broker's prior retained — a one-time partial state until the device
   reports its full state via an active push or DP_QUERY response.
-  Not catastrophic, but documented.
 - **Hard cap can truncate large fleets.** With 1000+ devices on a slow
   broker, 5s may not be enough to receive all retained messages.
-  Uncached devices get the same first-publish overwrite as the custom
-  template case. There is no config knob for the hard cap in v1
-  (YAGNI); add an issue if you hit this.
+  Uncached devices get the same first-publish overwrite as the
+  unparseable template case. There is no config knob for the hard cap
+  in v1 (YAGNI); add an issue if you hit this.
 
 ### 4.7 The scavenger
 

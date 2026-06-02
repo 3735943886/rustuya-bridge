@@ -5,6 +5,7 @@ use rustuyabridge::bridge::{
     BridgeContext, compile_topic_regex, match_topic, render_template, tpl_to_wildcard,
 };
 use rustuyabridge::config::Cli;
+use rustuyabridge::payload_parse::{parse_payload_with_template, validate_payload_template};
 use rustuyabridge::server::BridgeServer;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -94,6 +95,48 @@ fn parse_payload_py<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let val = BridgeContext::parse_mqtt_payload(payload, &vars);
     json_value_to_py(py, &val)
+}
+
+/// Reverse of the bridge's `render_template` for payloads: given the
+/// payload template (with `{var}` placeholders) and a concrete payload the
+/// bridge produced from it, return a dict mapping each placeholder name to
+/// the captured value.
+///
+/// Returns `None` when the template can't be reverse-parsed — non-JSON
+/// shape (e.g. `v={value};ts={timestamp}`), payload structure doesn't
+/// match the template, no recognized placeholders, or malformed JSON.
+///
+/// This is the canonical Rust implementation of the algorithm formerly
+/// duplicated as `rustuya_manager.payload.parse_payload_with_template` —
+/// downstream tooling should prefer this binding for consistency with the
+/// bridge's own seed phase.
+#[pyfunction]
+#[pyo3(name = "parse_payload_with_template")]
+fn parse_payload_with_template_py<'py>(
+    py: Python<'py>,
+    payload: &str,
+    template: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(captures) = parse_payload_with_template(payload, template) else {
+        return Ok(None);
+    };
+    let dict = PyDict::new(py);
+    for (k, v) in &captures {
+        dict.set_item(k, json_value_to_py(py, v)?)?;
+    }
+    Ok(Some(dict.into_any()))
+}
+
+/// Checks whether a payload template is reverse-parseable by the bridge's
+/// seed phase. Returns `(ok, message)` — `message` is human-readable and
+/// explains the failure when `ok` is `false`.
+#[pyfunction]
+#[pyo3(name = "validate_payload_template")]
+fn validate_payload_template_py(template: &str) -> (bool, String) {
+    match validate_payload_template(template) {
+        Ok(()) => (true, "Template recognized.".to_string()),
+        Err(msg) => (false, msg),
+    }
 }
 
 #[pyclass]
@@ -299,5 +342,7 @@ fn pyrustuyabridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(match_topic_py, m)?)?;
     m.add_function(wrap_pyfunction!(render_template_py, m)?)?;
     m.add_function(wrap_pyfunction!(parse_payload_py, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_payload_with_template_py, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_payload_template_py, m)?)?;
     Ok(())
 }

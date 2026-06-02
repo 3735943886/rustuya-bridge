@@ -198,25 +198,9 @@ where
     res
 }
 
-/// Parses a broker-retained seed message payload into a `dps` map. Only
-/// handles the default `{value}` payload template: multi-DP mode payloads
-/// are the full dps JSON object; single-DP mode payloads are the per-DP
-/// value (the `dp` is recovered from the topic). Returns `None` on malformed
-/// payloads or templates this parser can't reverse — caller drops silently.
-fn parse_seed_payload(
-    payload: &str,
-    dp: Option<&str>,
-) -> Option<serde_json::Map<String, Value>> {
-    let v: Value = serde_json::from_str(payload).ok()?;
-    match dp {
-        Some(dp_key) => {
-            let mut m = serde_json::Map::new();
-            m.insert(dp_key.to_string(), v);
-            Some(m)
-        }
-        None => v.as_object().cloned(),
-    }
-}
+// Seed payload parsing is delegated to [`crate::payload_parse::parse_seed_dps`]
+// which short-circuits the default `{value}` template and delegates to the
+// template-aware reverse parser for custom JSON-shaped templates.
 
 /// Converts MQTT template to wildcard for subscription
 #[must_use]
@@ -405,20 +389,24 @@ impl BridgeContext {
         let cache = effective_retain.then(|| Arc::new(DpsCache::new()));
 
         // The seed phase parses broker-retained snapshots into the cache.
-        // Parsing only works when payload_template is the default `{value}`
-        // (so the published payload IS the dps dict, or the per-DP value in
-        // single-DP mode). For custom templates we can't generally reverse
-        // the wrapper, so seed is disabled and the bridge will overwrite
-        // broker retained on first publish per device. The user is warned
-        // once at startup.
+        // Default `{value}` is handled directly; any other template is run
+        // through the JSON-tree reverse parser in [`crate::payload_parse`]
+        // (sentinel + parallel walk), which works for any JSON-shaped
+        // template. Only text-style templates (e.g. `v={value};ts={timestamp}`)
+        // remain unparseable — those disable seed entirely and the bridge
+        // will overwrite broker retained on first publish per device.
         let seed_supported = effective_retain
-            && matches!(
-                cli.mqtt_payload_template.as_deref(),
-                None | Some("{value}")
-            );
-        if effective_retain && !seed_supported {
+            && match cli.mqtt_payload_template.as_deref() {
+                None | Some("{value}") => true,
+                Some(tpl) => crate::payload_parse::validate_payload_template(tpl).is_ok(),
+            };
+        if effective_retain
+            && !seed_supported
+            && let Some(tpl) = cli.mqtt_payload_template.as_deref()
+            && let Err(why) = crate::payload_parse::validate_payload_template(tpl)
+        {
             warn!(
-                "Custom mqtt_payload_template ('{payload_tpl}') is incompatible with the broker seed phase; the bridge will overwrite broker retained on first publish per device"
+                "Seed phase disabled: {why}. The bridge will overwrite broker retained on first publish per device."
             );
         }
 
@@ -817,9 +805,11 @@ impl BridgeContext {
                                 if seed_active && p.retain
                                     && let Some((id, dp_opt)) = self.match_seed_topic(&p.topic)
                                 {
-                                    if let Some(dps) =
-                                        parse_seed_payload(&payload, dp_opt.as_deref())
-                                        && let Some(cache) = &self.cache
+                                    if let Some(dps) = crate::payload_parse::parse_seed_dps(
+                                        &payload,
+                                        dp_opt.as_deref(),
+                                        self.mqtt_payload_template.as_deref(),
+                                    ) && let Some(cache) = &self.cache
                                     {
                                         cache.fill_missing(&id, &dps);
                                         seed_last_msg = Some(Instant::now());
@@ -3174,22 +3164,11 @@ mod context_tests {
         );
     }
 
-    #[tokio::test]
-    async fn cache_mode_custom_template_disables_seed() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_payload_template = Some("{\"v\":{value}}".into());
-        })
-        .await;
-        assert!(
-            ctx.seed_state_wildcard.is_none(),
-            "custom template must skip seed wildcard"
-        );
-        assert!(
-            ctx.seed_done.load(Ordering::Acquire),
-            "seed_done must be pre-flipped so snapshots aren't deferred"
-        );
-    }
+    // (The historical "custom template disables seed" assertion was retired
+    // — JSON-shaped templates are now seed-parseable. The retained-shape
+    // gate lives in `payload_parse::validate_payload_template`; coverage
+    // for both the supported and unsupported cases is in two new tests
+    // below, near the other ☆ seed setup.)
 
     #[tokio::test]
     async fn match_seed_topic_extracts_id_in_multi_dp_mode() {
@@ -3219,30 +3198,40 @@ mod context_tests {
         assert_eq!(dp.as_deref(), Some("42"));
     }
 
-    #[test]
-    fn parse_seed_payload_multi_dp_uses_full_object() {
-        let dps = parse_seed_payload(r#"{"1": true, "2": 50}"#, None).unwrap();
-        assert_eq!(dps.get("1"), Some(&json!(true)));
-        assert_eq!(dps.get("2"), Some(&json!(50)));
+    // parse_seed_payload-equivalent unit tests live in
+    // `crate::payload_parse::tests` (default + custom-template scenarios).
+
+    #[tokio::test]
+    async fn cache_mode_custom_template_with_parseable_shape_enables_seed() {
+        // A JSON-shaped custom template is now seed-parseable — the
+        // historical "default template only" restriction is gone.
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            cli.mqtt_payload_template =
+                Some(r#"{"type":"{type}","value":{value}}"#.into());
+        })
+        .await;
+        assert!(
+            ctx.seed_state_wildcard.is_some(),
+            "JSON-shaped template must arm the seed wildcard"
+        );
+        assert!(
+            !ctx.seed_done.load(Ordering::Acquire),
+            "seed_done must start false so the seed phase runs"
+        );
     }
 
-    #[test]
-    fn parse_seed_payload_single_dp_wraps_value_under_dp_key() {
-        let dps = parse_seed_payload("true", Some("13")).unwrap();
-        assert_eq!(dps.get("13"), Some(&json!(true)));
-    }
-
-    #[test]
-    fn parse_seed_payload_returns_none_on_garbage() {
-        assert!(parse_seed_payload("not json", None).is_none());
-        assert!(parse_seed_payload("", Some("1")).is_none());
-    }
-
-    #[test]
-    fn parse_seed_payload_multi_dp_rejects_scalar_payload() {
-        // Multi-DP mode expects an object; a scalar means custom template.
-        assert!(parse_seed_payload("true", None).is_none());
-        assert!(parse_seed_payload(r#""string""#, None).is_none());
+    #[tokio::test]
+    async fn cache_mode_unparseable_template_skips_seed() {
+        // Text-style template (e.g. `key=val` style) can't be sentinelled
+        // into valid JSON → seed disabled, seed_done pre-flipped.
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            cli.mqtt_payload_template = Some("v={value};ts={timestamp}".into());
+        })
+        .await;
+        assert!(ctx.seed_state_wildcard.is_none());
+        assert!(ctx.seed_done.load(Ordering::Acquire));
     }
 
     #[tokio::test]
