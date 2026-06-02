@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.8] — Python 0.2.0-rc.8 — 2026-06-02
+
+Hot-fix on top of rc.7 for a cache-mode bug discovered in field
+testing.
+
+### Fixed
+- **Single-DP snapshot republished every cached DP, not just the
+  changed one.** In cache mode with a `{dp}`-bearing event topic, an
+  event that changed DP 1 would also emit `type=passive` retained
+  snapshots for every other DP currently in the device's cache —
+  surfacing spurious "events" for DPs whose broker retained value
+  hadn't changed at all. The cache is per-device but single-DP topics
+  are per-(device, DP), so each per-DP topic already had the correct
+  retained from prior snapshots. The per-event path now publishes
+  only the DPs that actually changed; the seed-end flush still
+  re-asserts the full cache as one-shot initial sync. Multi-DP mode
+  (one topic per device, full DPS dict in payload) is unaffected.
+
 ## [0.3.0-rc.7] — Python 0.2.0-rc.7 — 2026-06-02
 
 Follow-up to rc.6 — fixes the `{type}` validation that wrongly
