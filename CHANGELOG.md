@@ -38,10 +38,11 @@ on HA reconnect. Retain-off users (the default) are unaffected.
   broker, drains them into the cache, then unsubscribes. Hard cap 5s,
   quiet 200ms. Snapshot publishes are deferred for any device that
   changes during the seed window; one batched flush at seed end.
-- **`{type}` validation** at startup: cache mode requires `{type}` in
-  `mqtt_event_topic` to separate active from snapshot publishes. If
-  missing, bridge logs ERROR and downgrades to pass-through mode (`mqtt_retain=false`)
-  rather than refusing to start.
+- **`{type}` distinguishability check** at startup: cache mode WARN
+  (no downgrade) if `{type}` is absent from both `mqtt_event_topic`
+  and `mqtt_payload_template`. Reload re-fires are safe regardless;
+  the warn flags potential live double-fire on event automations
+  subscribed to the snapshot topic.
 - **`src/dps_cache.rs`** — new module housing `DpsCache` with
   `merge`/`fill_missing`/`snapshot`/`remove`.
 
@@ -60,7 +61,7 @@ on HA reconnect. Retain-off users (the default) are unaffected.
 | `mqtt_retain=false` (default) | No change. |
 | `mqtt_retain=true`, default topic | Auto-enrolls into the new model. Broker-resident retained from the old (buggy) layout is overwritten by the first full publish per device. Snapshot publishes are deferred ≤5s on startup to absorb broker retained. |
 | `mqtt_retain=true`, custom event topic *with* `{type}` | Same as above. |
-| `mqtt_retain=true`, custom event topic *without* `{type}` | Bridge logs ERROR, runs in pass-through mode (no retain). Add `{type}` to enable cache mode. |
+| `mqtt_retain=true`, neither topic nor payload template has `{type}` | Cache mode still enabled (reload path safe). Bridge logs WARN about potential live double-fire on event automations subscribed to the snapshot topic. Add `{type}` to either template if event automations matter. |
 | `mqtt_retain=true`, custom `mqtt_payload_template` | Bridge logs WARN, runs in cache mode but **skips the seed phase**. First publish per device overwrites broker retained until next full heartbeat. |
 
 ### Documentation

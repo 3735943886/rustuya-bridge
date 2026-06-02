@@ -478,16 +478,30 @@ returns the keys that actually changed, and the snapshot publish is
 gated on that being non-empty. A device hammering the same heartbeat
 every 30s won't generate snapshot publishes after the first.
 
-### 4.3 `{type}` is mandatory in cache mode
+### 4.3 `{type}` and live double-fire
 
-Because the active delta and the snapshot must land on different
-topics (otherwise HA receives the active twice — once live, once via
-the retained snapshot — and re-fires automations), the event topic
-**must contain `{type}`**. If `mqtt_retain=true` is set with a topic
-that doesn't, the bridge logs an `ERROR` at startup and **downgrades
-to pass-through mode** rather than refusing to start. The bridge stays operational
-with safe (no-retain) semantics; the user fixes the template and
-restarts to enable cache mode.
+Cache mode publishes both an active delta (no retain) and a snapshot
+(retain) per active event. MQTT semantics keep the *reload* path safe
+unconditionally — a no-retain publish doesn't update the broker's
+retained value, so a re-subscribing client only ever receives the
+latest snapshot, never a stale active. The spurious-re-fire-on-reload
+bug is gone regardless of template shape.
+
+The only residual concern is **live double-fire**: a subscriber on
+the same-topic active+snapshot stream gets both messages per active
+event. To filter, the subscriber needs to tell them apart, and that
+needs `{type}` in one of:
+
+- the **event topic** (`{root}/event/{type}/{id}`) — subscribe to
+  just `{type}=active` or `{type}=passive`, never receive the other
+- the **payload template** (`{"type":"{type}","value":{value}}`) —
+  same topic for both, but consumers filter on `value_json.type`
+
+If `mqtt_retain=true` is set with **neither**, the bridge logs a WARN
+and keeps cache mode enabled — the user opted in explicitly, and a
+fleet with no event automations doesn't care about live double-fire
+(state entities are idempotent). The WARN points at the templates to
+add `{type}` to if the user does care.
 
 ### 4.4 The retain gate (`IdentifierSet`) — unchanged
 

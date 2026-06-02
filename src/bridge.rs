@@ -377,23 +377,30 @@ impl BridgeContext {
             );
         }
 
-        // cache mode (mqtt_retain=true) splits each device update across a no-retain
-        // delta on `{type}=active` and a retained snapshot on `{type}=passive`,
-        // so the event topic *must* contain `{type}` to separate them. If it
-        // doesn't, both publishes would collide on the same topic — the live
-        // active would be received twice by HA event automations (once
-        // no-retain, once via the retained snapshot), spuriously re-firing.
-        // Rather than refuse to start, log loudly and downgrade to pass-through mode so the
-        // bridge stays operational with safe (no-retain) semantics.
-        let event_has_type = mqtt_event_topic.contains("{type}");
-        let effective_retain = if cli.mqtt_retain() && !event_has_type {
-            error!(
-                "mqtt_retain=true requires {{type}} in mqtt_event_topic (got '{mqtt_event_topic}'). Falling back to no-retain mode. Add {{type}} to enable state recovery."
+        // cache mode (mqtt_retain=true) splits each device update across a
+        // no-retain delta and a retained snapshot. MQTT semantics keep us
+        // safe on the reload path regardless of templates: a no-retain
+        // publish doesn't overwrite the retained value, so a re-subscribing
+        // client always receives only the latest snapshot, never a stale
+        // active. Spurious re-fires on reconnect — the primary bug we
+        // wanted to kill — are gone unconditionally.
+        //
+        // The only residual concern is *live* double-fire: a subscriber on
+        // the active+snapshot topic gets two messages per active event and
+        // can't tell which is which unless `{type}` appears in the topic
+        // (separate subscriptions) or the payload (filter via value_json).
+        // State entities are idempotent and don't care; event automations
+        // need the distinction. We warn rather than downgrade because
+        // mqtt_retain=true is the user's explicit opt-in, and a fleet with
+        // no event automations is perfectly happy with neither {type}.
+        let type_distinguishable =
+            mqtt_event_topic.contains("{type}") || payload_tpl.contains("{type}");
+        if cli.mqtt_retain() && !type_distinguishable {
+            warn!(
+                "mqtt_retain=true but {{type}} is absent from both mqtt_event_topic ('{mqtt_event_topic}') and mqtt_payload_template ('{payload_tpl}'). State recovery on reconnect works, but live event automations subscribed to the snapshot topic may double-fire because active deltas and retained snapshots collide. Add {{type}} to either template to let consumers filter."
             );
-            false
-        } else {
-            cli.mqtt_retain()
-        };
+        }
+        let effective_retain = cli.mqtt_retain();
 
         let cache = effective_retain.then(|| Arc::new(DpsCache::new()));
 
@@ -2842,22 +2849,38 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn cache_mode_downgrades_to_passthrough_when_type_missing() {
+    async fn cache_mode_stays_active_when_type_missing_from_both() {
+        // No-{type} setup is opt-in for users whose fleet has no event
+        // automations — state recovery via retained snapshot still works
+        // (no-retain active never overwrites the retained passive). Bridge
+        // logs a WARN about potential live double-fire but honors the
+        // explicit mqtt_retain=true.
         let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
-            // Topic without {type} would let active/snapshot publishes
-            // collide. Bridge must downgrade rather than refuse to start.
             cli.mqtt_event_topic = Some("{root}/event/{id}".into());
+            cli.mqtt_payload_template = Some("{value}".into());
+        })
+        .await;
+        assert!(ctx.mqtt_retain, "mqtt_retain=true must stay honored");
+        assert!(ctx.cache.is_some());
+    }
+
+    #[tokio::test]
+    async fn cache_mode_stays_active_when_type_in_payload_only() {
+        // {type} in payload template suffices — subscribers can filter on
+        // `value_json.type` even if topic doesn't separate active/passive.
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            cli.mqtt_event_topic = Some("{root}/event/{id}/{dp}".into());
+            cli.mqtt_payload_template =
+                Some("{\"type\":\"{type}\",\"value\":{value}}".into());
         })
         .await;
         assert!(
-            !ctx.mqtt_retain,
-            "missing {{type}} must downgrade mqtt_retain to false"
+            ctx.mqtt_retain,
+            "{{type}} in payload template alone must keep cache mode active"
         );
-        assert!(
-            ctx.cache.is_none(),
-            "downgraded mode must not allocate a cache"
-        );
+        assert!(ctx.cache.is_some());
     }
 
     // ── cache-mode publish routing ──────────────────────────────────────────────────
