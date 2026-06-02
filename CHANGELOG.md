@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.6] — Python 0.2.0-rc.6 — 2026-06-02
+
+Retain-semantics overhaul. Fixes a long-standing data-loss bug for
+`mqtt_retain=true` users and removes the spurious-event-replay footgun
+on HA reconnect. Retain-off users (the default) are unaffected.
+
+### Fixed
+- **`mqtt_retain=true` no longer overwrites the retained snapshot with a
+  partial passive update.** Previously, in multi-DP mode (event topic
+  without `{dp}`), a battery-only or RSSI-only passive heartbeat would
+  publish *that single field* as the device's retained snapshot — wiping
+  the switch state, temperature, brightness etc. that the previous full
+  heartbeat had established. HA reload would then show "unknown" until
+  the next full report (sometimes minutes). The bridge now keeps a
+  per-device merged DPS cache and publishes snapshots from the cache,
+  so partial updates merge instead of replacing.
+- **Active events no longer re-fire HA event automations on reconnect.**
+  Active deltas (button presses, motion fires) used to be published
+  retained; on HA reload the broker re-delivered the retained active
+  and HA automations re-fired the button-press. Active is now always
+  published with `retain=false` to a dedicated `{type}=active` topic.
+
+### Added
+- **☆ mode** (`mqtt_retain=true`): in-memory DPS cache + two publish
+  routes — direct (active deltas, no retain, `{type}=active`) and cache
+  (merged snapshots, retain, `{type}=passive`).
+- **Seed phase** (☆ only): on first MQTT connect the bridge subscribes
+  to its own state wildcard to recover prior-session snapshots from the
+  broker, drains them into the cache, then unsubscribes. Hard cap 5s,
+  quiet 200ms. Snapshot publishes are deferred for any device that
+  changes during the seed window; one batched flush at seed end.
+- **`{type}` validation** at startup: ☆ requires `{type}` in
+  `mqtt_event_topic` to separate active from snapshot publishes. If
+  missing, bridge logs ERROR and downgrades to ★ (`mqtt_retain=false`)
+  rather than refusing to start.
+- **`src/dps_cache.rs`** — new module housing `DpsCache` with
+  `merge`/`fill_missing`/`snapshot`/`remove`.
+
+### Changed
+- **`mqtt_retain` semantic clarified:** in ☆ mode the flag now means
+  "publish full state snapshots on `{type}=passive` retained, and live
+  deltas on `{type}=active` no-retain." Active deltas are no longer
+  retained even when the flag is on. Previously `mqtt_retain=true`
+  applied retain uniformly to every publish.
+- **Default `mqtt_retain` stays `false`** (★ mode, current behavior).
+  No silent breaking change for the majority of users.
+
+### Migration
+| Setup | Effect |
+|---|---|
+| `mqtt_retain=false` (default) | No change. |
+| `mqtt_retain=true`, default topic | Auto-enrolls into the new model. Broker-resident retained from the old (buggy) layout is overwritten by the first full publish per device. Snapshot publishes are deferred ≤5s on startup to absorb broker retained. |
+| `mqtt_retain=true`, custom event topic *with* `{type}` | Same as above. |
+| `mqtt_retain=true`, custom event topic *without* `{type}` | Bridge logs ERROR, runs in ★ mode (no retain). Add `{type}` to enable ☆. |
+| `mqtt_retain=true`, custom `mqtt_payload_template` | Bridge logs WARN, runs in ☆ mode but **skips the seed phase**. First publish per device overwrites broker retained until next full heartbeat. |
+
+### Documentation
+- `docs/internals.md` §3.3 (active vs passive) and §4 (retain
+  semantics) rewritten around the ★/☆ split. New §4.5 covers the seed
+  phase mechanics; §4.6 documents known seed limitations.
+
 ## [0.3.0-rc.5] — Python 0.2.0-rc.5 — 2026-05-29
 
 Embedded-shutdown release. The headline fix lets a host application

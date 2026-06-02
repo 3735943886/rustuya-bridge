@@ -133,7 +133,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
 | `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
 | `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | `{value}` | MQTT payload template (e.g., `{"val": {value}}`) |
-| `--mqtt-retain` | `MQTT_RETAIN` | `false` | Retain flag for device state messages |
+| `--mqtt-retain` | `MQTT_RETAIN` | `false` | `true` enables the cache + snapshot retain model: live deltas publish to `{type}=active` no-retain, merged state snapshots to `{type}=passive` retained — recommended for HA-style state recovery. `false` (default) passes events through with no retain. See [docs/internals.md §4](docs/internals.md). |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
 | `--scavenger-timeout-secs`| `SCAVENGER_TIMEOUT_SECS` | `1` | Seconds the retain scavenger waits for retained MQTT messages before exiting after `remove`/`clear`. Raise on slow brokers. |

@@ -13,8 +13,12 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
 
 use crate::config::{Cli, DeviceConfig, load_state};
+use crate::dps_cache::DpsCache;
 use crate::error::BridgeError;
 use crate::types::{ApiResponse, BridgeRequest};
+use std::collections::BTreeSet;
+use std::sync::atomic::AtomicBool;
+use std::sync::Mutex as StdMutex;
 
 pub const MQTT_CHANNEL_CAPACITY: usize = 100;
 pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
@@ -80,6 +84,29 @@ pub struct BridgeContext {
     /// full past `try_send_mqtt`'s timeout. Exposed in `status` responses.
     pub mqtt_drop_count: AtomicU64,
     pub cancel: tokio_util::sync::CancellationToken,
+
+    /// Per-device merged DPS cache. `Some` only when `mqtt_retain=true` and the
+    /// event topic carries `{type}` (☆ mode). `None` in ★ mode (pass-through).
+    pub cache: Option<Arc<DpsCache>>,
+
+    /// Set when the broker-retained seed phase has completed (☆ only). While
+    /// `false`, cache-driven snapshot publishes are deferred and the
+    /// device id is recorded in `seed_pending` for a single flush at seed end.
+    pub seed_done: AtomicBool,
+
+    /// Device ids whose cache changed during the seed window. Drained once at
+    /// seed end to publish a single state snapshot per device, avoiding the
+    /// noisy "republish everything" pattern.
+    pub seed_pending: StdMutex<BTreeSet<String>>,
+
+    /// MQTT wildcard topic used to recover cached state from the broker on
+    /// startup (☆ only, default payload template only). Derived from the event
+    /// topic with `{type}=passive` and other placeholders as `+`.
+    pub seed_state_wildcard: Option<String>,
+
+    /// Regex matched against incoming retained messages on the seed wildcard
+    /// to extract `{id}` and (optionally) `{dp}` from the topic.
+    pub seed_state_regex: Option<Regex>,
 }
 
 /// Topic-template variable keys recognised by [`tpl_to_wildcard`], [`compile_topic_regex`],
@@ -166,6 +193,26 @@ where
     }
     res.push_str(&template[last..]);
     res
+}
+
+/// Parses a broker-retained seed message payload into a `dps` map. Only
+/// handles the default `{value}` payload template: multi-DP mode payloads
+/// are the full dps JSON object; single-DP mode payloads are the per-DP
+/// value (the `dp` is recovered from the topic). Returns `None` on malformed
+/// payloads or templates this parser can't reverse — caller drops silently.
+fn parse_seed_payload(
+    payload: &str,
+    dp: Option<&str>,
+) -> Option<serde_json::Map<String, Value>> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    match dp {
+        Some(dp_key) => {
+            let mut m = serde_json::Map::new();
+            m.insert(dp_key.to_string(), v);
+            Some(m)
+        }
+        None => v.as_object().cloned(),
+    }
 }
 
 /// Converts MQTT template to wildcard for subscription
@@ -327,15 +374,68 @@ impl BridgeContext {
             );
         }
 
+        // ☆ mode (mqtt_retain=true) splits each device update across a no-retain
+        // delta on `{type}=active` and a retained snapshot on `{type}=passive`,
+        // so the event topic *must* contain `{type}` to separate them. If it
+        // doesn't, both publishes would collide on the same topic — the live
+        // active would be received twice by HA event automations (once
+        // no-retain, once via the retained snapshot), spuriously re-firing.
+        // Rather than refuse to start, log loudly and downgrade to ★ so the
+        // bridge stays operational with safe (no-retain) semantics.
+        let event_has_type = mqtt_event_topic.contains("{type}");
+        let effective_retain = if cli.mqtt_retain() && !event_has_type {
+            error!(
+                "mqtt_retain=true requires {{type}} in mqtt_event_topic (got '{mqtt_event_topic}'). Falling back to no-retain mode. Add {{type}} to enable state recovery."
+            );
+            false
+        } else {
+            cli.mqtt_retain()
+        };
+
+        let cache = effective_retain.then(|| Arc::new(DpsCache::new()));
+
+        // The seed phase parses broker-retained snapshots into the cache.
+        // Parsing only works when payload_template is the default `{value}`
+        // (so the published payload IS the dps dict, or the per-DP value in
+        // single-DP mode). For custom templates we can't generally reverse
+        // the wrapper, so seed is disabled and the bridge will overwrite
+        // broker retained on first publish per device. The user is warned
+        // once at startup.
+        let seed_supported = effective_retain
+            && matches!(
+                cli.mqtt_payload_template.as_deref(),
+                None | Some("{value}")
+            );
+        if effective_retain && !seed_supported {
+            warn!(
+                "Custom mqtt_payload_template ('{payload_tpl}') is incompatible with the broker seed phase; the bridge will overwrite broker retained on first publish per device"
+            );
+        }
+
+        let root_topic_str = cli
+            .mqtt_root_topic
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_MQTT_ROOT_TOPIC.to_string());
+
+        let (seed_state_wildcard, seed_state_regex) = if seed_supported {
+            let tpl = mqtt_event_topic.replace("{type}", "passive");
+            let wildcard = tpl_to_wildcard(&tpl, &root_topic_str);
+            let regex = compile_topic_regex(&tpl);
+            (Some(wildcard), regex)
+        } else {
+            (None, None)
+        };
+
+        // If we can't seed (★ or unsupported template), pre-flip seed_done so
+        // publish_device_event doesn't defer snapshots indefinitely.
+        let initial_seed_done = !seed_supported;
+
         let ctx = Arc::new(Self {
             cli: cli.clone(),
             mqtt_tx: cli.mqtt_broker.is_some().then_some(mqtt_tx_sender),
-            mqtt_root_topic: cli
-                .mqtt_root_topic
-                .clone()
-                .unwrap_or_else(|| crate::config::DEFAULT_MQTT_ROOT_TOPIC.to_string()),
+            mqtt_root_topic: root_topic_str,
             mqtt_event_topic,
-            mqtt_retain: cli.mqtt_retain(),
+            mqtt_retain: effective_retain,
             mqtt_message_topic: cli.mqtt_message_topic.clone(),
             mqtt_payload_template: cli.mqtt_payload_template.clone(),
             mqtt_scanner_topic: cli.mqtt_scanner_topic.clone(),
@@ -353,6 +453,11 @@ impl BridgeContext {
             scavenger_tx: tokio::sync::Mutex::new(None),
             mqtt_drop_count: AtomicU64::new(0),
             cancel,
+            cache,
+            seed_done: AtomicBool::new(initial_seed_done),
+            seed_pending: StdMutex::new(BTreeSet::new()),
+            seed_state_wildcard,
+            seed_state_regex,
         });
 
         Ok((ctx, mqtt_tx_receiver, save_rx, refresh_rx))
@@ -598,9 +703,21 @@ impl BridgeContext {
         let config_topic =
             crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
 
+        // ── Seed phase (☆ only) ──────────────────────────────────────────
+        // After the first ConnAck the bridge subscribes to its own retained
+        // state topic to recover prior-session snapshots, then unsubscribes
+        // and calls `on_seed_complete()` once either the broker quiets (200ms
+        // since last retained) or the 5s hard cap fires.
+        const SEED_HARD_CAP: Duration = Duration::from_secs(5);
+        const SEED_QUIET: Duration = Duration::from_millis(200);
+        let seed_wildcard = self.seed_state_wildcard.clone();
+
         let handle = tokio::spawn(async move {
             let mut retry_delay = INITIAL_RETRY_DELAY_SECS;
             let mut next_retry: Option<Instant> = None;
+            let mut seed_active = false;
+            let mut seed_deadline: Option<Instant> = None;
+            let mut seed_last_msg: Option<Instant> = None;
             loop {
                 tokio::select! {
                     () = async {
@@ -611,6 +728,26 @@ impl BridgeContext {
                         }
                     } => {
                         next_retry = None;
+                    }
+                    () = async {
+                        let wakeup = match (seed_last_msg, seed_deadline) {
+                            (Some(t), Some(d)) => Some((t + SEED_QUIET).min(d)),
+                            (None, Some(d)) => Some(d),
+                            _ => None,
+                        };
+                        if let Some(w) = wakeup {
+                            tokio::time::sleep_until(w).await;
+                        } else {
+                            futures_util::future::pending::<()>().await;
+                        }
+                    }, if seed_active => {
+                        seed_active = false;
+                        seed_deadline = None;
+                        seed_last_msg = None;
+                        if let Some(w) = &seed_wildcard {
+                            let _ = client.unsubscribe(w).await;
+                        }
+                        self.on_seed_complete().await;
                     }
                     notification = eventloop.poll(), if next_retry.is_none() => {
                         match notification {
@@ -625,10 +762,45 @@ impl BridgeContext {
                                 if let Err(e) = client.subscribe(&config_topic, rumqttc::QoS::AtLeastOnce).await {
                                     error!("Config subscription failed: {e}");
                                 }
+                                // First-connect seed bootstrap (☆ only).
+                                if let Some(w) = &seed_wildcard
+                                    && !self.seed_done.load(Ordering::Acquire)
+                                    && !seed_active
+                                {
+                                    match client.subscribe(w, rumqttc::QoS::AtLeastOnce).await {
+                                        Ok(()) => {
+                                            info!("Seeding ☆ cache from broker via '{w}'");
+                                            seed_active = true;
+                                            seed_deadline = Some(Instant::now() + SEED_HARD_CAP);
+                                        }
+                                        Err(e) => {
+                                            error!("Seed subscribe failed: {e}; skipping seed");
+                                            // Don't block snapshot publishes forever.
+                                            self.on_seed_complete().await;
+                                        }
+                                    }
+                                }
                             }
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
                                 let payload = String::from_utf8_lossy(&p.payload);
                                 debug!("MQTT Received: [{}] {payload}", p.topic);
+
+                                // Seed-window retained delivery: feed into the cache
+                                // without firing the publish path. The retain check
+                                // protects us from picking up live (non-retained)
+                                // events that incidentally match the wildcard.
+                                if seed_active && p.retain
+                                    && let Some((id, dp_opt)) = self.match_seed_topic(&p.topic)
+                                {
+                                    if let Some(dps) =
+                                        parse_seed_payload(&payload, dp_opt.as_deref())
+                                        && let Some(cache) = &self.cache
+                                    {
+                                        cache.fill_missing(&id, &dps);
+                                        seed_last_msg = Some(Instant::now());
+                                    }
+                                    continue;
+                                }
 
                                 if p.topic == config_topic {
                                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload)
@@ -1134,7 +1306,49 @@ impl BridgeContext {
         templates
     }
 
-    /// Publishes device event using MQTT templates
+    /// Renders the configured event topic / payload templates for a device
+    /// update and pushes each rendered (topic, payload) onto the MQTT outbound
+    /// channel. Single low-level publish helper used by both ★ pass-through
+    /// and ☆ active/snapshot publishes; retain is decided by the caller.
+    async fn publish_event_templates(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        cid: Option<&str>,
+        dps: &Value,
+        is_passive: bool,
+        retain: bool,
+    ) {
+        let templates = self.generate_device_templates(id, name, cid, dps, is_passive);
+        if templates.is_empty() {
+            return;
+        }
+        for (topic, payload) in templates {
+            self.try_send_mqtt(Some(MqttMessage {
+                topic,
+                payload,
+                retain,
+            }))
+            .await;
+        }
+    }
+
+    /// Publishes a device event.
+    ///
+    /// ★ mode (`mqtt_retain=false`): pass-through — render templates with the
+    /// incoming `is_passive` and publish a single MQTT message without retain.
+    /// This preserves the historical bridge behavior for retain-off users.
+    ///
+    /// ☆ mode (`mqtt_retain=true`): two parallel routes.
+    /// 1. *Direct route* (active only): publish the incoming delta on
+    ///    `{type}=active`, no retain — for HA event automations etc.
+    /// 2. *Cache route*: merge the incoming DPs into the in-memory cache; if
+    ///    any value actually changed AND the seed phase has finished, publish
+    ///    the full merged snapshot on `{type}=passive` retained. During the
+    ///    seed window the device id is queued in `seed_pending` for a single
+    ///    deferred flush — this is what avoids overwriting the broker's
+    ///    full-state snapshot with a partial passive (e.g. a battery-only
+    ///    report).
     pub async fn publish_device_event(
         &self,
         id: String,
@@ -1150,49 +1364,109 @@ impl BridgeContext {
 
         debug!("Device Event: [{id}] {dps}");
 
-        if self.mqtt_tx.is_some() {
-            // Check if device still exists before publishing to avoid race conditions during removal
-            if !exists {
-                return;
-            }
-
-            let templates = self.generate_device_templates(
-                &id,
-                name.as_deref(),
-                cid.as_deref(),
-                &dps,
-                is_passive,
-            );
-            if templates.is_empty() {
-                return;
-            }
-
-            // Retain is structurally safe only when the topic/payload templates
-            // reference an identifier the scavenger can later use to clear the
-            // retained message. `{id}` is always available; `{name}`/`{cid}` only
-            // when this specific device has them. The structurally-impossible
-            // case (templates reference no identifier at all) is warned once at
-            // startup in `BridgeContext::new`; per-device shortfalls are debug
-            // only to avoid log flooding.
-            let retain = self.mqtt_retain
-                && self
-                    .event_identifiers
-                    .satisfied_by(name.as_deref(), cid.as_deref());
-            if self.mqtt_retain && !retain {
-                debug!(
-                    "Ignoring retain for event from '{id}': no template identifier resolvable for this device (name={name:?}, cid={cid:?})"
-                );
-            }
-
-            for (topic, payload) in templates {
-                self.try_send_mqtt(Some(MqttMessage {
-                    topic,
-                    payload,
-                    retain,
-                }))
-                .await;
-            }
+        if self.mqtt_tx.is_none() || !exists {
+            return;
         }
+
+        let name_opt = name.as_deref();
+        let cid_opt = cid.as_deref();
+
+        // ★ pass-through. mqtt_retain=false here either by user choice or by
+        // the {type}-missing downgrade in `BridgeContext::new`.
+        if !self.mqtt_retain {
+            self.publish_event_templates(&id, name_opt, cid_opt, &dps, is_passive, false)
+                .await;
+            return;
+        }
+
+        // ☆ direct route: active delta to {type}=active, no retain.
+        if !is_passive {
+            self.publish_event_templates(&id, name_opt, cid_opt, &dps, false, false)
+                .await;
+        }
+
+        // ☆ cache route: merge then publish snapshot (gated by seed_done).
+        let Some(cache) = &self.cache else { return };
+        let Some(dps_obj) = dps.as_object() else { return };
+        let changed = cache.merge(&id, dps_obj);
+        if changed.is_empty() {
+            return;
+        }
+
+        if !self.seed_done.load(Ordering::Acquire) {
+            // Defer to seed-end flush; dedup by device id.
+            self.seed_pending.lock().unwrap().insert(id.clone());
+            return;
+        }
+
+        self.publish_snapshot(&id, name_opt, cid_opt).await;
+    }
+
+    /// Match an incoming topic against the seed wildcard regex and return
+    /// `(id, optional_dp)`. Returns `None` if not in ☆ seed-enabled mode or
+    /// the topic doesn't match.
+    fn match_seed_topic(&self, topic: &str) -> Option<(String, Option<String>)> {
+        let regex = self.seed_state_regex.as_ref()?;
+        let captures = regex.captures(topic)?;
+        let id = captures.name("id")?.as_str().to_string();
+        let dp = captures.name("dp").map(|m| m.as_str().to_string());
+        Some((id, dp))
+    }
+
+    /// Drives the seed-phase transition: flip `seed_done`, drain `seed_pending`,
+    /// and publish one snapshot per device whose cache changed during the seed
+    /// window. No-op if seed_done was already true (e.g. star-mode bypass).
+    pub async fn on_seed_complete(self: &Arc<Self>) {
+        if self.seed_done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending: Vec<String> = {
+            let mut guard = self.seed_pending.lock().unwrap();
+            std::mem::take(&mut *guard).into_iter().collect()
+        };
+        info!(
+            "Seed phase complete; flushing {} pending device snapshot(s)",
+            pending.len()
+        );
+        for id in pending {
+            let (name, cid) = {
+                let state = self.state.read().await;
+                state
+                    .configs
+                    .get(&id)
+                    .map(|c| (c.name.clone(), c.cid.clone()))
+                    .unwrap_or((None, None))
+            };
+            self.publish_snapshot(&id, name.as_deref(), cid.as_deref())
+                .await;
+        }
+    }
+
+    /// Publishes the cached snapshot for one device on the `{type}=passive`
+    /// topic with retain. Used both by the per-event cache route and by the
+    /// seed-end flush. Applies the same identifier-set retain gate as
+    /// historical events — if the template references `{name}`/`{cid}` and
+    /// this device lacks them, retain is stripped so the scavenger can still
+    /// reach the message later.
+    pub(crate) async fn publish_snapshot(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        cid: Option<&str>,
+    ) {
+        let Some(cache) = &self.cache else { return };
+        let Some(snap) = cache.snapshot(id) else { return };
+        let snap_value =
+            Value::Object(snap.into_iter().collect::<serde_json::Map<String, Value>>());
+
+        let retain = self.event_identifiers.satisfied_by(name, cid);
+        if !retain {
+            debug!(
+                "Stripping retain for snapshot from '{id}': no template identifier resolvable (name={name:?}, cid={cid:?})"
+            );
+        }
+        self.publish_event_templates(id, name, cid, &snap_value, true, retain)
+            .await;
     }
 
     /// Publishes a message for a specific device (e.g. error messages)
@@ -1741,6 +2015,15 @@ impl BridgeContext {
             self.request_refresh();
         }
 
+        // Drop any cached DPS snapshot for removed devices (☆ mode only —
+        // ★ has no cache). Done before scavenger so we don't republish a
+        // snapshot in a race with the cleanup.
+        if let Some(cache) = &self.cache {
+            for target_id in &targets {
+                cache.remove(target_id);
+            }
+        }
+
         // Scavenge retained messages for removed devices
         self.spawn_retain_scavenger(scavenger_targets).await;
 
@@ -1783,6 +2066,13 @@ impl BridgeContext {
             state.name_map.clear();
             targets
         };
+
+        // Drop the full ☆-mode cache alongside config wipe.
+        if let Some(cache) = &self.cache {
+            for t in &scavenger_targets {
+                cache.remove(&t.id);
+            }
+        }
 
         info!("All devices cleared");
 
@@ -2522,6 +2812,509 @@ mod context_tests {
             v.get("mqtt_drop_count").and_then(|n| n.as_u64()),
             Some(3),
             "status must surface the cumulative MQTT drop count"
+        );
+    }
+
+    // ── ☆ mode bring-up ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn star_mode_skips_cache_when_retain_off() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(false);
+        })
+        .await;
+        assert!(!ctx.mqtt_retain);
+        assert!(ctx.cache.is_none(), "★ mode must not allocate a cache");
+    }
+
+    #[tokio::test]
+    async fn star2_mode_allocates_cache_with_type_in_topic() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            // Default event topic contains {type}, so ☆ stays enabled.
+        })
+        .await;
+        assert!(ctx.mqtt_retain);
+        assert!(ctx.cache.is_some(), "☆ mode must allocate a cache");
+    }
+
+    #[tokio::test]
+    async fn star2_mode_downgrades_to_star_when_type_missing() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            // Topic without {type} would let active/snapshot publishes
+            // collide. Bridge must downgrade rather than refuse to start.
+            cli.mqtt_event_topic = Some("{root}/event/{id}".into());
+        })
+        .await;
+        assert!(
+            !ctx.mqtt_retain,
+            "missing {{type}} must downgrade mqtt_retain to false"
+        );
+        assert!(
+            ctx.cache.is_none(),
+            "downgraded mode must not allocate a cache"
+        );
+    }
+
+    // ── ☆ publish routing ──────────────────────────────────────────────────
+
+    async fn add_named_direct(ctx: &Arc<BridgeContext>, id: &str) {
+        ctx.add_device(DeviceConfig {
+            id: id.into(),
+            name: Some(format!("name-{id}")),
+            ip: Some("10.0.0.1".into()),
+            key: Some("0123456789abcdef".into()),
+            version: None,
+            cid: None,
+            parent_id: None,
+            last_error_code: None,
+        })
+        .await
+        .expect("add device");
+    }
+
+    #[tokio::test]
+    async fn star2_active_publishes_delta_then_snapshot_after_seed() {
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await; // any add-time publishes
+
+        // Pretend the seed phase finished so snapshots aren't deferred.
+        ctx.seed_done.store(true, Ordering::Release);
+
+        let dps = serde_json::json!({"1": true});
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            dps,
+            /* is_passive */ false,
+            /* exists */ true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(
+            msgs.len(),
+            2,
+            "active in ☆ must produce a delta + a snapshot publish"
+        );
+        let active = msgs.iter().find(|m| !m.retain).expect("active no-retain");
+        let snapshot = msgs.iter().find(|m| m.retain).expect("snapshot retained");
+        assert!(active.topic.contains("/active/"));
+        assert!(snapshot.topic.contains("/passive/"));
+    }
+
+    #[tokio::test]
+    async fn star2_passive_publishes_only_snapshot_after_seed() {
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        // Passive arrives as a raw JSON object (no `dps` key). The synthesised
+        // dps becomes this object, which goes straight into the cache.
+        let payload = serde_json::json!({"battery": 80});
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            payload,
+            /* is_passive */ true,
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(msgs.len(), 1, "passive in ☆ must produce snapshot only");
+        assert!(msgs[0].retain, "snapshot must be retained");
+        assert!(msgs[0].topic.contains("/passive/"));
+    }
+
+    #[tokio::test]
+    async fn star2_partial_passive_preserves_other_cached_keys() {
+        // The bug this whole redesign fixes: a battery-only passive update
+        // must not wipe the previously-known state DPs from the retained
+        // snapshot. The cache merges, so the snapshot we publish still has
+        // both keys.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            serde_json::json!({"1": true, "2": 50}),
+            true, // passive heartbeat
+            true,
+        )
+        .await;
+        drain_mqtt(&mut mqtt_rx).await;
+
+        // Battery-only partial follow-up
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            serde_json::json!({"battery": 80}),
+            true,
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(msgs.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&msgs[0].payload).unwrap();
+        assert_eq!(payload.get("1"), Some(&serde_json::json!(true)));
+        assert_eq!(payload.get("2"), Some(&serde_json::json!(50)));
+        assert_eq!(payload.get("battery"), Some(&serde_json::json!(80)));
+    }
+
+    #[tokio::test]
+    async fn star2_snapshot_publish_deferred_during_seed() {
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        // seed_done stays false — simulating the seed window.
+
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            serde_json::json!({"1": true}),
+            false, // active
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        // Active delta still fires (HA event automations); snapshot is deferred.
+        assert_eq!(msgs.len(), 1, "only active delta during seed");
+        assert!(!msgs[0].retain);
+        assert!(msgs[0].topic.contains("/active/"));
+
+        assert!(
+            ctx.seed_pending.lock().unwrap().contains("dev-1"),
+            "device should be queued for the seed-end flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn star2_dedupes_unchanged_values() {
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            serde_json::json!({"1": true}),
+            true,
+            true,
+        )
+        .await;
+        let first = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(first.len(), 1, "first passive publishes snapshot");
+
+        // Same value again — cache.merge returns no changed keys, no snapshot.
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            serde_json::json!({"1": true}),
+            true,
+            true,
+        )
+        .await;
+        let second = drain_mqtt(&mut mqtt_rx).await;
+        assert!(
+            second.is_empty(),
+            "same-value passive must dedupe to no publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn star_mode_publishes_single_passthrough() {
+        // Sanity: ★ retains the historical one-publish-per-event shape.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(false);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            serde_json::json!({"1": true}),
+            false,
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(msgs.len(), 1, "★ must publish exactly one message");
+        assert!(!msgs[0].retain, "★ never retains");
+        assert!(msgs[0].topic.contains("/active/"));
+    }
+
+    // ── ☆ seed phase ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn star2_default_template_arms_seed_wildcard() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        assert!(
+            ctx.seed_state_wildcard.is_some(),
+            "default template + ☆ must produce a seed wildcard"
+        );
+        assert!(ctx.seed_state_regex.is_some());
+        assert!(
+            !ctx.seed_done.load(Ordering::Acquire),
+            "seed_done starts false to gate snapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn star2_custom_template_disables_seed() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            cli.mqtt_payload_template = Some("{\"v\":{value}}".into());
+        })
+        .await;
+        assert!(
+            ctx.seed_state_wildcard.is_none(),
+            "custom template must skip seed wildcard"
+        );
+        assert!(
+            ctx.seed_done.load(Ordering::Acquire),
+            "seed_done must be pre-flipped so snapshots aren't deferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn match_seed_topic_extracts_id_in_multi_dp_mode() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            cli.mqtt_event_topic = Some("{root}/event/{type}/{id}".into());
+        })
+        .await;
+        let (id, dp) = ctx
+            .match_seed_topic("rustuya/event/passive/dev-1")
+            .expect("topic should match");
+        assert_eq!(id, "dev-1");
+        assert!(dp.is_none(), "multi-DP mode has no {{dp}}");
+    }
+
+    #[tokio::test]
+    async fn match_seed_topic_extracts_id_and_dp_in_single_dp_mode() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
+        })
+        .await;
+        let (id, dp) = ctx
+            .match_seed_topic("rustuya/event/passive/dev-1/42")
+            .expect("topic should match");
+        assert_eq!(id, "dev-1");
+        assert_eq!(dp.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn parse_seed_payload_multi_dp_uses_full_object() {
+        let dps = parse_seed_payload(r#"{"1": true, "2": 50}"#, None).unwrap();
+        assert_eq!(dps.get("1"), Some(&json!(true)));
+        assert_eq!(dps.get("2"), Some(&json!(50)));
+    }
+
+    #[test]
+    fn parse_seed_payload_single_dp_wraps_value_under_dp_key() {
+        let dps = parse_seed_payload("true", Some("13")).unwrap();
+        assert_eq!(dps.get("13"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn parse_seed_payload_returns_none_on_garbage() {
+        assert!(parse_seed_payload("not json", None).is_none());
+        assert!(parse_seed_payload("", Some("1")).is_none());
+    }
+
+    #[test]
+    fn parse_seed_payload_multi_dp_rejects_scalar_payload() {
+        // Multi-DP mode expects an object; a scalar means custom template.
+        assert!(parse_seed_payload("true", None).is_none());
+        assert!(parse_seed_payload(r#""string""#, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn on_seed_complete_flips_flag_and_flushes_pending() {
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+
+        // Simulate an active arriving during the seed window — snapshot
+        // publish is deferred, device gets queued in seed_pending.
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            json!({"1": true}),
+            false,
+            true,
+        )
+        .await;
+        let pre = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(pre.len(), 1, "only active delta during seed");
+        assert!(ctx.seed_pending.lock().unwrap().contains("dev-1"));
+
+        // Seed completes: flag flips, pending drains, snapshot publishes.
+        ctx.on_seed_complete().await;
+        assert!(ctx.seed_done.load(Ordering::Acquire));
+        assert!(ctx.seed_pending.lock().unwrap().is_empty());
+
+        let post = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(post.len(), 1, "flush publishes one snapshot");
+        assert!(post[0].retain, "flush snapshot is retained");
+        assert!(post[0].topic.contains("/passive/"));
+    }
+
+    #[tokio::test]
+    async fn on_seed_complete_is_idempotent() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        ctx.on_seed_complete().await;
+        // Second call must be a no-op — seed_done already true.
+        ctx.on_seed_complete().await;
+        assert!(ctx.seed_done.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn star2_runtime_added_device_publishes_immediately_after_seed() {
+        // Devices added after seed_done flips should not be silently queued
+        // for an already-finished flush — their first cache change must
+        // publish right away.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        add_named_direct(&ctx, "late-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+
+        ctx.publish_device_event(
+            "late-1".into(),
+            Some("name-late-1".into()),
+            None,
+            json!({"1": true}),
+            true,
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        assert_eq!(
+            msgs.len(),
+            1,
+            "runtime-added device must publish snapshot on first cache change"
+        );
+        assert!(msgs[0].retain);
+        assert!(
+            ctx.seed_pending.lock().unwrap().is_empty(),
+            "must not queue when seed already done"
+        );
+    }
+
+    #[tokio::test]
+    async fn star2_single_dp_mode_publishes_snapshot_per_dp() {
+        // Single-DP topic template → each DP gets its own snapshot message.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            json!({"1": true, "2": 50}),
+            true,
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        let snapshots: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "single-DP snapshot publishes one retained message per DP"
+        );
+        let topics: Vec<&str> = snapshots.iter().map(|m| m.topic.as_str()).collect();
+        assert!(topics.iter().any(|t| t.ends_with("/1")));
+        assert!(topics.iter().any(|t| t.ends_with("/2")));
+    }
+
+    #[tokio::test]
+    async fn star2_remove_drops_cached_snapshot() {
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            serde_json::json!({"1": true}),
+            true,
+            true,
+        )
+        .await;
+        let cache = ctx.cache.as_ref().expect("cache exists");
+        assert!(cache.snapshot("dev-1").is_some());
+
+        ctx.remove_device(Some(vec!["dev-1".into()]), None)
+            .await
+            .unwrap();
+        assert!(
+            cache.snapshot("dev-1").is_none(),
+            "cache must drop on removal"
         );
     }
 }

@@ -337,41 +337,34 @@ extraction.
 ### 3.3 Active vs passive events
 
 [handle_device_event](../src/bridge.rs) decides `is_passive` by
-whether the payload had any `dps` field (root or nested under `data`). Active
-events are deliberate device-driven state pushes (the device telling you
-"this just changed"); passive events are everything else that came over
-the wire with a non-empty JSON payload but no `dps` field — typically
-`DP_QUERY` responses (state read-back after you called `get`), periodic
-device-initiated status reports that use a non-standard shape, or
-sub-device messages with custom layouts. The bridge synthesizes a DPS
-dict from the raw payload so downstream consumers see a uniform format.
+whether the payload had any `dps` field (root or nested under `data`).
 
-The default event topic includes `{type}` (`active` or `passive`) so you can
-subscribe selectively. If you use the HA-style topic without `{type}`, both
-kinds collapse onto the same topic and you lose the distinction (the
-`"type"` field is still in the payload template if you kept it).
+- **Active** events are deliberate device-driven pushes
+  (the device telling you "this just changed", e.g. button pressed,
+  switch toggled). Wire shape: root or nested `dps` field present.
+- **Passive** events are everything else that came over the wire with a
+  non-empty JSON payload but no `dps` field — typically `DP_QUERY`
+  responses (state read-back after `get`), periodic device-initiated
+  status reports with non-standard shape, or sub-device messages with
+  custom layouts. The bridge synthesizes a DPS dict from the raw
+  payload so downstream consumers see a uniform format.
 
-**When the distinction actually matters.** The active/passive split maps
-onto two different kinds of DP semantics:
+What the bridge does with these depends on `mqtt_retain` — see §4.
+
+**Why the distinction exists at all.** Even before retain semantics, the
+active/passive split maps onto two different kinds of DP semantics:
 
 - **State DPs** — values describing the *current* state of the device
-  (on/off, current temperature, brightness, etc). Active and passive
-  carry the same meaning here: "the device is currently in this state".
-  A passive replay of `temperature=23.5` after a query is fine —
-  it's still true. Downstream consumers can treat both interchangeably.
+  (on/off, current temperature, brightness, etc). Both active and
+  passive carry "the device is in this state" — interchangeable.
 - **Event DPs** — values describing a *moment-in-time event*
-  (`single_click`, `double_click`, `motion_detected`, etc).
-  The DP value is essentially "the last thing that happened", and the
-  active event is the only one that means "it happened *now*". Passive
-  events for these DPs are dangerous — they re-deliver the last event
-  value on reconnect / query, so an automation that
-  triggers on `single_click` will fire spuriously unless you filter to
-  `type == "active"` only.
-
-If your fleet has any event-style DPs (scene controllers, wall-switch
-buttons, PIR sensors), keep `{type}` in the event topic — or filter on
-the `"type"` field in payloads — and route only active events to
-automations. State-only fleets can collapse the topics without harm.
+  (`single_click`, `double_click`, `motion_detected`, etc). Only an
+  active event means "this happened *now*"; a passive replay of
+  `single_click` from a heartbeat or query means nothing happened — the
+  device just kept its last value cached. Automations that trigger on
+  `single_click` must filter to `type == "active"` only, or use the
+  ☆ retain model (§4) which only retains snapshots, never event-style
+  deltas.
 
 ### 3.4 Single-DP vs multi-DP mode — the trap
 
@@ -429,42 +422,155 @@ Empty-string substitutions can produce slightly surprising shapes:
 
 ---
 
-## 4. Retain semantics — the scavenger and the gate
+## 4. Retain semantics — ★/☆ modes
 
-Retained MQTT messages are the bridge's nicest feature for HA integrations:
-restart your dashboard and the latest state is right there. They are also its
-nastiest debugging surface, because deleting a device must also delete every
-retained message that mentions it — otherwise stale state lingers on the
-broker forever.
+The bridge has **two distinct retain models** selected by `mqtt_retain`:
 
-The bridge handles this with two cooperating mechanisms.
+- ★ mode (`mqtt_retain=false`, default) — historical pass-through. Each
+  device event publishes one MQTT message with `retain=false`. No
+  in-memory cache, no seed phase. State recovery on consumer reload is
+  the consumer's problem.
+- ☆ mode (`mqtt_retain=true`) — separates **live deltas** (active events,
+  no retain) from **retained state snapshots** (the merged cache,
+  published with retain). HA-style state recovery works automatically
+  without spuriously re-firing event automations on reconnect.
 
-### 4.1 The retain gate (`IdentifierSet`)
+The rest of this section is about ☆.
+
+### 4.1 Why ☆ exists — the partial-overwrite bug it fixes
+
+Before ☆, retain=true users hit a silent data-loss bug: in **multi-DP
+mode** (event topic without `{dp}`) the bridge published one MQTT
+message per device update containing the *incoming* DPS dict. When a
+device sent a partial passive update (battery report only, RSSI only,
+periodic timer tick) the retained snapshot on the broker shrank to that
+partial dict — wiping out the full state the previous heartbeat had
+established. HA reload after a partial would then see "switch state =
+unknown" until the next full heartbeat (sometimes minutes).
+
+☆ fixes this by keeping a **per-device merged DPS cache** in the bridge
+and publishing snapshots from the cache, not from the incoming message.
+A battery-only passive merges into the cache; the published snapshot
+still contains the cached switch state, temperature, etc.
+
+A secondary win: active events publish as **delta with no retain** on
+the `{type}=active` topic, so HA event automations triggered by a
+button press don't spuriously re-fire when HA reconnects and the broker
+re-delivers a retained active.
+
+### 4.2 The two publish routes
+
+```
+Direct publish route (trigger: handler call site)
+  └─ Active events only → {type}=active topic, no-retain, incoming delta
+
+Cache publish route (trigger: cache.merge returns changed keys)
+  └─ Both active and passive → {type}=passive topic, retain,
+     full merged DPS snapshot from the cache
+```
+
+Both routes coexist for active events: a single active fires the direct
+route immediately AND merges into the cache, which (when seeded) fires
+a snapshot publish too. Passive events skip the direct route entirely.
+
+Identical-value updates are deduped at the cache layer — `cache.merge()`
+returns the keys that actually changed, and the snapshot publish is
+gated on that being non-empty. A device hammering the same heartbeat
+every 30s won't generate snapshot publishes after the first.
+
+### 4.3 `{type}` is mandatory in ☆
+
+Because the active delta and the snapshot must land on different
+topics (otherwise HA receives the active twice — once live, once via
+the retained snapshot — and re-fires automations), the event topic
+**must contain `{type}`**. If `mqtt_retain=true` is set with a topic
+that doesn't, the bridge logs an `ERROR` at startup and **downgrades
+to ★** rather than refusing to start. The bridge stays operational
+with safe (no-retain) semantics; the user fixes the template and
+restarts to enable ☆.
+
+### 4.4 The retain gate (`IdentifierSet`) — unchanged
 
 [IdentifierSet::satisfied_by](../src/bridge.rs) decides per-event
 whether `retain=true` is safe. The rule:
 
 - Scan the event topic and payload templates once at startup, record which
   of `{id}`/`{name}`/`{cid}` they reference → `event_identifiers`.
-- For each outbound event: retain only if at least one referenced
-  identifier *actually has a value for this device*.
+- For each retained publish (snapshot in ☆): retain only if at least
+  one referenced identifier *actually has a value for this device*.
 - `{id}` is always satisfiable (every device has an id). `{name}` and
   `{cid}` are only satisfiable when the device's config has a non-empty
   value for them.
 
-So if your event topic is `rustuya/event/{name}/{dp}` and you publish for a
-device with no name, the bridge **strips retain**. The per-device shortfall
-is logged at `debug` only (to avoid flooding when a fleet has many devices
-without names); enable debug logging if you're tracking down missing
-retains. Without this guard the scavenger would later have no way to find
-the retained message and clear it — it'd be orphaned.
+So if your event topic is `rustuya/event/{type}/{name}/{dp}` and you
+publish a snapshot for a device with no name, the bridge **strips
+retain** for that snapshot. The per-device shortfall is logged at
+`debug` only. Active-delta publishes are never retained, so this gate
+only affects snapshots.
 
-If the templates reference no identifier at all (e.g. `rustuya/all/events`),
-`IdentifierSet::is_empty()` is true and retain becomes structurally
-impossible to scavenge — the bridge warns **once at startup** (in
-`BridgeContext::new`) rather than on every event.
+If the templates reference no identifier at all (e.g.
+`rustuya/event/{type}`), `IdentifierSet::is_empty()` is true and
+retain becomes structurally impossible to scavenge — the bridge warns
+**once at startup** rather than on every event.
 
-### 4.2 The scavenger
+### 4.5 The seed phase — recovering broker state on startup
+
+On bridge startup in ☆ mode, the cache is empty. If the bridge starts
+publishing snapshots immediately, the first publish for each device
+contains only whatever DPs that device has reported so far in this
+session — usually one (whatever active fired first). That partial
+snapshot then overwrites the broker's prior full-state retained:
+exactly the bug we fixed in §4.1, just at startup instead of mid-run.
+
+The fix: **subscribe to your own state topic on connect, seed the
+cache from broker-retained snapshots, then start publishing**.
+
+The seed loop in [spawn_mqtt_task](../src/bridge.rs):
+
+1. On first `ConnAck`, subscribes to the state wildcard (event topic
+   with `{type}=passive` and other placeholders as `+`).
+2. Receives broker-retained payloads. For each, parses the payload as
+   the cached snapshot for that device and calls `cache.fill_missing`
+   — fills only empty slots, so anything the bridge already learned
+   from a live device event during the seed window takes precedence.
+3. Tracks the timestamp of the last seed message received.
+4. Exits when either:
+   - **Quiet period** — 200ms with no new seed message (broker
+     finished bursting retained); or
+   - **Hard cap** — 5s absolute, regardless. Protects against a
+     broken or unresponsive broker.
+5. Unsubscribes from the state wildcard and flips `seed_done`. Any
+   devices whose cache changed during the seed window (queued in
+   `seed_pending` by the publish gate) get one snapshot publish each.
+
+During the seed window:
+- **Active events still publish to `{type}=active`** (direct route is
+  ungated). HA event automations work normally.
+- **Snapshot publishes are deferred** — gated on `seed_done`. The
+  changed device is recorded in `seed_pending` for the flush at seed
+  end.
+
+The seed phase is one-shot per bridge lifetime. On MQTT reconnect, the
+bridge does *not* re-seed — the in-memory cache is already the source
+of truth at that point.
+
+### 4.6 Seed limitations
+
+- **Custom payload templates disable seed.** The seed parser only
+  reverses the default `{value}` template. If you set
+  `mqtt_payload_template` to anything else (e.g. `{"v":{value}}`),
+  the bridge warns at startup, **skips the seed phase**, and pre-flips
+  `seed_done=true`. The first publish per device will overwrite the
+  broker's prior retained — a one-time partial state until the device
+  reports its full state via heartbeat. Not catastrophic, but
+  documented.
+- **Hard cap can truncate large fleets.** With 1000+ devices on a slow
+  broker, 5s may not be enough to receive all retained messages.
+  Uncached devices get the same first-publish overwrite as the custom
+  template case. There is no config knob for the hard cap in v1
+  (YAGNI); add an issue if you hit this.
+
+### 4.7 The scavenger
 
 When you `remove` or `clear` devices,
 [spawn_retain_scavenger](../src/bridge.rs) spins up a transient
@@ -499,7 +605,7 @@ Subtleties:
   before injecting `"id": "..."`, so the fallback always finds messages
   regardless of caller-provided payload shape.
 
-### 4.3 The "deleting the state file" hazard
+### 4.8 The "deleting the state file" hazard
 
 This is the operational footgun the README warns about. The chain:
 
@@ -526,7 +632,7 @@ systemctl start rustuya-bridge
 With `mqtt_retain = false`, deleting the state file is harmless — no retained
 messages were ever published.
 
-### 4.4 The bridge config topic
+### 4.9 The bridge config topic
 
 `{root}/bridge/config` is published
 retained at startup with the full running config + `session_id`. It serves
@@ -543,7 +649,7 @@ and waits for the PubAck before disconnecting
  — the LWT is a backup, not the
 normal path.
 
-### 4.5 When the broker doesn't honor retain or LWT
+### 4.10 When the broker doesn't honor retain or LWT
 
 Several bridge features assume the broker treats `retain=true` and Last
 Will messages the way the MQTT spec describes. Some hosted MQTT services,
@@ -556,7 +662,7 @@ silent failure modes:
 | LWT stripped (only)    | If the bridge crashes, the retained `bridge/config` from the prior run stays on the broker forever. The next bridge restart sees a different `session_id` → §7 startup check fails → **bridge refuses to start**. Manual recovery: `mosquitto_pub -r -t '<root>/bridge/config' -m ''`. |
 | Both stripped          | Duplicate-instance detection effectively no-ops (nothing to see). Scavenger no-ops. The bridge will start under any conditions. |
 
-The retain check in §4.1 only verifies that the *templates* allow
+The retain check in §4.4 only verifies that the *templates* allow
 scavenging — it can't detect a broker that drops retain. If you have
 `mqtt_retain = true` set but no retained messages ever accumulate on the
 broker after running for a while, your broker is probably stripping
@@ -748,7 +854,7 @@ state-on-disk matches state-in-memory.
 
 ## 7. Duplicate-instance detection
 
-The mechanism is built on the bridge config topic (§4.4).
+The mechanism is built on the bridge config topic (§4.9).
 
 **At startup** ([check_existing_instance](../src/bridge.rs)):
 
@@ -783,7 +889,7 @@ topic. The next bridge to start sees nothing and proceeds.
   forever, and the next bridge startup will see it and refuse to start
   (different `session_id`). Recovery: clear the topic by hand —
   `mosquitto_pub -r -t '<root>/bridge/config' -m ''` — before
-  restarting. See §4.5 for the broader broker-compatibility picture.
+  restarting. See §4.10 for the broader broker-compatibility picture.
 
 ---
 
