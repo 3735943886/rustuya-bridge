@@ -160,13 +160,29 @@ Run with:
 
 ### MQTT Usage
 - **Commands**: Publish a JSON payload to the `mqtt-command-topic`.
-- **Events**: Device events are published to the `mqtt-event-topic`.
-  - **Active**: Published when the payload contains `dps` data (e.g., state changes).
-  - **Passive**: Published when the payload contains no `dps` data (e.g., state reports).
+- **Events**: Device events are published to the `mqtt-event-topic`. Each event carries a `{type}` of `active` or `passive`:
+  - **Active**: real-time push initiated by the device, physical interaction, firmware-driven change, or response to a SET. Payload arrives with the `data.dps` wrapper.
+  - **Passive**: status reports without an initiating change (DP_QUERY response, or periodic report). Payload arrives with root `dps`, no `data` wrapper.
 - **Responses/Errors**: Command results and errors are published to `mqtt-message-topic`.
   - **Success**: Published with `{level}` set to `response`.
   - **Error**: Published with `{level}` set to `error`.
 - **Scanner**: Results are published to `mqtt-scanner-topic`.
+
+#### Why a single state change can show up as two messages
+
+With `--mqtt-retain true` (recommended for HA-style state recovery), a single DP change publishes **two** event messages — this is intentional, not a duplicate:
+
+```text
+rustuya/event/active/aabbccdd11223344eeff   →  {"1":true}                  (no retain)
+rustuya/event/passive/aabbccdd11223344eeff  →  {"1":true,"2":50,"9":0}     (retain)
+```
+
+- **`active`** — the **delta** that just changed (only the DPs that moved). Published without retain so each event fires exactly once — useful as an automation trigger (e.g., HA "on state change" rules) when you want to react to the moment of change.
+- **`passive`** — the **full merged snapshot** of the device, retained. A subscriber that connects late (HA reconnect, manager restart) reads it once and immediately knows the current state without waiting for the next device update.
+
+If you only need *current state*, subscribing to `passive` is sufficient. If you need *event semantics*, watch `active`. Many consumers want both — `active` for the moment, `passive` for state at rest.
+
+In pass-through mode (`--mqtt-retain false`, the default), the bridge publishes a single message per event with no retain; `{type}` simply reflects which Tuya cmd produced it. There is no snapshot.
 
 ### Examples (MQTT)
 
