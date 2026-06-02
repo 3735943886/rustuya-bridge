@@ -1,10 +1,15 @@
-//! Inverse parser for the bridge's outbound payload templates.
+//! Payload parsing for both directions: inbound *commands* the bridge
+//! receives (heuristic-driven, [`parse_mqtt_payload`]) and outbound *event
+//! retains* the bridge produced (template-driven reverse parse,
+//! [`parse_payload_with_template`]).
 //!
-//! The bridge's [`render_template`](crate::bridge::render_template) substitutes
-//! `{var}` placeholders forward — payload template + variables → MQTT
-//! payload string. This module does the reverse: given the template and a
-//! concrete payload the bridge produced from it, recover each placeholder's
-//! captured value.
+//! ### Reverse template parsing
+//!
+//! The bridge's [`crate::template::render_template`] substitutes `{var}`
+//! placeholders forward — payload template + variables → MQTT payload
+//! string. The reverse goes the other way: given the template and a
+//! concrete payload the bridge produced from it, recover each
+//! placeholder's captured value.
 //!
 //! Algorithm (mirrors `rustuya_manager.payload.parse_payload_with_template`;
 //! eventual manager refactor will delegate to this implementation):
@@ -25,38 +30,43 @@
 //! - The two structures don't match (different keys, wrong array length,
 //!   mismatched literals).
 //! - The template has no recognized placeholders to capture.
+//!
+//! ### Inbound command parsing
+//!
+//! [`parse_mqtt_payload`] is the bridge's permissive parser for commands
+//! received on the command topic. It merges topic-extracted variables
+//! into the payload object, wraps scalars under `dps` when a `{dp}` is
+//! present, and applies the `set` heuristic via [`apply_set_heuristic`]
+//! (loose top-level fields become DP id/value pairs unless they collide
+//! with a reserved `BridgeRequest` field name).
 
+use crate::template::TOPIC_VARS;
 use regex::Regex;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// Placeholders recognized by [`crate::bridge::render_template`] /
-/// `replace_vars`. Restricting the reverse parser to this same set means
-/// a literal `{anything}` the user put in the template by mistake stays
-/// untouched and surfaces as a structure mismatch rather than silently
-/// corrupting capture results.
-const KNOWN_VARS: &[&str] = &[
-    "id",
-    "name",
-    "cid",
-    "dp",
-    "type",
-    "level",
-    "value",
-    "dps",
-    "timestamp",
-    "root",
-    "action",
-];
+/// Placeholders that may appear in payload templates but never in topic
+/// templates — they have no value at topic-build time. The reverse parser
+/// composes its placeholder regex from `template::TOPIC_VARS ∪
+/// PAYLOAD_ONLY_VARS` so the topic side stays the single source of truth
+/// for topic vocabulary.
+pub const PAYLOAD_ONLY_VARS: &[&str] = &["value", "dps", "timestamp", "root"];
 
 fn placeholder_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         // Match either a quoted placeholder `"{var}"` or a bare `{var}`.
         // Group 1 = quoted form, group 2 = bare form (at most one fires per match).
-        let alt = KNOWN_VARS.join("|");
-        let pattern = format!(r#""\{{({alt})\}}"|\{{({alt})\}}"#);
+        let alt: Vec<&str> = TOPIC_VARS
+            .iter()
+            .chain(PAYLOAD_ONLY_VARS.iter())
+            .copied()
+            .collect();
+        let pattern = format!(
+            r#""\{{({0})\}}"|\{{({0})\}}"#,
+            alt.join("|")
+        );
         Regex::new(&pattern).expect("known-vars regex compiles")
     })
 }
@@ -213,6 +223,112 @@ pub fn parse_seed_dps(
             Some(m)
         }
         None => dps_val.as_object().cloned(),
+    }
+}
+
+// ── Inbound command parsing ────────────────────────────────────────────────
+
+/// Parses an inbound MQTT command payload into a JSON value, merging in
+/// topic-extracted variables (`id`, `name`, `dp`, etc.) so the downstream
+/// `BridgeRequest` deserializer sees them as if they were in the payload.
+///
+/// Three layers of permissive handling:
+///
+/// 1. Non-JSON payload: wrap as `{"payload": "<raw>"}` so vars can still
+///    merge. When a `{dp}` topic var is present, the bare scalar becomes
+///    `{"dps": {"<dp>": <scalar>}}` instead — matches the common
+///    "publish a value to a per-DP command topic" idiom.
+/// 2. Topic vars don't overwrite payload keys (caller's explicit fields win).
+/// 3. For `action == "set"`, [`apply_set_heuristic`] auto-promotes loose
+///    top-level fields into `dps` unless a `dps`/`data` key is already
+///    present.
+///
+/// Arrays of objects are handled per-element (vars merge into each item).
+#[must_use]
+pub fn parse_mqtt_payload(payload: &str, vars: &HashMap<String, String>) -> Value {
+    let mut val =
+        serde_json::from_str::<Value>(payload).unwrap_or_else(|_| Value::String(payload.to_string()));
+
+    // Array: merge vars into each object element (and apply `set` heuristic).
+    if let Some(arr) = val.as_array_mut() {
+        for item in arr {
+            if let Some(obj) = item.as_object_mut() {
+                for (k, v) in vars {
+                    if !obj.contains_key(k) {
+                        obj.insert(k.clone(), Value::String(v.clone()));
+                    }
+                }
+                if obj.get("action").and_then(Value::as_str) == Some("set") {
+                    apply_set_heuristic(obj);
+                }
+            }
+        }
+        return val;
+    }
+
+    // Scalar: wrap so vars can be merged. With `{dp}` from topic, the
+    // scalar becomes the value for that DP; otherwise stash under `payload`.
+    if !val.is_object() {
+        let mut obj = Map::new();
+        if let Some(dp) = vars.get("dp") {
+            let mut dps = Map::new();
+            dps.insert(dp.clone(), val);
+            obj.insert("dps".to_string(), Value::Object(dps));
+        } else {
+            obj.insert("payload".to_string(), val);
+        }
+        val = Value::Object(obj);
+    }
+
+    if let Some(obj) = val.as_object_mut() {
+        for (k, v) in vars {
+            if !obj.contains_key(k) {
+                obj.insert(k.clone(), Value::String(v.clone()));
+            }
+        }
+        if obj.get("action").and_then(Value::as_str) == Some("set") {
+            apply_set_heuristic(obj);
+        }
+    }
+    val
+}
+
+/// `set` action helper: when the caller didn't provide an explicit `dps`
+/// (or `data`) object, treat every top-level field that is *not* a
+/// reserved `BridgeRequest` key as a DP id/value pair and collect them
+/// under `dps`. The deny-list must cover every field used by any
+/// `BridgeRequest` variant (plus topic-merged keys like `dp` and the
+/// scalar-wrap key `payload`) — adding a new field to `BridgeRequest`
+/// without updating this list will silently turn it into a DP write.
+///
+/// The loose top-level fields are *not* removed after copying into `dps`;
+/// `BridgeRequest`'s deserializer ignores fields it doesn't recognize, so
+/// leaving them avoids touching the parent object's shape (preserving the
+/// historical behavior the test suite locks in).
+pub fn apply_set_heuristic(obj: &mut Map<String, Value>) {
+    const RESERVED_FIELDS: &[&str] = &[
+        // BridgeRequest variants' fields:
+        "action",
+        "id",
+        "name",
+        "key",
+        "ip",
+        "version",
+        "cid",
+        "parent_id",
+        "cmd",
+        "data",
+        "dps",
+        // Topic-merged / scalar-wrap synthetic keys:
+        "dp",
+        "payload",
+    ];
+    if !obj.contains_key("dps") && !obj.contains_key("data") {
+        let mut dps = obj.clone();
+        for f in RESERVED_FIELDS {
+            dps.remove(*f);
+        }
+        obj.insert("dps".to_string(), Value::Object(dps));
     }
 }
 
@@ -389,5 +505,102 @@ mod tests {
     fn seed_dps_unparseable_template_returns_none() {
         let dps = parse_seed_dps("anything", Some("1"), Some("v={value}"));
         assert!(dps.is_none());
+    }
+
+    // ── parse_mqtt_payload / apply_set_heuristic ─────────────────────────
+
+    #[test]
+    fn parse_payload_merges_topic_vars_into_object() {
+        let vars: HashMap<String, String> =
+            [("id".into(), "dev-1".into())].into_iter().collect();
+        let val = parse_mqtt_payload(r#"{"action":"get"}"#, &vars);
+        assert_eq!(val.get("id").and_then(|v| v.as_str()), Some("dev-1"));
+        assert_eq!(val.get("action").and_then(|v| v.as_str()), Some("get"));
+    }
+
+    #[test]
+    fn parse_payload_topic_vars_do_not_overwrite_payload_keys() {
+        let vars: HashMap<String, String> =
+            [("id".into(), "from-topic".into())].into_iter().collect();
+        let val = parse_mqtt_payload(r#"{"id":"from-payload"}"#, &vars);
+        assert_eq!(
+            val.get("id").and_then(|v| v.as_str()),
+            Some("from-payload")
+        );
+    }
+
+    #[test]
+    fn parse_payload_wraps_scalar_with_dp_var_into_dps() {
+        let vars: HashMap<String, String> = [("dp".into(), "1".into())].into_iter().collect();
+        let val = parse_mqtt_payload("true", &vars);
+        assert_eq!(val.get("dps").and_then(|v| v.get("1")), Some(&json!(true)));
+    }
+
+    #[test]
+    fn parse_payload_set_heuristic_promotes_loose_fields_into_dps() {
+        let vars: HashMap<String, String> = HashMap::new();
+        let val = parse_mqtt_payload(
+            r#"{"action":"set","id":"dev-1","1":true,"2":50}"#,
+            &vars,
+        );
+        let dps = val.get("dps").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(dps.get("1"), Some(&json!(true)));
+        assert_eq!(dps.get("2"), Some(&json!(50)));
+        // Selector/action fields must not be smuggled into dps.
+        assert!(!dps.contains_key("id"));
+        assert!(!dps.contains_key("action"));
+    }
+
+    #[test]
+    fn parse_payload_set_heuristic_excludes_all_bridge_request_fields() {
+        // When the heuristic runs (no explicit `dps` / `data`), every
+        // BridgeRequest top-level field (key/ip/version/cid/parent_id/cmd
+        // + the existing core ones) must be stripped from auto-built dps
+        // so a typo'd/misplaced reserved field can't silently become a DP
+        // write.
+        let vars: HashMap<String, String> = HashMap::new();
+        let val = parse_mqtt_payload(
+            r#"{"action":"set","id":"dev","name":"n","key":"k","ip":"1.2.3.4",
+                "version":"3.3","cid":"c","parent_id":"p","cmd":7,
+                "dp":"99","payload":"x","1":true}"#,
+            &vars,
+        );
+        let dps = val.get("dps").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(dps.get("1"), Some(&json!(true)));
+        for reserved in [
+            "action", "id", "name", "key", "ip", "version", "cid", "parent_id",
+            "cmd", "dp", "payload", "dps",
+        ] {
+            assert!(
+                !dps.contains_key(reserved),
+                "reserved field `{reserved}` leaked into auto-built dps"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_payload_set_heuristic_skips_when_data_present() {
+        // Documented behavior: `data` opts out of the auto-wrap, so the
+        // payload is passed through unchanged (no `dps` synthesized).
+        let vars: HashMap<String, String> = HashMap::new();
+        let val = parse_mqtt_payload(
+            r#"{"action":"set","id":"dev","data":{"x":1}}"#,
+            &vars,
+        );
+        assert!(val.get("dps").is_none());
+        assert_eq!(val.get("data"), Some(&json!({"x": 1})));
+    }
+
+    #[test]
+    fn parse_payload_array_merges_vars_per_item() {
+        let vars: HashMap<String, String> =
+            [("id".into(), "dev-1".into())].into_iter().collect();
+        let val = parse_mqtt_payload(
+            r#"[{"action":"get"},{"action":"status","id":"override"}]"#,
+            &vars,
+        );
+        let arr = val.as_array().unwrap();
+        assert_eq!(arr[0].get("id").and_then(|v| v.as_str()), Some("dev-1"));
+        assert_eq!(arr[1].get("id").and_then(|v| v.as_str()), Some("override"));
     }
 }

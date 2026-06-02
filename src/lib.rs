@@ -3,6 +3,7 @@ pub mod config;
 pub mod dps_cache;
 pub mod error;
 pub mod handlers;
-pub mod payload_parse;
+pub mod payload;
 pub mod server;
+pub mod template;
 pub mod types;

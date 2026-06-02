@@ -1,12 +1,10 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
-use rustuyabridge::bridge::{
-    BridgeContext, compile_topic_regex, match_topic, render_template, tpl_to_wildcard,
-};
 use rustuyabridge::config::Cli;
-use rustuyabridge::payload_parse::{parse_payload_with_template, validate_payload_template};
+use rustuyabridge::payload::{parse_mqtt_payload, parse_payload_with_template, validate_payload_template};
 use rustuyabridge::server::BridgeServer;
+use rustuyabridge::template::{compile_topic_regex, match_topic, render_template, tpl_to_wildcard};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,8 +81,9 @@ fn render_template_py(template: &str, vars: HashMap<String, String>) -> String {
 
 /// Parses an MQTT payload into a structured value, merging in topic variables.
 ///
-/// This mirrors `BridgeContext::parse_mqtt_payload` so the manager interprets
-/// custom payload templates identically to the bridge.
+/// Mirrors `rustuyabridge::payload::parse_mqtt_payload` — the bridge's own
+/// command parser — so the manager interprets custom payload templates
+/// identically to the bridge.
 #[pyfunction]
 #[pyo3(name = "parse_payload")]
 #[allow(clippy::needless_pass_by_value)]
@@ -93,7 +92,7 @@ fn parse_payload_py<'py>(
     payload: &str,
     vars: HashMap<String, String>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let val = BridgeContext::parse_mqtt_payload(payload, &vars);
+    let val = parse_mqtt_payload(payload, &vars);
     json_value_to_py(py, &val)
 }
 

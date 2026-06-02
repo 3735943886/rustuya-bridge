@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use crate::config::{Cli, DeviceConfig, load_state};
 use crate::dps_cache::DpsCache;
 use crate::error::BridgeError;
+use crate::template::{compile_topic_regex, match_topic, render_template, tpl_to_wildcard};
 use crate::types::{ApiResponse, BridgeRequest};
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
@@ -112,11 +113,6 @@ pub struct BridgeContext {
     pub seed_state_regex: Option<Regex>,
 }
 
-/// Topic-template variable keys recognised by [`tpl_to_wildcard`], [`compile_topic_regex`],
-/// and [`BridgeContext::replace_vars`]. The `value`, `dps`, `timestamp`, and `root` keys are
-/// handled separately because they require values rather than wildcard substitution.
-const TOPIC_WILDCARD_KEYS: &[&str] = &["id", "name", "dp", "action", "cid", "type", "level"];
-
 /// Records which identifier placeholders (`{id}`, `{name}`, `{cid}`) a set of
 /// topic/payload templates references. Used to decide whether `retain=true` is
 /// safe: a retained message must carry an identifier so the scavenger can find
@@ -168,92 +164,11 @@ impl IdentifierSet {
     }
 }
 
-/// Walks a template string and substitutes `{key}` placeholders.
-///
-/// It calls `substitute(key, &mut out)` for each placeholder. The callback returns
-/// `true` to consume the placeholder or `false` to leave it untouched
-/// (the literal `{key}` is then emitted).
-pub fn render_template<F>(template: &str, mut substitute: F) -> String
-where
-    F: FnMut(&str, &mut String) -> bool,
-{
-    let mut res = String::with_capacity(template.len() + 32);
-    let mut last = 0;
-    while let Some(start) = template[last..].find('{') {
-        let actual_start = last + start;
-        res.push_str(&template[last..actual_start]);
-        let Some(end) = template[actual_start..].find('}') else {
-            break;
-        };
-        let actual_end = actual_start + end;
-        let key = &template[actual_start + 1..actual_end];
-        if substitute(key, &mut res) {
-            last = actual_end + 1;
-        } else {
-            res.push('{');
-            last = actual_start + 1;
-        }
-    }
-    res.push_str(&template[last..]);
-    res
-}
+// Template / payload helpers moved into dedicated modules — see
+// [`crate::template`] (forward substitution, topic ↔ wildcard / regex,
+// `match_topic`) and [`crate::payload`] (inbound command parsing, reverse
+// template parsing, seed-phase DPS extraction).
 
-// Seed payload parsing is delegated to [`crate::payload_parse::parse_seed_dps`]
-// which short-circuits the default `{value}` template and delegates to the
-// template-aware reverse parser for custom JSON-shaped templates.
-
-/// Converts MQTT template to wildcard for subscription
-#[must_use]
-pub fn tpl_to_wildcard(template: &str, root_topic: &str) -> String {
-    render_template(template, |key, out| match key {
-        "root" => {
-            out.push_str(root_topic);
-            true
-        }
-        k if TOPIC_WILDCARD_KEYS.contains(&k) => {
-            out.push('+');
-            true
-        }
-        _ => false,
-    })
-}
-
-/// Compiles a template into a Regex if it contains variables
-#[must_use]
-pub fn compile_topic_regex(template: &str) -> Option<Regex> {
-    if !template.contains('{') {
-        return None;
-    }
-
-    // Convert template to regex. E.g. "tuya/{id}/command" -> "^tuya/(?P<id>[^/]+)/command$"
-    let mut pattern = regex::escape(template);
-    for key in TOPIC_WILDCARD_KEYS {
-        pattern = pattern.replace(&format!(r"\{{{key}\}}"), &format!(r"(?P<{key}>[^/]+)"));
-    }
-
-    Regex::new(&format!("^{pattern}$")).ok()
-}
-
-/// Matches MQTT topic against precompiled regex or template
-#[must_use]
-pub fn match_topic(
-    topic: &str,
-    template: &str,
-    re: Option<&Regex>,
-) -> Option<HashMap<String, String>> {
-    if let Some(re) = re {
-        let caps = re.captures(topic)?;
-        let mut vars = HashMap::new();
-        for name in re.capture_names().flatten() {
-            if let Some(m) = caps.name(name) {
-                vars.insert(name.to_string(), m.as_str().to_string());
-            }
-        }
-        Some(vars)
-    } else {
-        (topic == template).then(HashMap::new)
-    }
-}
 async fn verify_write_permission(state_file: &str) -> Result<()> {
     let path = Path::new(state_file);
 
@@ -390,7 +305,7 @@ impl BridgeContext {
 
         // The seed phase parses broker-retained snapshots into the cache.
         // Default `{value}` is handled directly; any other template is run
-        // through the JSON-tree reverse parser in [`crate::payload_parse`]
+        // through the JSON-tree reverse parser in [`crate::payload`]
         // (sentinel + parallel walk), which works for any JSON-shaped
         // template. Only text-style templates (e.g. `v={value};ts={timestamp}`)
         // remain unparseable — those disable seed entirely and the bridge
@@ -398,12 +313,12 @@ impl BridgeContext {
         let seed_supported = effective_retain
             && match cli.mqtt_payload_template.as_deref() {
                 None | Some("{value}") => true,
-                Some(tpl) => crate::payload_parse::validate_payload_template(tpl).is_ok(),
+                Some(tpl) => crate::payload::validate_payload_template(tpl).is_ok(),
             };
         if effective_retain
             && !seed_supported
             && let Some(tpl) = cli.mqtt_payload_template.as_deref()
-            && let Err(why) = crate::payload_parse::validate_payload_template(tpl)
+            && let Err(why) = crate::payload::validate_payload_template(tpl)
         {
             warn!(
                 "Seed phase disabled: {why}. The bridge will overwrite broker retained on first publish per device."
@@ -805,7 +720,7 @@ impl BridgeContext {
                                 if seed_active && p.retain
                                     && let Some((id, dp_opt)) = self.match_seed_topic(&p.topic)
                                 {
-                                    if let Some(dps) = crate::payload_parse::parse_seed_dps(
+                                    if let Some(dps) = crate::payload::parse_seed_dps(
                                         &payload,
                                         dp_opt.as_deref(),
                                         self.mqtt_payload_template.as_deref(),
@@ -829,7 +744,7 @@ impl BridgeContext {
                                 }
 
                                 let vars = match_topic(&p.topic, &mqtt_command_topic, command_topic_re.as_ref()).unwrap_or_default();
-                                let req_val = Self::parse_mqtt_payload(&payload, &vars);
+                                let req_val = crate::payload::parse_mqtt_payload(&payload, &vars);
 
                                 let requests = match req_val {
                                     Value::Array(arr) => arr
@@ -1078,84 +993,9 @@ impl BridgeContext {
         Ok(opts)
     }
 
-    /// Parses MQTT payload into a [`BridgeRequest`] value, merging topic variables.
-    pub fn parse_mqtt_payload(payload: &str, vars: &HashMap<String, String>) -> Value {
-        let mut val = serde_json::from_str::<Value>(payload)
-            .unwrap_or_else(|_| Value::String(payload.to_string()));
-
-        // If it's an array, merge topic variables into each element
-        if let Some(arr) = val.as_array_mut() {
-            for item in arr {
-                if let Some(obj) = item.as_object_mut() {
-                    for (k, v) in vars {
-                        if !obj.contains_key(k) {
-                            obj.insert(k.clone(), Value::String(v.clone()));
-                        }
-                    }
-                    // Heuristic for 'set' action inside array items
-                    if obj.get("action").and_then(Value::as_str) == Some("set") {
-                        Self::apply_set_heuristic(obj);
-                    }
-                }
-            }
-            return val;
-        }
-
-        // If it's not an object (and not an array), wrap it so we can merge topic variables
-        if !val.is_object() {
-            let mut obj = serde_json::Map::new();
-            if let Some(dp) = vars.get("dp") {
-                // If we have a {dp} in topic, the payload is the value for that DP
-                let mut dps = serde_json::Map::new();
-                dps.insert(dp.clone(), val);
-                obj.insert("dps".to_string(), Value::Object(dps));
-            } else {
-                // Otherwise, keep it as a generic payload field
-                obj.insert("payload".to_string(), val);
-            }
-            val = Value::Object(obj);
-        }
-
-        if let Some(obj) = val.as_object_mut() {
-            // Merge topic variables (id, name, cid, action, dp etc)
-            for (k, v) in vars {
-                if !obj.contains_key(k) {
-                    obj.insert(k.clone(), Value::String(v.clone()));
-                }
-            }
-
-            // Heuristic for tuya2mqtt compatibility and simple set commands:
-            // If action is 'set', ensure we have a 'dps' object
-            if obj.get("action").and_then(Value::as_str) == Some("set") {
-                Self::apply_set_heuristic(obj);
-            }
-        }
-        val
-    }
-
-    /// Helper to apply 'set' command heuristic to an object.
-    ///
-    /// Treats every top-level field that is *not* a known `BridgeRequest`
-    /// field as a DP id/value pair. The deny-list must cover every field used
-    /// by any `BridgeRequest` variant (plus topic-merged keys like `dp` and the
-    /// scalar-wrap key `payload`) — adding a new field to `BridgeRequest`
-    /// without updating this list will silently turn it into a DP write.
-    fn apply_set_heuristic(obj: &mut serde_json::Map<String, Value>) {
-        const RESERVED_FIELDS: &[&str] = &[
-            // BridgeRequest variants' fields:
-            "action", "id", "name", "key", "ip", "version", "cid", "parent_id",
-            "cmd", "data", "dps",
-            // Topic-merged / scalar-wrap synthetic keys:
-            "dp", "payload",
-        ];
-        if !obj.contains_key("dps") && !obj.contains_key("data") {
-            let mut dps = obj.clone();
-            for f in RESERVED_FIELDS {
-                dps.remove(*f);
-            }
-            obj.insert("dps".to_string(), Value::Object(dps));
-        }
-    }
+    // `parse_mqtt_payload` and `apply_set_heuristic` live in
+    // [`crate::payload`] — they're pure functions with no `BridgeContext`
+    // state. The MQTT command loop calls them via `crate::payload::`.
 
     /// Atomically saves device configuration to state file
     ///
@@ -2245,7 +2085,6 @@ impl Drop for BridgeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     // ── IdentifierSet ──────────────────────────────────────────────────────────
 
@@ -2295,151 +2134,8 @@ mod tests {
         assert!(s.satisfied_by(None, Some("sub-1")));
     }
 
-    // ── tpl_to_wildcard ────────────────────────────────────────────────────────
-
-    #[test]
-    fn tpl_to_wildcard_substitutes_root_and_wildcards_variables() {
-        assert_eq!(
-            tpl_to_wildcard("{root}/event/{type}/{id}", "rustuya"),
-            "rustuya/event/+/+"
-        );
-    }
-
-    #[test]
-    fn tpl_to_wildcard_preserves_unknown_keys_literally() {
-        assert_eq!(
-            tpl_to_wildcard("{root}/{value}/x", "rustuya"),
-            "rustuya/{value}/x"
-        );
-    }
-
-    // ── compile_topic_regex / match_topic ─────────────────────────────────────
-
-    #[test]
-    fn compile_topic_regex_returns_none_for_literal_template() {
-        assert!(compile_topic_regex("rustuya/command").is_none());
-    }
-
-    #[test]
-    fn match_topic_extracts_variables() {
-        let tpl = "rustuya/event/{type}/{id}";
-        let re = compile_topic_regex(tpl).unwrap();
-        let vars = match_topic("rustuya/event/active/dev-1", tpl, Some(&re)).unwrap();
-        assert_eq!(vars.get("type").map(String::as_str), Some("active"));
-        assert_eq!(vars.get("id").map(String::as_str), Some("dev-1"));
-    }
-
-    #[test]
-    fn match_topic_rejects_mismatch() {
-        let tpl = "rustuya/event/{id}";
-        let re = compile_topic_regex(tpl).unwrap();
-        assert!(match_topic("rustuya/other/dev-1", tpl, Some(&re)).is_none());
-    }
-
-    #[test]
-    fn match_topic_literal_template_exact_match() {
-        assert!(match_topic("rustuya/command", "rustuya/command", None).is_some());
-        assert!(match_topic("rustuya/command/x", "rustuya/command", None).is_none());
-    }
-
-    // ── render_template ────────────────────────────────────────────────────────
-
-    #[test]
-    fn render_template_substitutes_known_keys_and_keeps_unknown() {
-        let mut vars = HashMap::new();
-        vars.insert("a".to_string(), "1".to_string());
-        let out = render_template("x={a},y={b}", |key, out| {
-            vars.get(key).is_some_and(|v| {
-                out.push_str(v);
-                true
-            })
-        });
-        assert_eq!(out, "x=1,y={b}");
-    }
-
-    // ── parse_mqtt_payload ────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_payload_merges_topic_vars_into_object() {
-        let vars: HashMap<String, String> =
-            [("id".into(), "dev-1".into())].into_iter().collect();
-        let val = BridgeContext::parse_mqtt_payload(r#"{"action":"get"}"#, &vars);
-        assert_eq!(val.get("id").and_then(|v| v.as_str()), Some("dev-1"));
-        assert_eq!(val.get("action").and_then(|v| v.as_str()), Some("get"));
-    }
-
-    #[test]
-    fn parse_payload_topic_vars_do_not_overwrite_payload_keys() {
-        let vars: HashMap<String, String> =
-            [("id".into(), "from-topic".into())].into_iter().collect();
-        let val = BridgeContext::parse_mqtt_payload(r#"{"id":"from-payload"}"#, &vars);
-        assert_eq!(
-            val.get("id").and_then(|v| v.as_str()),
-            Some("from-payload")
-        );
-    }
-
-    #[test]
-    fn parse_payload_wraps_scalar_with_dp_var_into_dps() {
-        let vars: HashMap<String, String> = [("dp".into(), "1".into())].into_iter().collect();
-        let val = BridgeContext::parse_mqtt_payload("true", &vars);
-        assert_eq!(val.get("dps").and_then(|v| v.get("1")), Some(&json!(true)));
-    }
-
-    #[test]
-    fn parse_payload_set_heuristic_promotes_loose_fields_into_dps() {
-        let vars: HashMap<String, String> = HashMap::new();
-        let val = BridgeContext::parse_mqtt_payload(
-            r#"{"action":"set","id":"dev-1","1":true,"2":50}"#,
-            &vars,
-        );
-        let dps = val.get("dps").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(dps.get("1"), Some(&json!(true)));
-        assert_eq!(dps.get("2"), Some(&json!(50)));
-        // Selector/action fields must not be smuggled into dps.
-        assert!(!dps.contains_key("id"));
-        assert!(!dps.contains_key("action"));
-    }
-
-    #[test]
-    fn parse_payload_set_heuristic_excludes_all_bridge_request_fields() {
-        // Regression guard for the extended deny-list: when the heuristic runs
-        // (no explicit `dps` / `data`), every BridgeRequest top-level field
-        // (key/ip/version/cid/parent_id/cmd + the existing core ones) must be
-        // stripped from auto-built dps, so a typo'd/misplaced reserved field
-        // can't silently become a DP write.
-        let vars: HashMap<String, String> = HashMap::new();
-        let val = BridgeContext::parse_mqtt_payload(
-            r#"{"action":"set","id":"dev","name":"n","key":"k","ip":"1.2.3.4",
-                "version":"3.3","cid":"c","parent_id":"p","cmd":7,
-                "dp":"99","payload":"x","1":true}"#,
-            &vars,
-        );
-        let dps = val.get("dps").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(dps.get("1"), Some(&json!(true)));
-        for reserved in [
-            "action", "id", "name", "key", "ip", "version", "cid", "parent_id",
-            "cmd", "dp", "payload", "dps",
-        ] {
-            assert!(
-                !dps.contains_key(reserved),
-                "reserved field `{reserved}` leaked into auto-built dps"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_payload_set_heuristic_skips_when_data_present() {
-        // Documented behavior: `data` opts out of the auto-wrap, so the
-        // payload is passed through unchanged (no `dps` synthesized).
-        let vars: HashMap<String, String> = HashMap::new();
-        let val = BridgeContext::parse_mqtt_payload(
-            r#"{"action":"set","id":"dev","data":{"x":1}}"#,
-            &vars,
-        );
-        assert!(val.get("dps").is_none());
-        assert_eq!(val.get("data"), Some(&json!({"x": 1})));
-    }
+    // template / payload pure-function tests moved alongside their subjects
+    // in `crate::template::tests` and `crate::payload::tests`.
 
 // ── Async / context-bound behavior tests ─────────────────────────────────
 // Tests below construct a full BridgeContext over a tempdir so they exercise
@@ -3166,7 +2862,7 @@ mod context_tests {
 
     // (The historical "custom template disables seed" assertion was retired
     // — JSON-shaped templates are now seed-parseable. The retained-shape
-    // gate lives in `payload_parse::validate_payload_template`; coverage
+    // gate lives in `payload::validate_payload_template`; coverage
     // for both the supported and unsupported cases is in two new tests
     // below, near the other ☆ seed setup.)
 
@@ -3199,7 +2895,7 @@ mod context_tests {
     }
 
     // parse_seed_payload-equivalent unit tests live in
-    // `crate::payload_parse::tests` (default + custom-template scenarios).
+    // `crate::payload::tests` (default + custom-template scenarios).
 
     #[tokio::test]
     async fn cache_mode_custom_template_with_parseable_shape_enables_seed() {
@@ -3490,17 +3186,4 @@ mod context_tests {
         );
     }
 }
-
-    #[test]
-    fn parse_payload_array_merges_vars_per_item() {
-        let vars: HashMap<String, String> =
-            [("id".into(), "dev-1".into())].into_iter().collect();
-        let val = BridgeContext::parse_mqtt_payload(
-            r#"[{"action":"get"},{"action":"status","id":"override"}]"#,
-            &vars,
-        );
-        let arr = val.as_array().unwrap();
-        assert_eq!(arr[0].get("id").and_then(|v| v.as_str()), Some("dev-1"));
-        assert_eq!(arr[1].get("id").and_then(|v| v.as_str()), Some("override"));
-    }
 }
