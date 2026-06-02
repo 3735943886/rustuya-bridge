@@ -11,8 +11,7 @@
 //! concrete payload the bridge produced from it, recover each
 //! placeholder's captured value.
 //!
-//! Algorithm (mirrors `rustuya_manager.payload.parse_payload_with_template`;
-//! eventual manager refactor will delegate to this implementation):
+//! Algorithm:
 //!
 //! 1. Replace every recognized `{var}` (and the equivalent `"{var}"` for
 //!    already-quoted occurrences) with a unique sentinel string, wrapping
