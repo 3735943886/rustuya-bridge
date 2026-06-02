@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.7] — Python 0.2.0-rc.7 — 2026-06-02
+
+Follow-up to rc.6 — fixes the `{type}` validation that wrongly
+downgraded a real user's working setup, plus channel headroom and
+documentation cleanups.
+
+### Fixed
+- **Cache mode now accepts `{type}` in `mqtt_payload_template` alone**
+  (not just in `mqtt_event_topic`). The earlier check refused to
+  enable cache mode for users with a custom payload template like
+  `{"type":"{type}","value":{value}}` — even though HA can filter on
+  `value_json.type` perfectly well in that setup. Validation also
+  demoted from ERROR + downgrade to WARN-only: MQTT semantics keep
+  the reload path safe regardless (no-retain active never overwrites
+  the retained snapshot); only live event automations on the snapshot
+  topic might double-fire without `{type}`. mqtt_retain=true is the
+  user's explicit opt-in and the bridge now honors it.
+
+### Changed
+- **MQTT outbound channel capacity 100 → 200.** Cache mode emits two
+  publishes per active event (delta + snapshot); the original 100-slot
+  buffer left half the burst headroom of the pre-rc.6 workload.
+
+### Documentation
+- `docs/internals.md` §4.3 rewritten around the live-double-fire
+  framing (the reload re-fire was already gone in rc.6 regardless of
+  templates; the remaining concern is per-event live double-fire when
+  consumers can't filter active vs snapshot).
+- ★/☆ chat shorthand replaced with **pass-through mode** /
+  **cache mode** across code, docs, CHANGELOG, and runtime logs.
+  No behavior change.
+- Tuya `HEART_BEAT` no longer described as a source of device state.
+  State arrives via `DP_STATUS` push, `DP_QUERY` response, or
+  periodic device-initiated reports — never the keepalive timer.
+  Affected wording in rc.5 and rc.6 entries fixed for accuracy.
+
 ## [0.3.0-rc.6] — Python 0.2.0-rc.6 — 2026-06-02
 
 Retain-semantics overhaul. Fixes a long-standing data-loss bug for
