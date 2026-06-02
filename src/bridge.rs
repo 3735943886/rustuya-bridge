@@ -1409,7 +1409,11 @@ impl BridgeContext {
             return;
         }
 
-        self.publish_snapshot(&id, name_opt, cid_opt).await;
+        // Pass `changed` so single-DP mode only republishes the DPs that
+        // actually changed — otherwise a one-DP update would also resend
+        // the retained snapshots for every other cached DP on this device.
+        self.publish_snapshot(&id, name_opt, cid_opt, Some(&changed))
+            .await;
     }
 
     /// Match an incoming topic against the seed wildcard regex and return
@@ -1447,25 +1451,56 @@ impl BridgeContext {
                     .map(|c| (c.name.clone(), c.cid.clone()))
                     .unwrap_or((None, None))
             };
-            self.publish_snapshot(&id, name.as_deref(), cid.as_deref())
+            // Seed flush: pass None so the full cache is re-asserted as
+            // initial sync (we don't track per-DP dirty during seed).
+            self.publish_snapshot(&id, name.as_deref(), cid.as_deref(), None)
                 .await;
         }
     }
 
     /// Publishes the cached snapshot for one device on the `{type}=passive`
-    /// topic with retain. Used both by the per-event cache route and by the
-    /// seed-end flush. Applies the same identifier-set retain gate as
-    /// historical events — if the template references `{name}`/`{cid}` and
-    /// this device lacks them, retain is stripped so the scavenger can still
-    /// reach the message later.
+    /// topic with retain. `only_keys` narrows what gets published in
+    /// single-DP mode (one topic per DP) so an event that changed DP 1
+    /// doesn't republish a still-current DP 2's retained — pass
+    /// `Some(&changed)` from the per-event path. Seed-end flush passes
+    /// `None` to (re)assert the full cache as an initial sync.
+    /// In multi-DP mode (one topic per device, full DPS dict in payload)
+    /// the filter is meaningless and ignored: a single message always
+    /// carries the full snapshot.
+    ///
+    /// Applies the same identifier-set retain gate as historical events —
+    /// if the template references `{name}`/`{cid}` and this device lacks
+    /// them, retain is stripped so the scavenger can still reach the
+    /// message later.
     pub(crate) async fn publish_snapshot(
         &self,
         id: &str,
         name: Option<&str>,
         cid: Option<&str>,
+        only_keys: Option<&[String]>,
     ) {
         let Some(cache) = &self.cache else { return };
-        let Some(snap) = cache.snapshot(id) else { return };
+        let Some(full_snap) = cache.snapshot(id) else { return };
+
+        let event_tpl = &self.mqtt_event_topic;
+        let is_single_dp = event_tpl.contains("{dp}") || event_tpl.contains("{value}");
+
+        let snap = match (is_single_dp, only_keys) {
+            (true, Some(keys)) => {
+                let mut filtered = std::collections::BTreeMap::new();
+                for k in keys {
+                    if let Some(v) = full_snap.get(k) {
+                        filtered.insert(k.clone(), v.clone());
+                    }
+                }
+                if filtered.is_empty() {
+                    return;
+                }
+                filtered
+            }
+            _ => full_snap,
+        };
+
         let snap_value =
             Value::Object(snap.into_iter().collect::<serde_json::Map<String, Value>>());
 
@@ -3311,6 +3346,60 @@ mod context_tests {
         let topics: Vec<&str> = snapshots.iter().map(|m| m.topic.as_str()).collect();
         assert!(topics.iter().any(|t| t.ends_with("/1")));
         assert!(topics.iter().any(|t| t.ends_with("/2")));
+    }
+
+    #[tokio::test]
+    async fn cache_mode_single_dp_publishes_only_changed_dps() {
+        // Regression for a user-reported bug: after the cache is populated
+        // with multiple DPs, an event changing one DP should NOT also
+        // republish snapshots for unchanged DPs in single-DP topic mode.
+        // Each per-DP topic already has the correct retained from prior
+        // snapshots — re-emitting them as type=passive on every unrelated
+        // event spuriously surfaces "events" for DPs that didn't change.
+        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.mqtt_retain = Some(true);
+            cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
+        })
+        .await;
+        add_named_direct(&ctx, "dev-1").await;
+        drain_mqtt(&mut mqtt_rx).await;
+        ctx.seed_done.store(true, Ordering::Release);
+
+        // Seed cache with two DPs, drain the resulting publishes.
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            json!({"1": true, "2": 50}),
+            true,
+            true,
+        )
+        .await;
+        drain_mqtt(&mut mqtt_rx).await;
+
+        // Now change only DP 1.
+        ctx.publish_device_event(
+            "dev-1".into(),
+            Some("name-dev-1".into()),
+            None,
+            json!({"1": false}),
+            false,
+            true,
+        )
+        .await;
+
+        let msgs = drain_mqtt(&mut mqtt_rx).await;
+        let snapshots: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "single-DP mode must only republish the DP that changed, not all cached DPs"
+        );
+        assert!(
+            snapshots[0].topic.ends_with("/1"),
+            "snapshot must be for the changed DP only (got '{}')",
+            snapshots[0].topic
+        );
     }
 
     #[tokio::test]
