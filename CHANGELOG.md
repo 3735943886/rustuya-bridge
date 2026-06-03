@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.14] — Python 0.2.0-rc.14 — 2026-06-03
+
+### Changed
+- **Retained cleanup now logs at `info`** how many retained it collected,
+  matched, and actually cleared (plus the topic lists) — diagnostic for
+  pinpointing whether a partial cleanup is a collection, matching, or publish
+  problem. `clear_and_flush` returns the real sent count.
+
 ## [0.3.0-rc.13] — Python 0.2.0-rc.13 — 2026-06-03
 
 ### Fixed

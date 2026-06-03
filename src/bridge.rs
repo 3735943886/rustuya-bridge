@@ -1551,7 +1551,7 @@ impl BridgeContext {
         client: &rumqttc::AsyncClient,
         eventloop: &mut rumqttc::EventLoop,
         topics: &[String],
-    ) {
+    ) -> usize {
         let mut queued = 0usize; // handed to the client
         let mut sent = 0usize; // written to the socket by the eventloop
         while sent < topics.len() {
@@ -1567,9 +1567,13 @@ impl BridgeContext {
             match tokio::time::timeout(Duration::from_secs(5), eventloop.poll()).await {
                 Ok(Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::Publish(_)))) => sent += 1,
                 Ok(Ok(_)) => {}
-                _ => break, // connection error or 5s stall
+                other => {
+                    debug!("clear_and_flush stop after {sent}/{} sent: {other:?}", topics.len());
+                    break; // connection error or 5s stall
+                }
             }
         }
+        sent
     }
 
     /// Spawns a background task to clear retained messages for specific devices
@@ -1719,12 +1723,16 @@ impl BridgeContext {
             }
             to_clear.sort();
             to_clear.dedup();
-            debug!(
-                "Scavenger clearing {} retained for {} devices",
+            let collected: Vec<&String> = seen.iter().map(|(t, _)| t).collect();
+            info!(
+                "Scavenger: collected {} retained, matched {} of {} targets. \
+                 collected={collected:?} to_clear={to_clear:?}",
+                seen.len(),
                 to_clear.len(),
                 active_targets.len()
             );
-            Self::clear_and_flush(&client, &mut eventloop, &to_clear).await;
+            let sent = Self::clear_and_flush(&client, &mut eventloop, &to_clear).await;
+            info!("Scavenger: cleared {sent} of {} matched", to_clear.len());
             let _ = client.disconnect().await;
         });
     }
@@ -2108,10 +2116,11 @@ impl BridgeContext {
 
         // Phase 2: clear every collected topic, flushing without blocking.
         let topics: Vec<String> = topics.into_iter().collect();
-        debug!("Purge clearing {} retained message(s)", topics.len());
-        Self::clear_and_flush(&client, &mut eventloop, &topics).await;
+        info!("Purge: collected {} retained. topics={topics:?}", topics.len());
+        let sent = Self::clear_and_flush(&client, &mut eventloop, &topics).await;
+        info!("Purge: cleared {sent} of {} collected", topics.len());
         let _ = client.disconnect().await;
-        topics.len()
+        sent
     }
 
     /// Re-applies a configuration change by clearing old-scheme retained
