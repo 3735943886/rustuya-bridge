@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Retained cleanup deadlocked after a handful of messages (completes the
+  rc.12 fix).** The scavenger and reconfigure purge published their clears
+  *inline* in the receive loop with `publish().await`; once the bounded request
+  channel filled during a retained burst, the await blocked the loop, the
+  eventloop stopped being polled, and the task hung — clearing only ~6–10
+  messages. For `reconfigure` the hung `purge().await` also never reached the
+  restart. Rewritten to **collect-then-clear**: receive and collect all retained
+  topics first (no publishing, so PUBACKs stay prompt and the channel can't
+  fill), then clear via a non-blocking `try_publish`/`poll` interleave that
+  drains before disconnect. (rc.12's QoS0 switch only traded the QoS1 throttle
+  for broker-side QoS0 drops; reverted to QoS1.)
+- **Coalesced `remove`s missed most devices.** When several `remove`s were
+  forwarded to a running scavenger, retained was matched against the targets
+  known at the instant each message arrived — but retained is delivered once (at
+  subscribe), so devices whose `remove` landed later never matched. The
+  scavenger now collects every retained message and matches against the *final*
+  target set, so a burst of individual removes clears them all.
+
 ## [0.3.0-rc.12] — Python 0.2.0-rc.12 — 2026-06-03
 
 ### Fixed

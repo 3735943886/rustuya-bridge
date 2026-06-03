@@ -1541,17 +1541,33 @@ impl BridgeContext {
         }
     }
 
-    /// Drives the eventloop briefly so queued QoS0 clears actually reach the
-    /// socket before disconnecting — `publish()` only enqueues, and the
-    /// receive loop may exit with a few still unsent. Bounded (≤50 polls) so
-    /// live traffic on the subscribed wildcards can't keep it spinning.
-    async fn flush_eventloop(eventloop: &mut rumqttc::EventLoop) {
-        for _ in 0..50 {
-            if tokio::time::timeout(Duration::from_millis(100), eventloop.poll())
-                .await
-                .is_err()
+    /// Publishes an empty retained (clear) for each topic and drives the
+    /// eventloop until they're all written out. Interleaves non-blocking
+    /// `try_publish` with `poll` so a bounded request channel can never
+    /// deadlock — awaiting `publish()` inside a poll loop blocks the loop the
+    /// moment the channel fills, which stalls the whole task. Bounded by a
+    /// per-poll stall timeout so live traffic can't keep it spinning.
+    async fn clear_and_flush(
+        client: &rumqttc::AsyncClient,
+        eventloop: &mut rumqttc::EventLoop,
+        topics: &[String],
+    ) {
+        let mut queued = 0usize; // handed to the client
+        let mut sent = 0usize; // written to the socket by the eventloop
+        while sent < topics.len() {
+            // Enqueue as many clears as the request channel will take right now.
+            while queued < topics.len()
+                && client
+                    .try_publish(topics[queued].as_str(), rumqttc::QoS::AtLeastOnce, true, "")
+                    .is_ok()
             {
-                break; // a 100ms idle gap means the outgoing queue drained
+                queued += 1;
+            }
+            // Drive the eventloop; count our clears as they leave for the broker.
+            match tokio::time::timeout(Duration::from_secs(5), eventloop.poll()).await {
+                Ok(Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::Publish(_)))) => sent += 1,
+                Ok(Ok(_)) => {}
+                _ => break, // connection error or 5s stall
             }
         }
     }
@@ -1610,11 +1626,13 @@ impl BridgeContext {
         let msg_re = compile_topic_regex(&msg_tpl);
         let scavenger_timeout_secs = self.cli.scavenger_timeout_secs();
 
+        let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &root_topic);
+
         tokio::spawn(async move {
-            let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+            let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 64);
 
             for sub in &subs {
-                if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtMostOnce).await {
+                if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
                     error!("Scavenger subscription failed for {sub}: {e}");
                 } else {
                     debug!("Scavenger subscribed to {sub}");
@@ -1622,6 +1640,15 @@ impl BridgeContext {
             }
 
             let mut active_targets = targets;
+            // Collect every retained message during the receive window, then
+            // match at the end. Retained is delivered once (at subscribe), but
+            // coalesced targets (a burst of `remove`s forwarded via `rx`)
+            // accumulate over time — matching per-message-as-it-arrives would
+            // miss devices whose `remove` landed after their retained was
+            // already received and discarded. Collecting and clearing are kept
+            // separate so our PUBACKs stay prompt (no broker throttle) and the
+            // bounded request channel can't fill and deadlock mid-receive.
+            let mut seen: Vec<(String, bytes::Bytes)> = Vec::new();
             let mut deadline =
                 tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
 
@@ -1640,61 +1667,16 @@ impl BridgeContext {
                             break;
                         }
                     }
-                    () = tokio::time::sleep_until(deadline) => {
-                        break;
-                    }
+                    () = tokio::time::sleep_until(deadline) => break,
                     notification = eventloop.poll() => {
                         match notification {
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
-                                if !p.retain {
+                                if !p.retain || p.topic == config_topic {
                                     continue;
                                 }
-
-                                let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &root_topic);
-                                if p.topic == config_topic {
-                                    continue;
-                                }
-
-                                let mut should_clear = false;
-
-                                // 1. Precise Topic Match
-                                let vars = match_topic(&p.topic, &event_tpl, event_re.as_ref())
-                                    .or_else(|| match_topic(&p.topic, &msg_tpl, msg_re.as_ref()));
-
-                                if let Some(vars) = vars {
-                                    let v_id = vars.get("id");
-                                    let v_name = vars.get("name");
-                                    let v_chan = vars.get("cid");
-
-                                    should_clear = active_targets.iter().any(|t| {
-                                        let id_hit = v_id.is_some_and(|v| v == &t.id);
-                                        let cid_hit = v_chan.is_some() && t.cid.as_ref() == v_chan;
-                                        let name_hit = v_name.is_some() && t.name.as_ref() == v_name;
-                                        id_hit || cid_hit || name_hit
-                                    });
-                                }
-
-                                // 2. Exact Payload Match
-                                if !should_clear {
-                                    let payload = String::from_utf8_lossy(&p.payload);
-                                    should_clear = active_targets.iter().any(|t| {
-                                        // Exact JSON string value match
-                                        let id_match = payload.contains(&format!("\"{}\"", t.id));
-                                        let cid_match = t.cid.as_ref().is_some_and(|cid| payload.contains(&format!("\"{cid}\"")));
-                                        let name_match = t.name.as_ref().is_some_and(|name| payload.contains(&format!("\"{name}\"")));
-                                        id_match || cid_match || name_match
-                                    });
-                                }
-
-                                if should_clear {
-                                    debug!("Scavenger clearing retained message: {}", p.topic);
-                                    // QoS0: empty retained is idempotent, and no
-                                    // PUBACK round-trip means the broker isn't
-                                    // throttled into dribbling out retained.
-                                    let _ = client
-                                        .publish(&p.topic, rumqttc::QoS::AtMostOnce, true, "")
-                                        .await;
-                                }
+                                seen.push((p.topic.clone(), p.payload.clone()));
+                                // Keep the window open while retained keep arriving.
+                                deadline = tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
                             }
                             Err(_) => break, // Connection error
                             _ => {}
@@ -1702,8 +1684,47 @@ impl BridgeContext {
                     }
                 }
             }
-            debug!("Scavenger finished for {} devices", active_targets.len());
-            Self::flush_eventloop(&mut eventloop).await;
+
+            // Match the full set against the final target list, then clear.
+            let mut to_clear: Vec<String> = Vec::new();
+            for (topic, payload) in &seen {
+                // 1. Precise topic match.
+                let vars = match_topic(topic, &event_tpl, event_re.as_ref())
+                    .or_else(|| match_topic(topic, &msg_tpl, msg_re.as_ref()));
+                let mut matched = false;
+                if let Some(vars) = vars {
+                    let v_id = vars.get("id");
+                    let v_name = vars.get("name");
+                    let v_chan = vars.get("cid");
+                    matched = active_targets.iter().any(|t| {
+                        let id_hit = v_id.is_some_and(|v| v == &t.id);
+                        let cid_hit = v_chan.is_some() && t.cid.as_ref() == v_chan;
+                        let name_hit = v_name.is_some() && t.name.as_ref() == v_name;
+                        id_hit || cid_hit || name_hit
+                    });
+                }
+                // 2. Exact payload (quoted-id) fallback.
+                if !matched {
+                    let payload = String::from_utf8_lossy(payload);
+                    matched = active_targets.iter().any(|t| {
+                        let id_match = payload.contains(&format!("\"{}\"", t.id));
+                        let cid_match = t.cid.as_ref().is_some_and(|cid| payload.contains(&format!("\"{cid}\"")));
+                        let name_match = t.name.as_ref().is_some_and(|name| payload.contains(&format!("\"{name}\"")));
+                        id_match || cid_match || name_match
+                    });
+                }
+                if matched {
+                    to_clear.push(topic.clone());
+                }
+            }
+            to_clear.sort();
+            to_clear.dedup();
+            debug!(
+                "Scavenger clearing {} retained for {} devices",
+                to_clear.len(),
+                active_targets.len()
+            );
+            Self::clear_and_flush(&client, &mut eventloop, &to_clear).await;
             let _ = client.disconnect().await;
         });
     }
@@ -2046,16 +2067,19 @@ impl BridgeContext {
         let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &root_topic);
         let timeout = self.cli.scavenger_timeout_secs();
 
-        let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 64);
         for sub in &subs {
-            if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtMostOnce).await {
+            if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
                 error!("Purge subscription failed for {sub}: {e}");
             } else {
                 debug!("Purge subscribed to {sub}");
             }
         }
 
-        let mut cleared: usize = 0;
+        // Phase 1: collect every retained topic. We don't clear inline here —
+        // see `clear_and_flush` for why awaiting a publish inside the receive
+        // loop deadlocks once the request channel fills.
+        let mut topics: HashSet<String> = HashSet::new();
         let mut deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
         loop {
             tokio::select! {
@@ -2068,14 +2092,8 @@ impl BridgeContext {
                             if !p.retain || p.payload.is_empty() || p.topic == config_topic {
                                 continue;
                             }
-                            debug!("Purge clearing retained message: {}", p.topic);
-                            // QoS0: no PUBACK round-trip → broker isn't throttled
-                            // into dribbling out retained one inflight-window at a time.
-                            let _ = client
-                                .publish(&p.topic, rumqttc::QoS::AtMostOnce, true, "")
-                                .await;
-                            cleared += 1;
-                            // Keep draining while a backlog is actively arriving.
+                            topics.insert(p.topic.clone());
+                            // Keep the window open while retained keep arriving.
                             deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
                         }
                         Err(e) => {
@@ -2087,9 +2105,13 @@ impl BridgeContext {
                 }
             }
         }
-        Self::flush_eventloop(&mut eventloop).await;
+
+        // Phase 2: clear every collected topic, flushing without blocking.
+        let topics: Vec<String> = topics.into_iter().collect();
+        debug!("Purge clearing {} retained message(s)", topics.len());
+        Self::clear_and_flush(&client, &mut eventloop, &topics).await;
         let _ = client.disconnect().await;
-        cleared
+        topics.len()
     }
 
     /// Re-applies a configuration change by clearing old-scheme retained
