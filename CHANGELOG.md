@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.11] — Python 0.2.0-rc.11 — 2026-06-03
+
 ### Added
 - **`reconfigure` action** — applies a config change (topic/payload templates
   or `mqtt_retain`) by cleanly restarting the bridge instead of re-registering
