@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.13] — Python 0.2.0-rc.13 — 2026-06-03
+
 ### Fixed
 - **Retained cleanup deadlocked after a handful of messages (completes the
   rc.12 fix).** The scavenger and reconfigure purge published their clears
