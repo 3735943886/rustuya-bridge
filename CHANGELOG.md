@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Retained cleanup (`clear` / `remove` / `reconfigure`) now clears the whole
+  fleet, not a random 1–6 messages.** The scavenger and the reconfigure purge
+  subscribed and published their empty-retain clears at QoS1; the PUBACK
+  round-trips throttled the broker into dribbling out retained one
+  inflight-window at a time, so the short idle window only caught a handful.
+  Both now use QoS0 (an empty retained is idempotent — no delivery guarantee
+  needed) so the broker dumps all retained at once, and both flush the
+  eventloop before disconnecting so the last queued clears aren't dropped.
+
 ## [0.3.0-rc.11] — Python 0.2.0-rc.11 — 2026-06-03
 
 ### Added

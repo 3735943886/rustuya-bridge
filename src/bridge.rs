@@ -1541,6 +1541,21 @@ impl BridgeContext {
         }
     }
 
+    /// Drives the eventloop briefly so queued QoS0 clears actually reach the
+    /// socket before disconnecting — `publish()` only enqueues, and the
+    /// receive loop may exit with a few still unsent. Bounded (≤50 polls) so
+    /// live traffic on the subscribed wildcards can't keep it spinning.
+    async fn flush_eventloop(eventloop: &mut rumqttc::EventLoop) {
+        for _ in 0..50 {
+            if tokio::time::timeout(Duration::from_millis(100), eventloop.poll())
+                .await
+                .is_err()
+            {
+                break; // a 100ms idle gap means the outgoing queue drained
+            }
+        }
+    }
+
     /// Spawns a background task to clear retained messages for specific devices
     #[allow(clippy::too_many_lines, reason = "tokio::select! event-loop driver")]
     pub async fn spawn_retain_scavenger(&self, targets: Vec<crate::types::ScavengerTarget>) {
@@ -1599,7 +1614,7 @@ impl BridgeContext {
             let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
 
             for sub in &subs {
-                if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
+                if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtMostOnce).await {
                     error!("Scavenger subscription failed for {sub}: {e}");
                 } else {
                     debug!("Scavenger subscribed to {sub}");
@@ -1673,8 +1688,11 @@ impl BridgeContext {
 
                                 if should_clear {
                                     debug!("Scavenger clearing retained message: {}", p.topic);
+                                    // QoS0: empty retained is idempotent, and no
+                                    // PUBACK round-trip means the broker isn't
+                                    // throttled into dribbling out retained.
                                     let _ = client
-                                        .publish(&p.topic, rumqttc::QoS::AtLeastOnce, true, "")
+                                        .publish(&p.topic, rumqttc::QoS::AtMostOnce, true, "")
                                         .await;
                                 }
                             }
@@ -1685,6 +1703,7 @@ impl BridgeContext {
                 }
             }
             debug!("Scavenger finished for {} devices", active_targets.len());
+            Self::flush_eventloop(&mut eventloop).await;
             let _ = client.disconnect().await;
         });
     }
@@ -2029,7 +2048,7 @@ impl BridgeContext {
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
         for sub in &subs {
-            if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
+            if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtMostOnce).await {
                 error!("Purge subscription failed for {sub}: {e}");
             } else {
                 debug!("Purge subscribed to {sub}");
@@ -2050,8 +2069,10 @@ impl BridgeContext {
                                 continue;
                             }
                             debug!("Purge clearing retained message: {}", p.topic);
+                            // QoS0: no PUBACK round-trip → broker isn't throttled
+                            // into dribbling out retained one inflight-window at a time.
                             let _ = client
-                                .publish(&p.topic, rumqttc::QoS::AtLeastOnce, true, "")
+                                .publish(&p.topic, rumqttc::QoS::AtMostOnce, true, "")
                                 .await;
                             cleared += 1;
                             // Keep draining while a backlog is actively arriving.
@@ -2066,6 +2087,7 @@ impl BridgeContext {
                 }
             }
         }
+        Self::flush_eventloop(&mut eventloop).await;
         let _ = client.disconnect().await;
         cleared
     }
