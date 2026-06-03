@@ -113,10 +113,15 @@ Run with **host network mode** to ensure Tuya device discovery works correctly:
 docker run -d \
   --name rustuya \
   --network host \
+  --restart unless-stopped \
   -e MQTT_BROKER=mqtt://localhost:1883 \
   -v $(pwd)/data:/data \
   3735943886/rustuya
 ```
+
+`--restart unless-stopped` lets the container come back after a `reconfigure`
+(which exits the process cleanly for the new config to take effect — see
+[Changing templates or retain](#changing-templates-or-retain)).
 
 ## Configuration
 

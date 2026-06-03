@@ -70,6 +70,79 @@ async def main():
 asyncio.run(main())
 ```
 
+## Keeping the bridge running across `reconfigure`
+
+The bridge is meant to be driven entirely over MQTT — including config changes.
+To apply a change to the topic/payload templates or `mqtt_retain`, edit the
+`config_path` file and publish a `reconfigure` action to the command topic. The
+bridge clears the retained messages published under the old scheme and then
+**exits cleanly** so the new config can take effect — exactly like the native
+binary under `systemd Restart=always`.
+
+In an embedded host there is no external supervisor, so wrap the server in a
+small recreate loop. An intentional shutdown stops the *supervisor* (not the
+bridge); any other exit — `reconfigure` or a crash — recreates it, re-reading
+`config_path`:
+
+```python
+# asyncio
+import asyncio
+from pyrustuyabridge import PyBridgeServer
+
+class AsyncBridgeSupervisor:
+    def __init__(self, **kwargs):
+        self._kwargs = {**kwargs, "no_signals": True}  # host owns signals
+        self._stop, self._server = False, None
+
+    async def run(self):
+        while not self._stop:
+            self._server = PyBridgeServer(**self._kwargs)  # re-reads config_path
+            try:
+                await self._server.start_async()           # returns on reconfigure/stop
+            except Exception as e:
+                print("bridge exited with error, restarting:", e)
+                await asyncio.sleep(5)
+
+    def stop(self):
+        self._stop = True
+        if self._server:
+            self._server.stop()
+
+# asyncio.run(AsyncBridgeSupervisor(config_path="/etc/rustuya/config.json").run())
+```
+
+```python
+# thread
+import threading, time
+from pyrustuyabridge import PyBridgeServer
+
+class BridgeSupervisor:
+    def __init__(self, **kwargs):
+        self._kwargs = {**kwargs, "no_signals": True}
+        self._stop = threading.Event()
+        self._server = None
+
+    def run(self):                                   # run in a thread (blocking)
+        while not self._stop.is_set():
+            self._server = PyBridgeServer(**self._kwargs)
+            try:
+                self._server.start()                 # blocks until reconfigure/stop
+            except Exception as e:
+                print("bridge exited with error, restarting:", e)
+                time.sleep(5)
+
+    def stop(self):
+        self._stop.set()
+        if self._server:
+            self._server.stop()
+```
+
+**Config precedence is kwargs > `config_path` file > defaults** (the file only
+fills fields left unset). So put any field you want to change via
+`reconfigure` in the **file**, not in kwargs — a field passed as a kwarg wins
+and the file edit is ignored (same rule as CLI flags vs. config file in the
+native binary).
+
 ## Helpers
 
 The module also exposes topic/payload utilities for code that needs to
