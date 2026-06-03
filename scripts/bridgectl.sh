@@ -287,7 +287,10 @@ User=${SVC_USER}
 Group=${SVC_USER}
 WorkingDirectory=${DATA_DIR}
 ExecStart=${BIN_PATH} --config ${CONFIG_FILE}
-Restart=on-failure
+# 'always' (not 'on-failure') so the bridge comes back after a clean
+# self-exit — the 'reconfigure' action exits 0 to re-read config. An
+# explicit 'systemctl stop' / 'bridgectl stop' still prevents restart.
+Restart=always
 RestartSec=5
 
 # Hardening
