@@ -120,6 +120,7 @@ async fn handle_request_inner(
             .await
         }
         BridgeRequest::Clear => ctx.clear_devices().await,
+        BridgeRequest::Reconfigure => ctx.reconfigure().await,
         BridgeRequest::Status => Ok(ctx.get_bridge_status().await),
         BridgeRequest::Get { id, name, cid } => {
             let by_name = id.is_none() && name.is_some();

@@ -294,6 +294,7 @@ If `--mqtt-command-topic` contains variables like `{id}`, the bridge will automa
 | `request` | `id` or `name`, `cmd`, `data`?, `cid`? | Send raw command. Supports lists `[...]`. |
 | `sub_discover` | `id` or `name` | Trigger sub-device discovery (Gateways). |
 | `scan` | - | Scan for local devices (UDP 6666/6667). |
+| `reconfigure` | - | Clear old-scheme retained messages and restart to apply config changes. See [Changing templates or retain](#changing-templates-or-retain). |
 
 ### Target Selection Rules
 1. **ID Priority**: If both `id` and `name` are provided, `id` is used and `name` is ignored.
@@ -329,6 +330,51 @@ when running under systemd.
 > stale retained messages on the broker for devices it no longer knows
 > about. Send a `clear` command (or per-device `remove`) first. With the
 > default `mqtt_retain = false`, deleting the file is harmless.
+
+### Changing templates or retain
+
+The bridge reads its configuration **only at startup**, so any change to the
+topic/payload templates or `mqtt_retain` needs a restart to take effect.
+Restarting naively, though, leaves a mess when `mqtt_retain = true`: the
+retained state snapshots already on the broker were published under the *old*
+scheme. Change the event/message/payload templates and they sit on the old
+topics as orphans forever; turn retain off and they're never cleared. Consumers
+keep seeing ghost state. Re-registering every device just to clean up is
+overkill.
+
+The `reconfigure` action handles this:
+
+```bash
+# 1. Edit your config FIRST (file / flags / env) — the running bridge ignores
+#    it until restart.
+# 2. Then trigger reconfigure:
+mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "reconfigure"}'
+```
+
+While its old (in-memory) config is still live, the bridge stops retaining new
+publishes (live events keep flowing), clears the retained messages under the
+old scheme, then exits. A process supervisor restarts it into your edited
+config, with device registrations preserved. More generally, `reconfigure` is
+just the "apply a config change" path — *edit config → reconfigure* works for
+any change.
+
+Notes:
+- **Edit the config before triggering** `reconfigure`. If you trigger it first,
+  the restart reloads the unchanged config.
+- Requires a process supervisor that auto-restarts the bridge (systemd
+  `Restart=always`, Docker restart policy, …). Without one, the bridge simply
+  exits. It logs whether a supervisor was detected.
+- With `mqtt_retain` off there are no bridge-published retained snapshots to
+  clear, so it warns but still restarts.
+- During the brief window state isn't retained; it's re-established after the
+  restart (send `get` to your devices to refresh immediately).
+- The retained cleanup is **skipped when nothing scavenge-relevant changed** —
+  if the broker, root/event/message topics, and `mqtt_retain` in your
+  `--config` file still match the running config, `reconfigure` is just a clean
+  restart and won't blank valid retained state. (This skip relies on file-based
+  config; if those fields come from CLI flags or env vars, the cleanup runs
+  regardless.) A broker change still purges — the cleanup runs against the
+  *old* broker before the restart, so its retained don't get orphaned.
 
 ## Further Reading
 

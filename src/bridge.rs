@@ -89,6 +89,13 @@ pub struct BridgeContext {
     pub mqtt_drop_count: AtomicU64,
     pub cancel: tokio_util::sync::CancellationToken,
 
+    /// When set, the outbound publish loop forces `retain=false` on every
+    /// message regardless of its `MqttMessage::retain` flag. Latched on by the
+    /// `reconfigure` action so device events arriving during/after the
+    /// old-scheme retained purge can't recreate orphaned retained snapshots.
+    /// Never cleared — the process exits shortly after it's set.
+    pub retain_suppressed: AtomicBool,
+
     /// Per-device merged DPS cache. `Some` only when `mqtt_retain=true` and the
     /// event topic carries `{type}` (cache mode). `None` in pass-through mode (pass-through).
     pub cache: Option<Arc<DpsCache>>,
@@ -366,6 +373,7 @@ impl BridgeContext {
             scavenger_tx: tokio::sync::Mutex::new(None),
             mqtt_drop_count: AtomicU64::new(0),
             cancel,
+            retain_suppressed: AtomicBool::new(false),
             cache,
             seed_done: AtomicBool::new(initial_seed_done),
             seed_pending: StdMutex::new(BTreeSet::new()),
@@ -784,7 +792,11 @@ impl BridgeContext {
                     msg_opt = mqtt_tx_receiver.recv() => {
                         if let Some(Some(msg)) = msg_opt {
                             debug!("MQTT Publish: [{}] {}", msg.topic, msg.payload);
-                            if let Err(e) = client.publish(msg.topic, rumqttc::QoS::AtLeastOnce, msg.retain, msg.payload).await {
+                            // `reconfigure` latches `retain_suppressed` so no
+                            // new retained snapshots land while the old scheme
+                            // is being purged ahead of a restart.
+                            let retain = msg.retain && !self.retain_suppressed.load(Ordering::Relaxed);
+                            if let Err(e) = client.publish(msg.topic, rumqttc::QoS::AtLeastOnce, retain, msg.payload).await {
                                 error!("Publish failed: {e}");
                             }
                         } else {
@@ -1974,6 +1986,198 @@ impl BridgeContext {
 
         self.request_save();
         Ok(ApiResponse::ok("clear", "all"))
+    }
+
+    /// Clears **every** retained message under the bridge's event and message
+    /// topic wildcards, regardless of device. Connects a transient MQTT client
+    /// (separate from the main one), drains retained messages until
+    /// `scavenger_timeout_secs` of idle, and returns the number of topics
+    /// cleared. Best-effort: returns `0` on no broker or connection failure.
+    ///
+    /// Unlike [`Self::spawn_retain_scavenger`] (which matches a removed-device
+    /// target set), this is unconditional and awaited inline — used by
+    /// `reconfigure` to wipe old-scheme retained snapshots before a restart.
+    pub async fn purge_all_retained(&self) -> usize {
+        let Some(broker_url) = self.cli.mqtt_broker.clone() else {
+            return 0;
+        };
+        let client_id = format!("{}_purge_{}", self.cli.mqtt_client_id(), unix_millis());
+        let mqtt_options =
+            match self.create_mqtt_options(&broker_url, &client_id, &self.cli, false) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    error!("Failed to create MQTT options for purge: {e}");
+                    return 0;
+                }
+            };
+
+        let root_topic = self.mqtt_root_topic.clone();
+        let mut subs = HashSet::new();
+        for tpl in [
+            Some(self.mqtt_event_topic.as_str()),
+            self.mqtt_message_topic.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !tpl.is_empty() {
+                subs.insert(tpl_to_wildcard(tpl, &root_topic));
+            }
+        }
+        let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &root_topic);
+        let timeout = self.cli.scavenger_timeout_secs();
+
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+        for sub in &subs {
+            if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
+                error!("Purge subscription failed for {sub}: {e}");
+            } else {
+                debug!("Purge subscribed to {sub}");
+            }
+        }
+
+        let mut cleared: usize = 0;
+        let mut deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => break,
+                notification = eventloop.poll() => {
+                    match notification {
+                        Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
+                            // Skip non-retained, the bridge-config topic, and our
+                            // own empty clears echoed back to us.
+                            if !p.retain || p.payload.is_empty() || p.topic == config_topic {
+                                continue;
+                            }
+                            debug!("Purge clearing retained message: {}", p.topic);
+                            let _ = client
+                                .publish(&p.topic, rumqttc::QoS::AtLeastOnce, true, "")
+                                .await;
+                            cleared += 1;
+                            // Keep draining while a backlog is actively arriving.
+                            deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+                        }
+                        Err(e) => {
+                            warn!("Purge connection error: {e}");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let _ = client.disconnect().await;
+        cleared
+    }
+
+    /// Re-applies a configuration change by clearing old-scheme retained
+    /// messages and restarting the bridge.
+    ///
+    /// The bridge reads its config only at startup, so any change to the
+    /// topic/payload templates or `mqtt_retain` needs a restart to take
+    /// effect. `reconfigure` performs that restart cleanly *while the old
+    /// (in-memory) config is still live*, so it can scavenge the retained
+    /// snapshots published under the old scheme before they become orphans.
+    ///
+    /// It **always** restarts (relying on a process supervisor to bring the
+    /// bridge back); device registrations are preserved on disk. When
+    /// `mqtt_retain` is off there are no bridge-published retained snapshots to
+    /// clear, so it warns but still restarts — letting "edit config →
+    /// reconfigure" be a uniform habit. The retained purge is skipped when the
+    /// scavenge-relevant config on disk is unchanged (see
+    /// [`Self::scavenge_config_unchanged`]), so a casual reconfigure on an
+    /// unchanged scheme is a plain restart, not a needless state wipe.
+    ///
+    /// # Errors
+    /// Currently always returns `Ok`; reserved for future failure modes.
+    pub async fn reconfigure(&self) -> Result<ApiResponse, BridgeError> {
+        let supervised = std::env::var_os("INVOCATION_ID").is_some()
+            || std::env::var_os("JOURNAL_STREAM").is_some();
+
+        info!("reconfigure: re-applying config via clean restart.");
+        if supervised {
+            info!("reconfigure: process supervisor detected; expecting an automatic restart.");
+        } else {
+            warn!(
+                "reconfigure: no process supervisor detected (no INVOCATION_ID/JOURNAL_STREAM). \
+                 The bridge will exit and must be restarted manually to apply the new config."
+            );
+        }
+
+        if self.cli.mqtt_broker.is_none() {
+            warn!(
+                "reconfigure: no MQTT broker configured — skipping retained cleanup; \
+                 restarting only."
+            );
+        } else if self.scavenge_config_unchanged().await {
+            // The retained topics depend only on the root/event/message
+            // templates and the retain flag; if none of those changed on disk,
+            // the existing retained snapshots are still valid under the
+            // restarted scheme — clearing them would needlessly blank state.
+            info!(
+                "reconfigure: scavenge-relevant config (broker, root/event/message topic, \
+                 retain) is unchanged on disk; restarting without retained cleanup. Edit the \
+                 config first if you intended a change."
+            );
+        } else {
+            // Latch retain off for the rest of this process's life so device
+            // events arriving during/after the purge can't recreate old-scheme
+            // retained snapshots. Live (non-retained) delivery continues.
+            self.retain_suppressed.store(true, Ordering::Relaxed);
+            if !self.mqtt_retain {
+                warn!(
+                    "reconfigure: mqtt_retain is off — clearing any stale retained from a prior \
+                     retain=on run."
+                );
+            }
+            let cleared = self.purge_all_retained().await;
+            info!("reconfigure: cleared {cleared} retained message(s) under the old scheme.");
+        }
+
+        info!("reconfigure: shutting down for restart.");
+        self.cancel.cancel();
+
+        Ok(ApiResponse::ok("reconfigure", "all"))
+    }
+
+    /// Returns `true` when the scavenge-relevant config on disk (broker, root,
+    /// event topic, message topic, and `mqtt_retain` — *not* the payload
+    /// template, which doesn't relocate retained topics) matches the running
+    /// in-memory config, i.e. a restart won't move or orphan any retained
+    /// messages.
+    ///
+    /// Errs toward `false` (→ purge): no `--config` file, an unreadable or
+    /// unparseable file, or any differing field all return `false`. A CLI/env
+    /// override of one of these fields makes the file value diverge from the
+    /// in-memory value, so it also returns `false` — the safe direction, since
+    /// a wrongly-skipped purge would leave permanent orphans while a needless
+    /// purge merely re-syncs state after restart.
+    async fn scavenge_config_unchanged(&self) -> bool {
+        let Some(config_path) = self.cli.config.as_deref() else {
+            return false;
+        };
+        let Ok(content) = tokio::fs::read_to_string(config_path).await else {
+            return false;
+        };
+        let Ok(mut file_cli) = serde_json::from_str::<Cli>(&content) else {
+            return false;
+        };
+        // Resolve omitted fields to the same defaults the runtime config did,
+        // so an absent field reads as its default rather than a spurious diff.
+        file_cli.merge(Cli::default());
+        let (_, file_event) = file_cli.mqtt_topics();
+        let file_root = file_cli
+            .mqtt_root_topic
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_MQTT_ROOT_TOPIC);
+        // The broker is part of "where retained live": switching brokers leaves
+        // the old broker's retained orphaned (the purge runs against the old,
+        // in-memory broker before the restart), so a broker change must purge.
+        file_cli.mqtt_broker == self.cli.mqtt_broker
+            && file_event == self.mqtt_event_topic
+            && file_root == self.mqtt_root_topic
+            && file_cli.mqtt_message_topic == self.mqtt_message_topic
+            && file_cli.mqtt_retain() == self.mqtt_retain
     }
 
     /// Returns current bridge status and registered devices
@@ -3183,6 +3387,94 @@ mod context_tests {
         assert!(
             cache.snapshot("dev-1").is_none(),
             "cache must drop on removal"
+        );
+    }
+
+    // ── reconfigure ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn reconfigure_action_deserializes() {
+        let req: BridgeRequest =
+            serde_json::from_value(json!({ "action": "reconfigure" })).expect("parse reconfigure");
+        assert!(matches!(req, BridgeRequest::Reconfigure));
+        assert_eq!(req.action_name(), "reconfigure");
+    }
+
+    #[tokio::test]
+    async fn reconfigure_without_broker_still_restarts() {
+        // No broker → purge is skipped (nothing to clear), but reconfigure must
+        // still always trigger shutdown ("edit config → reconfigure" is a
+        // uniform habit, broker or not).
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) =
+            make_ctx(|cli| cli.mqtt_broker = None).await;
+
+        assert!(!ctx.cancel.is_cancelled());
+
+        let res = ctx.reconfigure().await.expect("reconfigure ok");
+
+        assert_eq!(res.action.as_deref(), Some("reconfigure"));
+        assert!(
+            ctx.cancel.is_cancelled(),
+            "reconfigure must always trigger shutdown, even with no broker"
+        );
+    }
+
+    #[tokio::test]
+    async fn scavenge_config_unchanged_false_without_config_file() {
+        // No --config path → can't prove the scheme is unchanged → purge.
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+        assert!(!ctx.scavenge_config_unchanged().await);
+    }
+
+    #[tokio::test]
+    async fn scavenge_config_unchanged_detects_match_and_change() {
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let cfg_path = cfg_dir.path().join("config.json");
+        let broker = "mqtt://noop.invalid:1883";
+        let matching = format!(
+            r#"{{"mqtt_broker":"{broker}","mqtt_event_topic":"{{root}}/ev/{{id}}","mqtt_retain":true}}"#
+        );
+        tokio::fs::write(&cfg_path, &matching)
+            .await
+            .expect("write config");
+        let cfg_str = cfg_path.to_string_lossy().into_owned();
+
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+            cli.config = Some(cfg_str.clone());
+            cli.mqtt_broker = Some(broker.into());
+            cli.mqtt_event_topic = Some("{root}/ev/{id}".into());
+            cli.mqtt_retain = Some(true);
+        })
+        .await;
+
+        // File matches in-memory (broker + root/event/message topic + retain) → skip purge.
+        assert!(
+            ctx.scavenge_config_unchanged().await,
+            "matching config must read as unchanged"
+        );
+
+        // Relocate the event topic on disk → a restart would orphan retained → purge.
+        tokio::fs::write(
+            &cfg_path,
+            r#"{"mqtt_broker":"mqtt://noop.invalid:1883","mqtt_event_topic":"{root}/NEW/{id}","mqtt_retain":true}"#,
+        )
+        .await
+        .expect("rewrite config");
+        assert!(
+            !ctx.scavenge_config_unchanged().await,
+            "an event-topic change must be detected"
+        );
+
+        // Point at a different broker → the old broker's retained would orphan → purge.
+        tokio::fs::write(
+            &cfg_path,
+            r#"{"mqtt_broker":"mqtt://other.invalid:1883","mqtt_event_topic":"{root}/ev/{id}","mqtt_retain":true}"#,
+        )
+        .await
+        .expect("rewrite config");
+        assert!(
+            !ctx.scavenge_config_unchanged().await,
+            "a broker change must be detected"
         );
     }
 }

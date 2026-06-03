@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`reconfigure` action** — applies a config change (topic/payload templates
+  or `mqtt_retain`) by cleanly restarting the bridge instead of re-registering
+  devices. While the old in-memory config is still live it stops retaining new
+  publishes (live events keep flowing — no event loss), clears the retained
+  messages published under the old topic scheme so they don't become orphans,
+  then exits for a process supervisor to restart into the edited config. Device
+  registrations are preserved on disk. Always restarts (warns if `mqtt_retain`
+  is off or no broker is configured), but **skips the retained cleanup when the
+  scavenge-relevant config on disk is unchanged** (broker + root/event/message
+  topic + retain), so a casual `reconfigure` on an unchanged scheme is just a
+  restart, not a state wipe. A broker change still purges the *old* broker
+  before restarting. See `README.md` → "Changing templates or retain" and
+  `docs/internals.md` §4.11.
+
 ### Fixed
 - **`bridgectl --prerelease` now correctly picks the newest pre-release.**
   GitHub's `GET /repos/.../releases` is documented as `created_at desc`

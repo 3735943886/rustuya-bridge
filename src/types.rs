@@ -79,6 +79,7 @@ pub enum BridgeRequest {
         name: Option<SingleOrList>,
     },
     Scan,
+    Reconfigure,
 }
 
 impl BridgeRequest {
@@ -94,6 +95,7 @@ impl BridgeRequest {
             Self::Request { .. } => "request",
             Self::SubDiscover { .. } => "sub_discover",
             Self::Scan => "scan",
+            Self::Reconfigure => "reconfigure",
         }
     }
 

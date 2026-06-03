@@ -687,6 +687,67 @@ scavenging — it can't detect a broker that drops retain. If you have
 broker after running for a while, your broker is probably stripping
 retain.
 
+### 4.11 `reconfigure` — applying template/retain changes without re-registering
+
+The bridge reads its config only at startup, so changing the topic/payload
+templates or `mqtt_retain` requires a restart. A naive restart orphans the
+old-scheme retained snapshots on the broker (see §4.8 for the same hazard via
+the state file). [reconfigure](../src/bridge.rs) (action `reconfigure`) is the
+clean path:
+
+0. **Skip-when-unchanged guard** — [scavenge_config_unchanged](../src/bridge.rs)
+   re-reads the `--config` file and compares the *scavenge-relevant* fields
+   (broker, root, event topic, message topic, `mqtt_retain` — **not** the
+   payload template, which doesn't relocate retained topics) against the running
+   in-memory config. The broker counts because switching brokers orphans the
+   old broker's retained; the purge runs against the old (in-memory) broker
+   before the restart, so a broker change must not be skipped. If they match,
+   the retained topics won't move on restart,
+   so the purge (steps 1–2) is skipped entirely and `reconfigure` is a plain
+   clean restart — a casual `reconfigure` on an unchanged scheme won't blank
+   valid state. The guard errs toward purging: no config file, an
+   unreadable/unparseable file, a differing field, or a CLI/env override (which
+   makes the file value diverge from in-memory) all fall through to the purge.
+   This is the safe direction — a wrongly-skipped purge would orphan retained
+   permanently, whereas a needless purge just re-syncs after restart.
+1. **Latch retain off** — sets `retain_suppressed` (an `AtomicBool` on
+   `BridgeContext`). The outbound publish loop in `spawn_mqtt_task` ANDs every
+   message's `retain` with `!retain_suppressed`, so from this instant no new
+   retained snapshots land — *even ones already queued* in the 100-deep channel,
+   because the override is applied at the `client.publish` call, not at message
+   creation. Live (non-retained) delivery continues, so unlike a hard publish
+   stop there is **no event loss**.
+2. **Purge** — [purge_all_retained](../src/bridge.rs) connects a transient MQTT
+   client (its own client_id, like the scavenger), subscribes to the event +
+   message topic wildcards under the *current* (old) templates, and clears every
+   retained message it receives until `scavenger_timeout_secs` of idle. It skips
+   non-retained messages, the `bridge/config` topic, and its own empty clears
+   echoed back (empty payload). Unconditional — no per-device target matching,
+   since a template migration clears everything anyway. Returns the count
+   cleared (logged).
+3. **Exit** — fires `self.cancel.cancel()`, which the server `run()` loop selects
+   on and runs the normal graceful shutdown (`close()` → save state with
+   **device configs intact** → clear `bridge/config` → disconnect). A process
+   supervisor restarts the bridge into the edited config.
+
+Key properties:
+
+- **Uses in-memory (old) templates**, never re-reads the config file — so editing
+  the config file *before* invoking is correct and necessary (the file change
+  only takes effect on the supervisor's restart). Triggering before editing
+  reloads the unchanged config.
+- **Always restarts.** No broker → warns, skips the purge, still exits. Retain
+  off → warns (nothing the bridge published to clear), still purges any stale
+  retained and exits. This keeps "edit config → reconfigure" a single uniform
+  habit rather than a conditional one.
+- **Supervisor-dependent.** `cancel` makes the process exit; a supervisor
+  (systemd `Restart=always`, Docker policy) must bring it back. `reconfigure`
+  logs whether one was detected via `INVOCATION_ID` / `JOURNAL_STREAM`.
+- **No new magic numbers** — the purge idle window reuses the existing
+  `scavenger_timeout_secs` knob; bump it for large fleets on slow brokers.
+- `retain_suppressed` is never cleared — the process exits shortly after it's
+  set, and a fresh `BridgeContext` starts with it `false`.
+
 ---
 
 ## 5. Sub-device routing
@@ -1304,6 +1365,7 @@ ok, msg = rb.validate_payload_template("v={value};ts={timestamp}")
 | Why an add changed something else        | [add_device](../src/bridge.rs)      |
 | Why a retain didn't fire                 | [IdentifierSet](../src/bridge.rs)       |
 | Why a retained message isn't clearing    | [spawn_retain_scavenger](../src/bridge.rs) |
+| How to apply a template/retain change     | [reconfigure](../src/bridge.rs), [purge_all_retained](../src/bridge.rs) (§4.11) |
 | Why a topic substitution is wrong        | [render_template](../src/bridge.rs), [replace_vars](../src/bridge.rs) |
 | Why a command isn't matching             | [parse_mqtt_payload](../src/bridge.rs), [compile_topic_regex](../src/bridge.rs) |
 | Why a sub-device command goes nowhere    | [get_connected_device](../src/bridge.rs), [resolve_cid](../src/bridge.rs) |
