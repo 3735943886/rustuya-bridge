@@ -1542,19 +1542,28 @@ impl BridgeContext {
     }
 
     /// Publishes an empty retained (clear) for each topic and drives the
-    /// eventloop until they're all written out. Interleaves non-blocking
-    /// `try_publish` with `poll` so a bounded request channel can never
-    /// deadlock — awaiting `publish()` inside a poll loop blocks the loop the
-    /// moment the channel fills, which stalls the whole task. Bounded by a
-    /// per-poll stall timeout so live traffic can't keep it spinning.
+    /// eventloop until the broker has **acknowledged** them all. Interleaves
+    /// non-blocking `try_publish` with `poll` so a bounded request channel can
+    /// never deadlock (awaiting `publish()` inside a poll loop blocks the loop
+    /// the moment the channel fills).
+    ///
+    /// Counts incoming `PubAck`s, not the outgoing writes: rumqttc buffers its
+    /// network writes, so an `Outgoing::Publish` only means "encoded into the
+    /// write buffer". Disconnecting right after the last one (the eventloop
+    /// stops being polled, so the buffer is never flushed and the DISCONNECT
+    /// never even leaves) drops that whole still-buffered tail — which is why a
+    /// 112/112 "sent" count left ~80 retained alive on the broker. A `PubAck`
+    /// can only come back after the broker actually received the clear, so
+    /// waiting for them forces the flush and confirms delivery. Returns the
+    /// acked count; bounded by a per-poll stall timeout.
     async fn clear_and_flush(
         client: &rumqttc::AsyncClient,
         eventloop: &mut rumqttc::EventLoop,
         topics: &[String],
     ) -> usize {
         let mut queued = 0usize; // handed to the client
-        let mut sent = 0usize; // written to the socket by the eventloop
-        while sent < topics.len() {
+        let mut acked = 0usize; // confirmed received by the broker
+        while acked < topics.len() {
             // Enqueue as many clears as the request channel will take right now.
             while queued < topics.len()
                 && client
@@ -1563,17 +1572,17 @@ impl BridgeContext {
             {
                 queued += 1;
             }
-            // Drive the eventloop; count our clears as they leave for the broker.
-            match tokio::time::timeout(Duration::from_secs(5), eventloop.poll()).await {
-                Ok(Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::Publish(_)))) => sent += 1,
+            // Drive the eventloop; a PubAck means the broker stored the clear.
+            match tokio::time::timeout(Duration::from_secs(10), eventloop.poll()).await {
+                Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)))) => acked += 1,
                 Ok(Ok(_)) => {}
                 other => {
-                    debug!("clear_and_flush stop after {sent}/{} sent: {other:?}", topics.len());
-                    break; // connection error or 5s stall
+                    debug!("clear_and_flush stop after {acked}/{} acked: {other:?}", topics.len());
+                    break; // connection error or stall
                 }
             }
         }
-        sent
+        acked
     }
 
     /// Spawns a background task to clear retained messages for specific devices
@@ -1723,16 +1732,17 @@ impl BridgeContext {
             }
             to_clear.sort();
             to_clear.dedup();
-            let collected: Vec<&String> = seen.iter().map(|(t, _)| t).collect();
+            debug!(
+                "Scavenger collected={:?} to_clear={to_clear:?}",
+                seen.iter().map(|(t, _)| t).collect::<Vec<_>>()
+            );
+            let matched = to_clear.len();
+            let acked = Self::clear_and_flush(&client, &mut eventloop, &to_clear).await;
             info!(
-                "Scavenger: collected {} retained, matched {} of {} targets. \
-                 collected={collected:?} to_clear={to_clear:?}",
+                "Scavenger: collected {} retained, matched {matched} of {} targets, cleared {acked}",
                 seen.len(),
-                to_clear.len(),
                 active_targets.len()
             );
-            let sent = Self::clear_and_flush(&client, &mut eventloop, &to_clear).await;
-            info!("Scavenger: cleared {sent} of {} matched", to_clear.len());
             let _ = client.disconnect().await;
         });
     }
@@ -2116,11 +2126,11 @@ impl BridgeContext {
 
         // Phase 2: clear every collected topic, flushing without blocking.
         let topics: Vec<String> = topics.into_iter().collect();
-        info!("Purge: collected {} retained. topics={topics:?}", topics.len());
-        let sent = Self::clear_and_flush(&client, &mut eventloop, &topics).await;
-        info!("Purge: cleared {sent} of {} collected", topics.len());
+        debug!("Purge topics={topics:?}");
+        let acked = Self::clear_and_flush(&client, &mut eventloop, &topics).await;
+        info!("Purge: collected {} retained, cleared {acked}", topics.len());
         let _ = client.disconnect().await;
-        sent
+        acked
     }
 
     /// Re-applies a configuration change by clearing old-scheme retained

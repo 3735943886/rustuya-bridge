@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.15] — Python 0.2.0-rc.15 — 2026-06-03
+
+### Fixed
+- **Retained cleanup reported success but left most messages on the broker.**
+  `clear_and_flush` counted `Outgoing::Publish` events — but rumqttc buffers its
+  network writes, so that only means "encoded into the write buffer". The
+  scavenger/purge then disconnected its transient client without polling the
+  eventloop further, so the buffered tail was never flushed (and the DISCONNECT
+  never sent), silently dropping most clears even though the log said
+  "112/112". Now counts incoming `PubAck`s: the broker can only ack a clear it
+  actually received, which forces the flush and confirms delivery. The logged
+  count is the real acked total.
+
 ## [0.3.0-rc.14] — Python 0.2.0-rc.14 — 2026-06-03
 
 ### Changed
