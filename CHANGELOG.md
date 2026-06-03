@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.12] — Python 0.2.0-rc.12 — 2026-06-03
+
 ### Fixed
 - **Retained cleanup (`clear` / `remove` / `reconfigure`) now clears the whole
   fleet, not a random 1–6 messages.** The scavenger and the reconfigure purge
