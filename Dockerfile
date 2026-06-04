@@ -1,4 +1,7 @@
-FROM --platform=$BUILDPLATFORM rust:slim AS builder
+# Pinned to bookworm so the produced glibc-dynamic binary targets glibc 2.36,
+# matching the distroless/cc-debian12 runtime below (avoids GLIBC_2.xx-not-found
+# at runtime if the base ever floats to a newer debian than the runtime).
+FROM --platform=$BUILDPLATFORM rust:slim-bookworm AS builder
 
 # 1. Install Docker cross-compilation helpers (xx)
 COPY --from=tonistiigi/xx:master / /
@@ -24,16 +27,26 @@ RUN --mount=type=cache,target=/usr/local/cargo/git/db \
     cp ./target/$(xx-cargo --print-target-triple)/release/rustuya-bridge /bin/rustuya-bridge
 
 # [Stage 2: Runtime]
-# The runtime image matches the target architecture (implicit default).
-FROM debian:trixie-slim
+# distroless/cc: glibc + libgcc + ca-certificates, no shell or package manager.
+# ca-certificates is required for `mqtts://` — rustls-native-certs reads the OS
+# trust store, which the previous debian-slim image never installed (so TLS
+# brokers silently failed there). Runtime arch matches the target implicitly.
+FROM gcr.io/distroless/cc-debian12
 WORKDIR /app
 
 # Copy the binary from the builder stage
 COPY --from=builder /bin/rustuya-bridge /app/rustuya-bridge
 
-ENV MQTT_BROKER="mqtt://localhost:1883"
+# NOTE: do NOT default MQTT_BROKER here. CLI/env take precedence over the
+# config file (merge only fills None fields), so a baked-in MQTT_BROKER would
+# silently override `mqtt_broker` set in /data/config.json — connecting to the
+# wrong broker for any user who configures it via the file. Leave it unset:
+# pass `-e MQTT_BROKER=...` or set it in config.json. STATE_FILE/CONFIG stay —
+# they pin where persistent data lives inside the container's /data volume.
 ENV STATE_FILE="/data/rustuya.json"
 ENV CONFIG="/data/config.json"
-RUN mkdir /data
+# No `RUN mkdir /data` — distroless has no shell. The bridge creates the data
+# dir itself on first run (apply_config_file / save_state mkdir -p the parent),
+# and a mounted volume provides it otherwise.
 
 ENTRYPOINT ["/app/rustuya-bridge"]
