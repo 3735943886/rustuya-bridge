@@ -768,14 +768,12 @@ impl BridgeContext {
                                 for req in requests {
                                     let ctx_h = self.clone();
                                     tokio::spawn(async move {
-                                        let res = crate::handlers::handle_request(ctx_h.clone(), req).await;
-                                        // Suppress response for successful set/get actions to avoid
-                                        // redundancy — unless the response carries fan-out info
-                                        // (`matched` extra), which the caller needs to see.
-                                        let suppress = res.status == crate::types::Status::Ok
-                                            && matches!(res.action.as_deref(), Some("set" | "get"))
-                                            && !res.extra.contains_key("matched");
-                                        if !suppress {
+                                        // Each affected target answers with its own response
+                                        // (per-id), addressed to its own topic. An empty Vec
+                                        // means the handler suppressed it (single successful
+                                        // set/get).
+                                        let responses = crate::handlers::handle_request(ctx_h.clone(), req).await;
+                                        for res in responses {
                                             ctx_h.publish_api_response(res).await;
                                         }
                                     });
@@ -2019,7 +2017,8 @@ impl BridgeContext {
         Ok(ApiResponse::ok("add", id))
     }
 
-    /// Removes devices and their sub-devices
+    /// Removes devices and their sub-devices, returning the ids actually removed
+    /// (the matched devices plus every cascaded sub-device).
     ///
     /// # Errors
     /// Returns [`BridgeError::NoMatchingDevices`] if no devices match the given selectors.
@@ -2027,13 +2026,8 @@ impl BridgeContext {
         &self,
         id: Option<Vec<String>>,
         name: Option<Vec<String>>,
-    ) -> Result<ApiResponse, BridgeError> {
-        // Capture caller intent before consuming the selectors so we can decide
-        // whether to annotate the response with `matched` fan-out info.
-        let by_name = id.is_none() && name.is_some();
-        let direct_matches = self.get_targets(id, name).await?;
-        let name_matched = direct_matches.len();
-        let mut targets = direct_matches.clone();
+    ) -> Result<Vec<String>, BridgeError> {
+        let mut targets = self.get_targets(id, name).await?;
 
         // Cascade removal to sub-devices
         let sub_targets: Vec<String> = {
@@ -2115,16 +2109,9 @@ impl BridgeContext {
         info!("Devices removed: {}", targets.join(", "));
         self.request_save();
 
-        let mut res = ApiResponse::ok("remove", targets.join(","));
-        // Annotate fan-out only for name-based lookups that resolved to
-        // multiple *directly-matched* devices. Cascaded sub-devices are not
-        // counted — the caller's name didn't match those.
-        if by_name && name_matched > 1 {
-            res = res
-                .with_extra("matched", Value::from(name_matched as u64))
-                .with_extra("targets", Value::from(direct_matches));
-        }
-        Ok(res)
+        // Return the removed ids (parent + cascaded subs); the handler emits one
+        // per-id `remove` response so each lands on its own response topic.
+        Ok(targets)
     }
 
     /// Clears all registered devices and scavenges their retained MQTT messages.
@@ -2325,7 +2312,9 @@ impl BridgeContext {
         info!("reconfigure: shutting down for restart.");
         self.cancel.cancel();
 
-        Ok(ApiResponse::ok("reconfigure", "all"))
+        // Bridge-level action (not an all-devices op like `clear`), so the
+        // response carries no device id and lands on the bridge response topic.
+        Ok(ApiResponse::ok_action("reconfigure"))
     }
 
     /// Returns `true` when the scavenge-relevant config on disk (broker, root,
@@ -2806,7 +2795,7 @@ mod context_tests {
 
     // ── #7: mqtt_drop_count is exposed in status response ─────────────────
 
-    // ── B1/B2: remove_device matched annotation + selective refresh ──────
+    // ── B1/B2: remove_device removed-id reporting + selective refresh ──────
 
     fn sub_device(id: &str, parent_id: &str, cid: &str) -> DeviceConfig {
         DeviceConfig {
@@ -2835,10 +2824,10 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn remove_by_name_with_cascade_reports_name_match_count_not_total() {
-        // Regression for the matched-count semantic: removing a single
-        // gateway by name that cascades to sub-devices must report
-        // `matched: 1` (or omit it), NOT the total removed including subs.
+    async fn remove_by_name_with_cascade_returns_all_removed_ids() {
+        // Removing a single gateway by name that cascades to sub-devices must
+        // return every removed id (gateway + 3 subs) so the handler can answer
+        // one per-id `remove` response each.
         let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
 
         ctx.add_device(named_direct("gw-1", "kitchen-gateway"))
@@ -2850,48 +2839,32 @@ mod context_tests {
                 .unwrap();
         }
 
-        let res = ctx
+        let removed = ctx
             .remove_device(None, Some(vec!["kitchen-gateway".into()]))
             .await
             .expect("remove by name");
 
-        // Single name match → no `matched` annotation should be added.
-        assert!(
-            !res.extra.contains_key("matched"),
-            "single name match must not be annotated as fan-out, got: {:?}",
-            res.extra
-        );
-        // But all 4 devices (gateway + 3 subs) should appear in the comma-joined id.
-        let removed: Vec<&str> = res.id.as_deref().unwrap_or("").split(',').collect();
         assert_eq!(removed.len(), 4, "cascade should remove gateway + 3 subs");
+        assert!(removed.contains(&"gw-1".to_string()));
+        assert!(removed.contains(&"sub-s2".to_string()));
     }
 
     #[tokio::test]
-    async fn remove_by_name_with_real_fanout_reports_only_name_matched_count() {
+    async fn remove_by_name_with_real_fanout_returns_each_matched_id() {
         // Two devices share a name → name lookup fans out to both. Each is a
-        // direct device (no subs). matched should be exactly 2.
+        // direct device (no subs); both ids are returned individually.
         let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
 
         ctx.add_device(named_direct("dev-a", "kitchen")).await.unwrap();
         ctx.add_device(named_direct("dev-b", "kitchen")).await.unwrap();
 
-        let res = ctx
+        let mut removed = ctx
             .remove_device(None, Some(vec!["kitchen".into()]))
             .await
             .unwrap();
+        removed.sort();
 
-        assert_eq!(
-            res.extra.get("matched").and_then(|v| v.as_u64()),
-            Some(2),
-            "two name matches must report matched: 2"
-        );
-        let targets = res
-            .extra
-            .get("targets")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
-            .unwrap();
-        assert_eq!(targets.len(), 2);
+        assert_eq!(removed, vec!["dev-a".to_string(), "dev-b".to_string()]);
     }
 
     #[tokio::test]
@@ -3601,6 +3574,10 @@ mod context_tests {
         let res = ctx.reconfigure().await.expect("reconfigure ok");
 
         assert_eq!(res.action.as_deref(), Some("reconfigure"));
+        assert!(
+            res.id.is_none(),
+            "reconfigure is a bridge-level action — no device id (lands on the bridge topic), not \"all\""
+        );
         assert!(
             ctx.cancel.is_cancelled(),
             "reconfigure must always trigger shutdown, even with no broker"

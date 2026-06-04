@@ -67,36 +67,36 @@ Three non-obvious consequences:
 `name_map` deliberately holds a `Vec<String>` per name. Two devices can share a
 name, and any `set`/`get`/`remove` by name will fan out to *all* matching
 devices ([find_device_ids](../src/bridge.rs)). There is no disambiguation
-prompt — but when a name-based lookup resolves to more than one device, the
-response carries `matched: N` and `targets: [...]` in `extra`, and the
-successful-set/get response suppression is bypassed so the caller actually
-sees the fan-out:
+prompt — instead, **each matched device answers with its own response**,
+addressed to its own `{id}` (so it lands on that device's response topic).
+A name-set matching two devices produces two responses:
 
 ```json
-{
-  "status": "ok",
-  "action": "set",
-  "id": "ebabc...,fbcde...",
-  "matched": 2,
-  "targets": ["ebabc...", "fbcde..."]
-}
+{ "status": "ok", "action": "set", "id": "ebabc..." }
+{ "status": "ok", "action": "set", "id": "fbcde..." }
 ```
 
-**`matched` counts name-matched devices only, not cascaded sub-devices.**
-If you `remove` a single gateway by name and the bridge cascades to its
-3 sub-devices, the `id` field shows 4 ids but `matched` is omitted (one
-name match, no fan-out). This is on purpose: cascading is the bridge's
-choice, not a result of the name lookup, so it doesn't represent
-ambiguity in the caller's selector.
+The single-target suppression (a lone successful `set`/`get` is dropped as
+redundant — §10.2) is bypassed whenever a command fans out, so the caller
+sees every device it touched. There is no comma-joined `id` and no `matched`
+count: the per-id responses *are* the fan-out signal. Subscribe to
+`{root}/response/+` (or `/#`) and correlate by the `id` field.
 
-> **Operational caveat — partial failure in name fan-out.** The handler
-> walks targets sequentially via `execute_per_target` and returns on the
-> first device-level error. So if `set` matches 3 devices by name and
-> device #2 times out, device #3 is never tried, the response is an
-> `error` with no `matched` annotation, and the caller can't easily tell
-> that part of the fleet was set and part wasn't. If you control fleets
-> by name and need atomicity, query `status` after a name-set to verify
-> all targets actually applied.
+**Cascade reports per-id too.** If you `remove` a single gateway by name and
+the bridge cascades to its 3 sub-devices, you get **4 separate `remove`
+responses** — one per removed id (gateway + 3 subs) — each on its own topic,
+so a consumer can drop each device individually. Cascading is the bridge's
+choice, not a result of the name lookup, but the wire shape is the same as
+any fan-out: one response per affected id.
+
+> **Operational note — partial failure in name fan-out.** [run_per_target](../src/handlers.rs)
+> attempts **every** target independently (no abort on first error) and each
+> reports its own outcome: a `set` matching 3 devices where device #2 times
+> out yields an `ok` for #1 and #3 and an `error` for #2, each addressed to
+> its own id. So partial failure is visible per-device — no need to re-query
+> `status` to find out which targets applied. (A target that isn't currently
+> connected is skipped and reported as `ok`; its offline state surfaces on the
+> device `error` topic — §3.2.)
 
 If a payload provides both `id` and `name`, `id` wins and `name` is silently
 ignored — see the early-return in `find_device_ids`. A debug log is
@@ -311,8 +311,9 @@ extraction.
    overwriting existing keys
    → final payload `{"dps": {"1": true}, "action": "set", "id": "ebabc...", "dp": "1"}`.
 4. Deserialized to `BridgeRequest::Set { id: Some(Single("ebabc...")), dps, ... }`.
-5. Routed to the device. Response suppressed for successful `set`/`get` (see
-   the `spawn_mqtt_task` Publish handler).
+5. Routed to the device. This is a single-target `set` that succeeds, so the
+   response is suppressed (see [responses_for_results](../src/handlers.rs) and
+   §10.2).
 
 **Outbound event** — device reports DPs `{"1": true, "2": 50}`:
 
@@ -1186,10 +1187,12 @@ pointing back at this tip, so a confused setup is loud rather than silent.
 
 ### 10.2 Suppressing successful set/get responses
 
-The MQTT main loop already does this for you — `set` and `get` only publish
-a response on *error*, OR when a name-based lookup fanned out to multiple
-devices (`matched > 1`). Don't subscribe to `{root}/response/#` expecting
-acks for every set; you'll only see errors and fan-out notifications.
+[responses_for_results](../src/handlers.rs) does this for you — a `set`/`get`
+that hits exactly **one** target and succeeds publishes no response (it's
+redundant; the device's own event/state already reflects it). You still get a
+response on *error*, and one **per device** when a command fans out to more
+than one target. Don't subscribe to `{root}/response/#` expecting an ack for
+every single-target set; you'll only see errors and fan-out responses.
 
 ### 10.3 Tuning save debounce
 
