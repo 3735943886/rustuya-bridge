@@ -338,6 +338,14 @@ extraction.
 4. Payload: the raw payload object, with `id` (and `name`/`cid` if present)
    injected.
 
+A successful connect therefore lands on the broker (retained) like this —
+`errorCode 0` plus a human-readable `errorMsg`, with `id`/`name` injected:
+
+```
+rustuya/error/ebabc0000000000000aaaa  {"errorCode":0,"errorMsg":"Connection Successful","id":"ebabc0000000000000aaaa","name":"Smart Socket 20A"}
+rustuya/error/ebfde0000000000000bbbb  {"errorCode":0,"errorMsg":"Connection Successful","id":"ebfde0000000000000bbbb","name":"office_light"}
+```
+
 > **`errorCode: 0` is success, not a fault.** Connect/disconnect is folded
 > into this same `error` path *on purpose* — rather than maintaining a
 > separate "device connected" topic, a successful connect/command emits
