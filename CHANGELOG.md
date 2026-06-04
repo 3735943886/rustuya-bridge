@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.16] — Python 0.2.0-rc.16 — 2026-06-04
+
+### Fixed
+- **Power loss could permanently deadlock startup.** `check_existing_instance`
+  treated any retained bridge-config (the `session_id` sentinel) as proof that
+  another instance was live, and bailed. Clearing that sentinel relied on the
+  LWT — which only fires if the broker observes the disconnect. On power loss
+  with a co-located broker the broker dies too, never publishes the will, and
+  restores the stale retained config on reboot, so every restart bailed. The
+  check now probes *liveness* instead of *presence*: when the sentinel is seen
+  it pings the `status` action and watches the bridge response topic, retrying
+  generously (2s × 12 ≈ 24s, under the ~45s LWT fallback it supersedes) and
+  returning the instant any reply arrives. A live instance answers in
+  milliseconds; a stale ghost never does, so startup proceeds. The LWT (fast
+  path on clean-socket crashes) and the config sid-guard (backstop) are
+  unchanged. Both probe topics are rendered through the existing `replace_vars`
+  translator — extended with an `action` variable — so the ping and its reply
+  still route correctly when the command/message topics carry `{action}` or
+  other template variables.
+
 ## [0.3.0-rc.15] — Python 0.2.0-rc.15 — 2026-06-03
 
 ### Fixed

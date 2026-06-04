@@ -50,6 +50,7 @@ struct TopicVars<'a> {
     cid: Option<&'a str>,
     level: Option<&'a str>,
     event_type: Option<&'a str>,
+    action: Option<&'a str>,
     dp: Option<&'a str>,
     val: Option<&'a Value>,
     dps_str: Option<&'a str>,
@@ -918,11 +919,68 @@ impl BridgeContext {
         }
     }
 
-    /// Briefly subscribes to the bridge config topic and returns an error if another
-    /// bridge instance is detected (its retained config is observed within 500ms).
+    /// Renders the topic the liveness probe publishes its `status` ping to,
+    /// using the same `replace_vars` translator as the rest of the codebase.
+    /// The action can ride *in the topic* (e.g. `{root}/command/{action}/{id}/{dp}`),
+    /// so `action` = "status"; every other variable gets a non-empty placeholder
+    /// because the command regex captures `[^/]+` per level — an empty segment
+    /// would never match the incumbent's subscription.
+    fn probe_command_topic(&self) -> String {
+        self.replace_vars(
+            self.cli
+                .mqtt_command_topic
+                .as_deref()
+                .unwrap_or(crate::config::DEFAULT_MQTT_COMMAND_TOPIC),
+            &TopicVars {
+                id: "bridge",
+                name: Some("bridge"),
+                cid: Some("bridge"),
+                level: Some("bridge"),
+                event_type: Some("bridge"),
+                action: Some("status"),
+                dp: Some("bridge"),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Renders the topic the liveness probe listens on for the incumbent's
+    /// `status` reply — the exact topic `publish_api_response` sends a
+    /// bridge-level OK response to (message topic, id/name = "bridge", level
+    /// "response"), so subscribe == publish for any template.
+    fn probe_response_topic(&self) -> String {
+        self.replace_vars(
+            self.mqtt_message_topic
+                .as_deref()
+                .unwrap_or(crate::config::DEFAULT_MQTT_MESSAGE_TOPIC),
+            &TopicVars {
+                id: "bridge",
+                name: Some("bridge"),
+                level: Some("response"),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Detects whether another *live* bridge instance owns this root topic.
+    ///
+    /// First observes the retained bridge-config sentinel for 500ms. If none is
+    /// present the path is clear and we start immediately. If a sentinel exists
+    /// it may belong to a live instance *or* be a stale ghost left by an unclean
+    /// exit whose LWT never fired — e.g. power loss with a co-located broker: the
+    /// broker dies before it can publish the will, then restores the stale
+    /// retained config on reboot, and mere-presence detection would deadlock
+    /// every restart. So we probe liveness instead: ping the `status` action
+    /// repeatedly and watch the bridge response topic. A live instance answers
+    /// within milliseconds; a ghost never does. The probe is biased generously
+    /// toward "alive" (many retries over a wide window, returning the instant any
+    /// response arrives) so a momentarily-disconnected incumbent is never
+    /// mistaken for a ghost — only sustained silence proceeds. The config sid
+    /// guard in the main MQTT loop remains the backstop if two live instances
+    /// ever slip past this gate.
     ///
     /// # Errors
-    /// Returns an error if the MQTT subscription fails or if a duplicate instance is detected.
+    /// Returns an error if the MQTT subscription fails or if a live duplicate answers.
     pub async fn check_existing_instance(&self) -> Result<()> {
         let Some(broker_url) = &self.cli.mqtt_broker else {
             return Ok(());
@@ -930,22 +988,85 @@ impl BridgeContext {
         let client_id = format!("{}_check", self.cli.mqtt_client_id());
         let opts = self.create_mqtt_options(broker_url, &client_id, &self.cli, false)?;
         let (client, mut eventloop) = rumqttc::AsyncClient::new(opts, 10);
-        let topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
-        client.subscribe(&topic, rumqttc::QoS::AtLeastOnce).await?;
+        let config_topic =
+            crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
+        client
+            .subscribe(&config_topic, rumqttc::QoS::AtLeastOnce)
+            .await?;
 
+        // Phase 1: observe the retained config sentinel.
+        let mut sentinel_seen = false;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, eventloop.poll()).await {
-            if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(p)) = event {
+            if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(p)) = event
+                && p.topic == config_topic
+            {
                 let payload = String::from_utf8_lossy(&p.payload);
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload)
                     && val.get("session_id").is_some()
                 {
-                    anyhow::bail!(
-                        "Duplicate instance detected. Another bridge is already running."
-                    );
+                    sentinel_seen = true;
+                    break;
                 }
             }
         }
+
+        // No sentinel → no prior instance → start clean (fast path, no probe).
+        if !sentinel_seen {
+            let _ = client.disconnect().await;
+            return Ok(());
+        }
+
+        // Phase 2: liveness probe. `PROBE_ATTEMPTS * PROBE_INTERVAL` is the hard
+        // cap, which also bounds power-loss recovery latency — kept under the
+        // ~45s LWT fallback it supersedes. A live instance answers on the first
+        // ping (ms), so this budget is only ever fully spent against a ghost.
+        const PROBE_ATTEMPTS: u32 = 12;
+        const PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+        let cmd_topic = self.probe_command_topic();
+        // The reply lands wherever the main loop publishes a bridge-level
+        // response. Responses are non-retained, so a dead instance's old reply
+        // can't masquerade as liveness — no nonce needed.
+        let resp_topic = self.probe_response_topic();
+        client
+            .subscribe(&resp_topic, rumqttc::QoS::AtLeastOnce)
+            .await?;
+        let ping = serde_json::json!({ "action": "status" }).to_string();
+
+        for _ in 0..PROBE_ATTEMPTS {
+            let _ = client
+                .publish(
+                    &cmd_topic,
+                    rumqttc::QoS::AtLeastOnce,
+                    false,
+                    ping.as_bytes(),
+                )
+                .await;
+            let attempt_deadline = tokio::time::Instant::now() + PROBE_INTERVAL;
+            loop {
+                match tokio::time::timeout_at(attempt_deadline, eventloop.poll()).await {
+                    Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))))
+                        if p.topic == resp_topic =>
+                    {
+                        let _ = client.disconnect().await;
+                        anyhow::bail!(
+                            "Duplicate instance detected. Another bridge is already running."
+                        );
+                    }
+                    // Other events / transient poll errors: keep listening until
+                    // this attempt's window elapses, then re-ping.
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+
+        warn!(
+            "Bridge config retained but no instance answered `status` in {}s; \
+             treating it as a stale ghost (unclean exit / power loss) and starting.",
+            PROBE_ATTEMPTS * PROBE_INTERVAL.as_secs() as u32
+        );
         let _ = client.disconnect().await;
         Ok(())
     }
@@ -1472,6 +1593,10 @@ impl BridgeContext {
             }
             "type" => {
                 out.push_str(vars.event_type.unwrap_or(""));
+                true
+            }
+            "action" => {
+                out.push_str(vars.action.unwrap_or(""));
                 true
             }
             "dp" => {
@@ -3539,6 +3664,79 @@ mod context_tests {
             !ctx.scavenge_config_unchanged().await,
             "a broker change must be detected"
         );
+    }
+
+    /// The liveness probe's `status` ping must survive any command-topic
+    /// template: the rendered topic has to (a) match what the incumbent
+    /// subscribes to and (b) parse back to a `Status` request — including
+    /// templates that carry the action in the topic (`{action}`) or that would
+    /// otherwise render an empty segment. Guards the two regressions found
+    /// while building the probe.
+    #[tokio::test]
+    async fn liveness_probe_command_topic_round_trips_across_templates() {
+        let templates = [
+            "{root}/command",
+            "{root}/command/{action}",
+            "{root}/command/{id}",
+            "{root}/command/{cid}",
+            "{root}/command/{action}/{id}/{dp}",
+        ];
+        for tmpl in templates {
+            let (ctx, _tmp, _m, _s, _r) =
+                make_ctx(|cli| cli.mqtt_command_topic = Some((*tmpl).to_string())).await;
+
+            // Incumbent side, exactly as `spawn_mqtt_task` builds it: the
+            // root-substituted template drives both the regex and the match.
+            let (cmd_tmpl, _) = ctx.cli.mqtt_topics();
+            let re = compile_topic_regex(&cmd_tmpl);
+
+            let probe_topic = ctx.probe_command_topic();
+
+            // No empty levels — the command regex captures `[^/]+` per level.
+            assert!(
+                !probe_topic.split('/').any(str::is_empty),
+                "probe topic {probe_topic:?} has an empty segment for {tmpl:?}"
+            );
+
+            let vars = match_topic(&probe_topic, &cmd_tmpl, re.as_ref()).unwrap_or_else(|| {
+                panic!("probe topic {probe_topic:?} must match the subscription for {tmpl:?}")
+            });
+
+            let req_val = crate::payload::parse_mqtt_payload(r#"{"action":"status"}"#, &vars);
+            let req: BridgeRequest = serde_json::from_value(req_val)
+                .unwrap_or_else(|e| panic!("must parse to a request for {tmpl:?}: {e}"));
+            assert!(
+                matches!(req, BridgeRequest::Status),
+                "probe must parse to Status for {tmpl:?}, got {:?}",
+                req.action_name()
+            );
+        }
+    }
+
+    /// The probe listens on the exact topic the incumbent publishes its
+    /// `status` reply to. Drives the real publish path (`get_bridge_status` →
+    /// `publish_api_response`) and asserts the captured topic equals what the
+    /// probe subscribes to — so the two halves can't silently drift apart.
+    #[tokio::test]
+    async fn liveness_probe_response_topic_matches_status_publish() {
+        for msg_tmpl in ["{root}/{level}/{id}", "{root}/{level}/{id}/{name}"] {
+            let (ctx, _tmp, mut mqtt_rx, _s, _r) =
+                make_ctx(|cli| cli.mqtt_message_topic = Some((*msg_tmpl).to_string())).await;
+
+            let resp = ctx.get_bridge_status().await;
+            ctx.publish_api_response(resp).await;
+
+            let published = mqtt_rx
+                .recv()
+                .await
+                .expect("channel open")
+                .expect("a publish, not a shutdown signal");
+            assert_eq!(
+                ctx.probe_response_topic(),
+                published.topic,
+                "probe must subscribe where status replies land, for {msg_tmpl:?}"
+            );
+        }
     }
 }
 }
