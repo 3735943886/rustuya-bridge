@@ -280,9 +280,9 @@ Take this config (a common Home Assistant / single-DP setup):
 {
   "mqtt_root_topic": "rustuya",
   "mqtt_command_topic": "{root}/command/{action}/{id}/{dp}",
-  "mqtt_event_topic":   "{root}/event/{id}/{dp}",
+  "mqtt_event_topic":   "{root}/event/{type}/{id}/{dp}",
   "mqtt_message_topic": "{root}/{level}/{id}",
-  "mqtt_payload_template": "{\"type\": \"{type}\", \"value\": {value}}",
+  "mqtt_payload_template": "{value}",
   "mqtt_retain": true
 }
 ```
@@ -318,11 +318,13 @@ extraction.
 1. `mqtt_event_topic` contains `{dp}` → [single-DP mode](../src/bridge.rs).
    The bridge iterates the DPS object and emits one message per key.
 2. For DP `1`:
-   - Topic: `rustuya/event/ebabc.../1`
-   - Payload: `{"type": "active", "value": true}`
-3. For DP `2`: `rustuya/event/ebabc.../2`, payload `{"type": "active", "value": 50}`.
-4. Each message: QoS 1, `retain: true` (since `{id}` resolves and retain is
-   structurally safe — see §4).
+   - Topic: `rustuya/event/active/ebabc.../1`
+   - Payload: `true`
+3. For DP `2`: `rustuya/event/active/ebabc.../2`, payload `50`.
+4. Each message is QoS 1. Because these are **active** deltas, cache mode
+   (`mqtt_retain: true`) publishes them **no-retain**; only the merged
+   `passive` snapshot is retained — see §4. (Retain is structurally safe here
+   because `{id}` resolves.)
 
 **Outbound error** — device reports `{"errorCode": xxx}`:
 
