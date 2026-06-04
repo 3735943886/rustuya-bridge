@@ -320,7 +320,9 @@ extraction.
 2. For DP `1`:
    - Topic: `rustuya/event/active/ebabc.../1`
    - Payload: `true`
-3. For DP `2`: `rustuya/event/active/ebabc.../2`, payload `50`.
+3. For DP `2`:
+   - Topic: `rustuya/event/active/ebabc.../2`
+   - Payload: `50`
 4. Each message is QoS 1. Because these are **active** deltas, cache mode
    (`mqtt_retain: true`) publishes them **no-retain**; only the merged
    `passive` snapshot is retained — see §4. (Retain is structurally safe here
