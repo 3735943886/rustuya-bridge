@@ -114,7 +114,8 @@ spot it.
 | Sub-device (cid set), parent_id set, parent not registered| `"no parent"`                                |
 | Has `cid` but no `parent_id` (only via hand-edited state) | `"invalid subdevice"`                        |
 | Direct, in `instances`, no error history                  | `"online"`                                   |
-| Direct, in `instances`, errored before                    | the raw error code as string (e.g. `"905"`)  |
+| Direct, in `instances`, last reported `errorCode 0`       | `"0"` — success/connected, **same as online**|
+| Direct, in `instances`, errored before (non-zero code)    | the raw error code as string (e.g. `"905"`)  |
 | Direct, *not* in `instances` (rare; broken state)         | `"offline"`                                  |
 
 `"invalid subdevice"` can only appear if you hand-edit the state file or
@@ -330,13 +331,25 @@ extraction.
 
 **Outbound error** — device reports `{"errorCode": xxx}`:
 
-1. `handle_device_event` takes the error branch
-  .
+1. `handle_device_event` takes the error branch.
 2. `last_error_code` persisted on the in-memory config.
 3. Topic: `rustuya/error/ebabc...` (from `mqtt_message_topic` with
    `level=error`).
 4. Payload: the raw payload object, with `id` (and `name`/`cid` if present)
    injected.
+
+> **`errorCode: 0` is success, not a fault.** Connect/disconnect is folded
+> into this same `error` path *on purpose* — rather than maintaining a
+> separate "device connected" topic, a successful connect/command emits
+> `errorCode: 0` here and a real fault emits a non-zero code, so operators
+> watch one topic for both liveness and errors. Consequently the `error`
+> topic — and the `status` field (§1.4), which echoes `last_error_code`
+> verbatim — can legitimately carry `0`, meaning *connected*. A `status` of
+> `"0"` is equivalent to `"online"`; only a non-zero code is an actual fault.
+>
+> With `mqtt_retain` on the `error` topic is retained, so the latest `0` /
+> non-zero value persists on the broker — one glance at the retained message
+> tells you online (`0`) vs offline (anything else) without polling.
 
 ### 3.3 Active vs passive events
 
