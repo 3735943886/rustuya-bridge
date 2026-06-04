@@ -383,7 +383,7 @@ active/passive split maps onto two different kinds of DP semantics:
   (on/off, current temperature, brightness, etc). Both active and
   passive carry "the device is in this state" — interchangeable.
 - **Event DPs** — values describing a *moment-in-time event*
-  (`single_click`, `double_click`, `motion_detected`, etc). Only an
+  (`single_click`, `double_click`, etc). Only an
   active event means "this happened *now*"; a passive replay of
   `single_click` from a periodic status report or DP_QUERY response
   means nothing happened — the
@@ -463,18 +463,18 @@ The bridge has **two distinct retain models** selected by `mqtt_retain`:
 
 The rest of this section is about cache mode.
 
-### 4.1 Why cache mode exists — the partial-overwrite bug it fixes
+### 4.1 Why cache mode exists — the partial-overwrite hazard it avoids
 
-Before cache mode, retain=true users hit a silent data-loss bug: in **multi-DP
-mode** (event topic without `{dp}`) the bridge published one MQTT
-message per device update containing the *incoming* DPS dict. When a
-device sent a partial passive update (battery report only, RSSI only,
-periodic timer tick) the retained snapshot on the broker shrank to that
-partial dict — wiping out the full state the previous full status report
-had established. HA reload after a partial would then see "switch state =
-unknown" until the next full device status report (sometimes minutes).
+Naive `retain=true` publishing has a data-loss trap in **multi-DP mode**
+(event topic without `{dp}`): one retained MQTT message per device update,
+straight from the *incoming* DPS dict. A device that sends a partial passive
+update (battery report only, RSSI only, periodic timer tick) would shrink the
+retained snapshot on the broker to that partial dict — wiping out the full
+state a previous full status report established. An HA reload after a partial
+then reads "switch state = unknown" until the next full device status report
+(sometimes minutes).
 
-Cache mode fixes this by keeping a **per-device merged DPS cache** in the bridge
+Cache mode avoids this by keeping a **per-device merged DPS cache** in the bridge
 and publishing snapshots from the cache, not from the incoming message.
 A battery-only passive merges into the cache; the published snapshot
 still contains the cached switch state, temperature, etc.
