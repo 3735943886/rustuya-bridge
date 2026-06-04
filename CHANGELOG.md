@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.17] — Python 0.2.0-rc.17 — 2026-06-05
+
+### Changed
+- **Multi-target command responses are now emitted per id.** Commands that
+  affect more than one device — a `set`/`get`/`remove`/etc. that fans out by
+  name, or a `remove` that cascades from a gateway to its sub-devices — used to
+  answer with a single response whose `id` was the comma-joined target list.
+  That put commas in the response topic (`{root}/response/a,b,c`), which no
+  single subscriber is addressed by: the requester listening on their own id's
+  topic never saw it, and a consumer keying off the topic id (e.g. the manager)
+  acted on the literal `"a,b,c"` and dropped nothing. Now **every affected
+  target answers with its own response**, addressed to its own `{id}` so it
+  lands on that device's response topic. Partial failure is also visible
+  per-device: targets are attempted independently (no abort on the first error)
+  and each reports its own `ok`/`error`. The single-target suppression of a
+  successful `set`/`get` is unchanged.
+- **`reconfigure` now responds at the bridge level** (`status` response with no
+  device `id`, on the bridge response topic) instead of `id="all"` — it is a
+  bridge operation, not an all-devices operation. `clear` still answers with
+  `id="all"`.
+
+### Removed
+- The `matched` / `targets` fan-out annotation on responses. The per-id
+  responses are themselves the fan-out signal, so the extra count/list is no
+  longer needed.
+
 ## [0.3.0-rc.16] — Python 0.2.0-rc.16 — 2026-06-04
 
 ### Fixed
