@@ -522,6 +522,12 @@ cmd_upgrade() {
 
     install_binary "${tmpdir}/rustuya-bridge"
     install_self
+    # Refresh the unit too: it's a pure template (paths from constants, no user
+    # data — config lives in CONFIG_FILE), so rewriting is safe and idempotent.
+    # Without this, unit changes (e.g. Restart=always, hardening) never reach an
+    # install that only ever runs `upgrade`, leaving it on a stale unit. Runs
+    # daemon-reload, so the (re)start below picks up the new unit.
+    write_unit
     if [ "$direction" = "newer" ]; then
         ok "Downgraded to ${latest_ver}."
     else
