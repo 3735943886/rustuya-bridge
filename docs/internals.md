@@ -637,7 +637,7 @@ This is the operational footgun the README warns about. The chain:
 5. **The broker still has all 20 retained messages.** Any new subscriber
    sees ghost device state from devices the bridge can no longer manage.
 
-The scavenger only runs in response to `remove`/`clear` actions while the
+The scavenger runs in response to `remove`/`clear` actions while the
 bridge is alive. To reset cleanly:
 
 ```bash

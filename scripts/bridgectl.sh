@@ -596,7 +596,7 @@ EOF
   • user         ${SVC_USER}
 
 ${C_YELLOW}Heads-up about retained MQTT messages:${C_RESET}
-The retain-scavenger only runs in response to ${C_BOLD}remove${C_RESET} / ${C_BOLD}clear${C_RESET} commands
+The retain-scavenger runs in response to ${C_BOLD}remove${C_RESET} / ${C_BOLD}clear${C_RESET} commands
 while the bridge is alive. If ${C_BOLD}mqtt_retain${C_RESET} was enabled, purging now leaves
 stale retained messages on the broker for every previously-registered device.
 For a clean broker, publish ${C_BOLD}{"action":"clear"}${C_RESET} on the command topic and

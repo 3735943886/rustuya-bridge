@@ -330,7 +330,7 @@ directory — use an absolute path (or the Docker default `/data/rustuya.json`)
 when running under systemd.
 
 > **If `--mqtt-retain` is enabled, do not delete the state file to "reset"
-> the bridge.** The retain-scavenger only runs in response to `remove` /
+> the bridge.** The retain-scavenger runs in response to `remove` /
 > `clear` actions while the bridge is alive, so deleting the file leaves
 > stale retained messages on the broker for devices it no longer knows
 > about. Send a `clear` command (or per-device `remove`) first. With the
