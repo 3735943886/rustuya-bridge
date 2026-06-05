@@ -692,7 +692,9 @@ three purposes simultaneously:
 On graceful shutdown the bridge publishes the empty retained payload itself
 and waits for the PubAck before disconnecting
  — the LWT is a backup, not the
-normal path.
+normal path. The one failure both paths share — power loss with a co-located
+broker, where the will never fires — is what the startup liveness probe
+(§7.1) exists to recover from.
 
 ### 4.10 When the broker doesn't honor retain or LWT
 
@@ -704,7 +706,7 @@ silent failure modes:
 | Broker behavior        | What breaks                                                      |
 | ---------------------- | ---------------------------------------------------------------- |
 | Retain stripped        | Scavenger has nothing to clear (no retained messages to begin with — but also no stale ones to worry about). Status dashboards subscribing to `{root}/bridge/config` see nothing until the next bridge restart publishes live. |
-| LWT stripped (only)    | If the bridge crashes, the retained `bridge/config` from the prior run stays on the broker forever. The next bridge restart sees a different `session_id` → §7 startup check fails → **bridge refuses to start**. Manual recovery: `mosquitto_pub -r -t '<root>/bridge/config' -m ''`. |
+| LWT stripped (only)    | If the bridge crashes, the retained `bridge/config` from the prior run stays on the broker. The next startup's liveness probe (§7) pings `status`, gets no answer from the dead session, and after ~24s treats the retained config as a stale ghost and **starts anyway** — no manual cleanup. The only visible cost is a one-time ~24s startup delay on the restart following an ungraceful exit. |
 | Both stripped          | Duplicate-instance detection effectively no-ops (nothing to see). Scavenger no-ops. The bridge will start under any conditions. |
 
 The retain check in §4.4 only verifies that the *templates* allow
@@ -773,6 +775,11 @@ Key properties:
   `scavenger_timeout_secs` knob; bump it for large fleets on slow brokers.
 - `retain_suppressed` is never cleared — the process exits shortly after it's
   set, and a fresh `BridgeContext` starts with it `false`.
+- **Transient gap in retained state.** Between latching retain off and the
+  restart re-seeding the cache (§4.5), the broker briefly holds no fresh
+  snapshot. Live deltas keep flowing throughout, and the seed phase rebuilds
+  the cache from whatever survived; to refresh immediately rather than wait for
+  the next device push, send `get` to your devices after the restart.
 
 ---
 
@@ -960,42 +967,84 @@ state-on-disk matches state-in-memory.
 
 ## 7. Duplicate-instance detection
 
-The mechanism is built on the bridge config topic (§4.9).
+The mechanism is built on the bridge config topic (§4.9): a live bridge holds
+a retained `{root}/bridge/config` carrying its `session_id`. The hard part is
+telling a *live* incumbent apart from a *stale ghost* — a retained config left
+behind by an unclean exit whose LWT never cleared it (§7.1).
 
-**At startup** ([check_existing_instance](../src/bridge.rs)):
+**At startup** ([check_existing_instance](../src/bridge.rs)) runs two phases:
 
-1. Generate a `session_id = "sid_<unix_millis>"` for this instance.
-2. Subscribe to `{root}/bridge/config` with a temporary client.
-3. Wait 500ms for any retained config to arrive.
-4. If a retained payload with a `session_id` field is received, bail —
-   another bridge is already running on this `(broker, root_topic)`.
+1. Generate a `session_id = "sid_<unix_millis>"` for this instance, then
+   subscribe to `{root}/bridge/config` with a temporary client.
+2. **Phase 1 — observe the sentinel.** Wait 500ms for a retained payload with
+   a `session_id` field. None arrives → the path is clear, start immediately
+   (fast path, no probe).
+3. **Phase 2 — liveness probe.** A sentinel exists, but presence alone doesn't
+   prove the owner is alive. Ping the `status` action on the command topic and
+   listen on the bridge-level response topic, up to `PROBE_ATTEMPTS` (12) times
+   at `PROBE_INTERVAL` (2s) apart:
+   - **Any response** → a live incumbent owns this `(broker, root_topic)`.
+     Bail with "Duplicate instance detected".
+   - **Sustained silence** for the full ~24s budget → treat the retained
+     config as a stale ghost, log a WARN, and start anyway (the recovery
+     path — §7.1).
 
-**At runtime**:
+The probe returns the instant the first response arrives and is biased
+generously toward "alive" (many retries over a wide window), so a
+momentarily-disconnected incumbent is never mistaken for a ghost — only
+sustained silence proceeds. The ping rides the configured command topic
+(`action = "status"`, every other variable a non-empty placeholder so it
+matches the incumbent's subscription) and the reply lands on the bridge-level
+response topic — `probe_command_topic` / `probe_response_topic` build both
+through the same `replace_vars` translator as live traffic, so the probe
+tracks whatever templates you configured. Responses are non-retained, so a
+dead instance's old reply can't masquerade as liveness.
+
+**At runtime** (the sid guard):
 
 The main MQTT loop also subscribes to the config topic. If it ever sees a
 config payload with a `session_id` different from its own, it logs an error
 and self-cancels. This handles the case where a *second* bridge starts
-after the first — both run their 500ms check, but the second one's
-publish wins because the first one already shut down on receipt.
+after the first — both run their startup check, but the second one's
+publish wins because the first one already shut down on receipt. It is also
+the backstop if two live instances ever slip past the startup gate.
 
-**LWT cleanup**: if a bridge crashes (kill -9, OOM, power loss), the broker
-publishes the empty retained payload set as Last Will, clearing the config
-topic. The next bridge to start sees nothing and proceeds.
+### 7.1 Stale ghosts, LWT, and why the probe exists
+
+Two paths normally clear the retained `bridge/config` when a bridge goes away:
+
+- **Graceful shutdown** — the bridge publishes the empty retained payload
+  itself and waits for the PubAck (§8.3).
+- **Crash** (kill -9, OOM, broker-side disconnect) — the broker publishes the
+  empty retained payload as the bridge's Last Will, clearing the topic so the
+  next startup sees nothing.
+
+Both rely on *something* clearing the sentinel. The one case neither covers is
+**power loss with a co-located broker**: the broker dies along with the bridge
+before it can publish the will, then on reboot restores the stale retained
+config from its own persistence. The will never fires — there was no live
+broker to fire it — so the sentinel sits there permanently.
+
+This is the case the liveness probe (Phase 2 above) covers: a ghost never
+answers `status`, so after the ~24s budget the bridge declares the retained
+config stale and starts on its own. A live incumbent always answers within
+milliseconds, so the probe costs real wall-clock time *only* against a genuine
+ghost — presence alone would instead block the restart indefinitely.
+
+The probe's `PROBE_ATTEMPTS * PROBE_INTERVAL` budget is the upper bound on
+this recovery latency, deliberately kept under the broker's LWT/keep-alive
+fallback so the probe — not the will — is what normally resolves a ghost.
 
 **Limitations**:
 
 - Only protects against duplicates on the *same* `(broker, root_topic)`.
   Two bridges with different `mqtt_root_topic` won't collide.
-- The 500ms window is a heuristic. On a very slow broker connection,
-  startup may falsely succeed before the retained message arrives. The
-  runtime check catches this within seconds.
-- **The whole mechanism assumes the broker honors LWT.** If your broker
-  strips Last Will messages and your bridge crashes (kill -9, OOM,
-  power loss), the prior session's retained config stays on the broker
-  forever, and the next bridge startup will see it and refuse to start
-  (different `session_id`). Recovery: clear the topic by hand —
-  `mosquitto_pub -r -t '<root>/bridge/config' -m ''` — before
-  restarting. See §4.10 for the broader broker-compatibility picture.
+- The 500ms Phase-1 window is a heuristic. On a very slow broker connection
+  startup may observe no sentinel before it arrives; the runtime sid guard
+  catches the resulting overlap within seconds.
+- The probe trades ~24s of startup latency (ghost case only) for not needing
+  manual recovery. A live incumbent is detected immediately, so the cost is
+  paid only when there's genuinely nothing alive to collide with.
 
 ---
 

@@ -320,34 +320,33 @@ The bridge publishes events to the following MQTT topics:
 
 ## Operational Notes
 
-### Duplicate Instance Detection
-Running two bridges against the same MQTT broker + root topic is prevented.
+Day-to-day essentials. Each is covered in depth in
+[`docs/internals.md`](docs/internals.md):
 
-### State File
-Device registrations are persisted to `--state-file` (default `rustuya.json`)
-with debounced writes. The path is treated as relative to the working
-directory — use an absolute path (or the Docker default `/data/rustuya.json`)
-when running under systemd.
+- **One bridge per broker + root topic.** Starting a second bridge against
+  the same `(broker, mqtt_root_topic)` is detected and refused. After an
+  unclean shutdown (crash, power loss) a stale lock may linger on the broker;
+  the next start probes for a live instance and, if none answers, recovers
+  automatically after ~24s — no manual cleanup needed.
+  ([internals §7](docs/internals.md#7-duplicate-instance-detection))
 
-> **If `--mqtt-retain` is enabled, do not delete the state file to "reset"
-> the bridge.** The retain-scavenger runs in response to `remove` /
-> `clear` actions while the bridge is alive, so deleting the file leaves
-> stale retained messages on the broker for devices it no longer knows
-> about. Send a `clear` command (or per-device `remove`) first. With the
-> default `mqtt_retain = false`, deleting the file is harmless.
+- **State file.** Device registrations persist to `--state-file` (default
+  `rustuya.json`) with debounced writes. The path is relative to the working
+  directory — use an absolute path (or the Docker default
+  `/data/rustuya.json`) under systemd. **With `--mqtt-retain` enabled, don't
+  delete the state file to "reset" the bridge** — it leaves stale retained
+  messages on the broker for devices it no longer knows about. Send a `clear`
+  (or per-device `remove`) first. With the default `mqtt_retain = false`,
+  deleting the file is harmless.
+  ([internals §4.8](docs/internals.md#48-the-deleting-the-state-file-hazard))
 
 ### Changing templates or retain
 
-The bridge reads its configuration **only at startup**, so any change to the
-topic/payload templates or `mqtt_retain` needs a restart to take effect.
-Restarting naively, though, leaves a mess when `mqtt_retain = true`: the
-retained state snapshots already on the broker were published under the *old*
-scheme. Change the event/message/payload templates and they sit on the old
-topics as orphans forever; turn retain off and they're never cleared. Consumers
-keep seeing ghost state. Re-registering every device just to clean up is
-overkill.
-
-The `reconfigure` action handles this:
+The bridge reads its configuration **only at startup**, so changing the
+topic/payload templates or `mqtt_retain` needs a restart. A naive restart
+orphans the retained state snapshots already on the broker under the *old*
+scheme (turn retain off and they're never cleared; change topics and they sit
+as ghosts). The `reconfigure` action handles this cleanly:
 
 ```bash
 # 1. Edit your config FIRST (file / flags / env) — the running bridge ignores
@@ -356,30 +355,14 @@ The `reconfigure` action handles this:
 mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "reconfigure"}'
 ```
 
-While its old (in-memory) config is still live, the bridge stops retaining new
-publishes (live events keep flowing), clears the retained messages under the
-old scheme, then exits. A process supervisor restarts it into your edited
-config, with device registrations preserved. More generally, `reconfigure` is
-just the "apply a config change" path — *edit config → reconfigure* works for
-any change.
-
-Notes:
-- **Edit the config before triggering** `reconfigure`. If you trigger it first,
-  the restart reloads the unchanged config.
-- Requires a process supervisor that auto-restarts the bridge (systemd
-  `Restart=always`, Docker restart policy, …). Without one, the bridge simply
-  exits. It logs whether a supervisor was detected.
-- With `mqtt_retain` off there are no bridge-published retained snapshots to
-  clear, so it warns but still restarts.
-- During the brief window state isn't retained; it's re-established after the
-  restart (send `get` to your devices to refresh immediately).
-- The retained cleanup is **skipped when nothing scavenge-relevant changed** —
-  if the broker, root/event/message topics, and `mqtt_retain` in your
-  `--config` file still match the running config, `reconfigure` is just a clean
-  restart and won't blank valid retained state. (This skip relies on file-based
-  config; if those fields come from CLI flags or env vars, the cleanup runs
-  regardless.) A broker change still purges — the cleanup runs against the
-  *old* broker before the restart, so its retained don't get orphaned.
+It stops retaining new publishes (live events keep flowing), clears the
+old-scheme retained messages, then exits; a process supervisor (systemd
+`Restart=always`, Docker restart policy) restarts it into the edited config
+with device registrations preserved. More generally, *edit config →
+reconfigure* is the uniform "apply a config change" path. The full mechanics —
+the skip-when-unchanged guard, broker-change handling, and retain-off behavior
+— are in
+[internals §4.11](docs/internals.md#411-reconfigure--applying-templateretain-changes-without-re-registering).
 
 ## Further Reading
 
