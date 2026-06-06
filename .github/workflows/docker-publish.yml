@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 # Release creation is owned by binary-publish.yml so both workflows attach to
 # the same release without racing on its creation.
 jobs:
