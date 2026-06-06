@@ -97,8 +97,10 @@ pub struct BridgeContext {
     /// Never cleared — the process exits shortly after it's set.
     pub retain_suppressed: AtomicBool,
 
-    /// Per-device merged DPS cache. `Some` only when `mqtt_retain=true` and the
-    /// event topic carries `{type}` (cache mode). `None` in pass-through mode (pass-through).
+    /// Per-device merged DPS cache. `Some` whenever `mqtt_retain=true` (cache
+    /// mode); `None` in pass-through mode (`mqtt_retain=false`). Note `{type}`
+    /// absence does *not* gate this — it only triggers a startup WARN (deltas
+    /// and the state snapshot then collide on one topic), never a downgrade.
     pub cache: Option<Arc<DpsCache>>,
 
     /// Set when the broker-retained seed phase has completed (cache mode only). While

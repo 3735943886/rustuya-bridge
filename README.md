@@ -172,6 +172,7 @@ Run with:
 - **Responses/Errors**: Command results and errors are published to `mqtt-message-topic`.
   - **Success**: Published with `{level}` set to `response`.
   - **Error**: Published with `{level}` set to `error`.
+  - **Retain**: command responses/errors (the ack for a command you sent) are always **no-retain** — they're one-shot. **Device-reported errors** — the `errorCode` the bridge pushes from device events, where `errorCode: 0` means *connected* — instead follow `--mqtt-retain`: **retained when on**, so the last-known connect/error state stays on the broker and a late subscriber reads online (`0`) vs offline (non-zero) without polling; no-retain when off.
 - **Scanner**: Results are published to `mqtt-scanner-topic`.
 
 #### Why `--mqtt-retain` emits a separate `state` snapshot
