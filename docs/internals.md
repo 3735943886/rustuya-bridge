@@ -326,9 +326,9 @@ extraction.
    - Topic: `rustuya/event/active/ebabc.../2`
    - Payload: `50`
 4. Each message is QoS 1. Because these are **active** deltas, cache mode
-   (`mqtt_retain: true`) publishes them **no-retain**; only the merged
-   `passive` snapshot is retained — see §4. (Retain is structurally safe here
-   because `{id}` resolves.)
+   (`mqtt_retain: true`) publishes them **no-retain** on `{type}=active`; only
+   the merged `{type}=state` snapshot is retained — see §4. (Retain is
+   structurally safe there because `{id}` resolves.)
 
 **Outbound error** — device reports `{"errorCode": xxx}`:
 
@@ -432,7 +432,7 @@ current code path doesn't populate.
 | `{name}`      | device name from config                             | empty string          |
 | `{cid}`       | sub-device cid                                      | empty string          |
 | `{level}`     | `"response"` / `"error"` / `"scanner"` (msg path)   | empty string          |
-| `{type}`      | `"active"` / `"passive"` (event-publish only)       | empty string          |
+| `{type}`      | `"active"`/`"passive"` (raw delta) or `"state"` (retained snapshot, cache mode); event-publish only | empty string          |
 | `{dp}`        | DP key (single-DP mode only)                        | empty string          |
 | `{value}`     | per-DP value (single-DP) OR full DPS JSON (multi-DP)| empty string          |
 | `{dps}`       | full DPS JSON string                                | empty string          |
@@ -457,10 +457,12 @@ The bridge has **two distinct retain models** selected by `mqtt_retain`:
   device event publishes one MQTT message with `retain=false`. No
   in-memory cache, no seed phase. State recovery on consumer reload is
   the consumer's problem.
-- cache mode (`mqtt_retain=true`) — separates **live deltas** (active events,
-  no retain) from **retained state snapshots** (the merged cache,
-  published with retain). HA-style state recovery works automatically
-  without spuriously re-firing event automations on reconnect.
+- cache mode (`mqtt_retain=true`) — separates **live deltas** (both active and
+  passive events, no retain, on `{type}=active`/`{type}=passive`) from a
+  **retained state snapshot** (the merged cache, published with retain on a
+  distinct `{type}=state` topic). HA-style state recovery works automatically
+  without spuriously re-firing event automations on reconnect, and a passive
+  readback (e.g. the reply to `get`) is still observable as a live delta.
 
 The rest of this section is about cache mode.
 
@@ -489,47 +491,59 @@ re-delivers a retained active.
 
 ```
 Direct publish route (trigger: handler call site)
-  └─ Active events only → {type}=active topic, no-retain, incoming delta
+  └─ Both active and passive → {type}=active / {type}=passive topic,
+     no-retain, incoming raw delta. Fires unconditionally.
 
 Cache publish route (trigger: cache.merge returns changed keys)
-  └─ Both active and passive → {type}=passive topic, retain,
+  └─ Both active and passive → {type}=state topic, retain,
      full merged DPS snapshot from the cache
 ```
 
-Both routes coexist for active events: a single active fires the direct
-route immediately AND merges into the cache, which (when seeded) fires
-a snapshot publish too. Passive events skip the direct route entirely.
+Every event fires the direct route immediately (its raw delta, no retain)
+*and* merges into the cache, which — when seeded and when something actually
+changed — fires a snapshot publish on `{type}=state`. The distinction between
+active and passive lives entirely in the **direct route's `{type}`** value;
+the snapshot is always `state` regardless of origin.
 
-Identical-value updates are deduped at the cache layer — `cache.merge()`
-returns the keys that actually changed, and the snapshot publish is
-gated on that being non-empty. A device sending the same periodic
-status report every 30s won't generate snapshot publishes after the
-first.
+The direct route is **ungated**: it fires even for a passive whose values all
+match the cache. This is deliberate — it's the "something arrived" signal, so
+a `get`/`status` readback that changes nothing is still visible on
+`{type}=passive` rather than being silently absorbed into the (unchanged)
+snapshot.
+
+Identical-value updates are deduped only at the **cache layer** — `cache.merge()`
+returns the keys that actually changed, and the *snapshot* publish is gated on
+that being non-empty. A device sending the same periodic status report every
+30s won't generate snapshot publishes after the first, but it *will* keep
+emitting the no-retain `{type}=passive` delta each time.
 
 ### 4.3 `{type}` and live double-fire
 
-Cache mode publishes both an active delta (no retain) and a snapshot
-(retain) per active event. MQTT semantics keep the *reload* path safe
-unconditionally — a no-retain publish doesn't update the broker's
-retained value, so a re-subscribing client only ever receives the
-latest snapshot, never a stale active. The spurious-re-fire-on-reload
-bug is gone regardless of template shape.
+Cache mode publishes a no-retain raw delta (`{type}=active`/`{type}=passive`)
+*and*, when something changed, a retained snapshot (`{type}=state`) per event.
+MQTT semantics keep the *reload* path safe unconditionally — a no-retain
+publish doesn't update the broker's retained value, so a re-subscribing client
+only ever receives the latest `state` snapshot, never a stale delta. The
+spurious-re-fire-on-reload bug is gone regardless of template shape.
 
-The only residual concern is **live double-fire**: a subscriber on
-the same-topic active+snapshot stream gets both messages per active
-event. To filter, the subscriber needs to tell them apart, and that
-needs `{type}` in one of:
+The only residual concern is **live double-fire**: when `{type}` is in the
+topic, the three kinds (active delta, passive delta, state snapshot) each get
+their own topic, so a subscriber receives exactly what it subscribed to and
+there is no collision — pick `{type}=active` for event triggers, `{type}=state`
+for current state, `{type}=passive` to watch readbacks. The distinction needs
+`{type}` in one of:
 
-- the **event topic** (`{root}/event/{type}/{id}`) — subscribe to
-  just `{type}=active` or `{type}=passive`, never receive the other
-- the **payload template** (`{"type":"{type}","value":{value}}`) —
-  same topic for both, but consumers filter on `value_json.type`
+- the **event topic** (`{root}/event/{type}/{id}`) — subscribe to just the
+  `{type}` you want; each kind is a separate topic.
+- the **payload template** (`{"type":"{type}","value":{value}}`) — all kinds
+  share a topic, but consumers filter on `value_json.type`.
 
-If `mqtt_retain=true` is set with **neither**, the bridge logs a WARN
-and keeps cache mode enabled — the user opted in explicitly, and a
-fleet with no event automations doesn't care about live double-fire
-(state entities are idempotent). The WARN points at the templates to
-add `{type}` to if the user does care.
+If `mqtt_retain=true` is set with **neither**, all three kinds collide on one
+topic: a live subscriber gets every delta *and* every snapshot with no way to
+tell them apart. The bridge logs a WARN and keeps cache mode enabled — the
+user opted in explicitly, and a fleet with no event automations doesn't care
+(state entities are idempotent). The WARN points at the templates to add
+`{type}` to if the user does care.
 
 ### 4.4 The retain gate (`IdentifierSet`) — unchanged
 
@@ -547,8 +561,8 @@ whether `retain=true` is safe. The rule:
 So if your event topic is `rustuya/event/{type}/{name}/{dp}` and you
 publish a snapshot for a device with no name, the bridge **strips
 retain** for that snapshot. The per-device shortfall is logged at
-`debug` only. Active-delta publishes are never retained, so this gate
-only affects snapshots.
+`debug` only. Delta publishes (active and passive) are never retained,
+so this gate only affects the `{type}=state` snapshots.
 
 If the templates reference no identifier at all (e.g.
 `rustuya/event/{type}`), `IdentifierSet::is_empty()` is true and
@@ -570,7 +584,7 @@ cache from broker-retained snapshots, then start publishing**.
 The seed loop in [spawn_mqtt_task](../src/bridge.rs):
 
 1. On first `ConnAck`, subscribes to the state wildcard (event topic
-   with `{type}=passive` and other placeholders as `+`).
+   with `{type}=state` and other placeholders as `+`).
 2. Receives broker-retained payloads. For each, parses the payload as
    the cached snapshot for that device and calls `cache.fill_missing`
    — fills only empty slots, so anything the bridge already learned
@@ -586,8 +600,8 @@ The seed loop in [spawn_mqtt_task](../src/bridge.rs):
    `seed_pending` by the publish gate) get one snapshot publish each.
 
 During the seed window:
-- **Active events still publish to `{type}=active`** (direct route is
-  ungated). HA event automations work normally.
+- **Deltas still publish** to `{type}=active`/`{type}=passive` (direct route
+  is ungated). HA event automations and readback observability work normally.
 - **Snapshot publishes are deferred** — gated on `seed_done`. The
   changed device is recorded in `seed_pending` for the flush at seed
   end.

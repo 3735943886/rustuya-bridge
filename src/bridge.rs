@@ -113,7 +113,8 @@ pub struct BridgeContext {
 
     /// MQTT wildcard topic used to recover cached state from the broker on
     /// startup (cache mode only, default payload template only). Derived from the event
-    /// topic with `{type}=passive` and other placeholders as `+`.
+    /// topic with `{type}=state` (the retained-snapshot type) and other
+    /// placeholders as `+`.
     pub seed_state_wildcard: Option<String>,
 
     /// Regex matched against incoming retained messages on the seed wildcard
@@ -284,18 +285,21 @@ impl BridgeContext {
             );
         }
 
-        // cache mode (mqtt_retain=true) splits each device update across a
-        // no-retain delta and a retained snapshot. MQTT semantics keep us
+        // cache mode (mqtt_retain=true) splits each device update across
+        // no-retain raw deltas (`{type}=active` / `{type}=passive`) and a
+        // retained merged snapshot (`{type}=state`). MQTT semantics keep us
         // safe on the reload path regardless of templates: a no-retain
         // publish doesn't overwrite the retained value, so a re-subscribing
-        // client always receives only the latest snapshot, never a stale
-        // active. Spurious re-fires on reconnect — the primary bug we
+        // client always receives only the latest `state` snapshot, never a
+        // stale delta. Spurious re-fires on reconnect — the primary bug we
         // wanted to kill — are gone unconditionally.
         //
-        // The only residual concern is *live* double-fire: a subscriber on
-        // the active+snapshot topic gets two messages per active event and
-        // can't tell which is which unless `{type}` appears in the topic
-        // (separate subscriptions) or the payload (filter via value_json).
+        // The only residual concern is *live* double-fire: when `{type}` is
+        // absent all three kinds (active delta, passive delta, state
+        // snapshot) land on one topic, so a live subscriber gets every delta
+        // *and* every snapshot and can't tell them apart. With `{type}` in
+        // the topic each kind is its own topic (subscribe to just what you
+        // want); in the payload, consumers filter via value_json.type.
         // State entities are idempotent and don't care; event automations
         // need the distinction. We warn rather than downgrade because
         // mqtt_retain=true is the user's explicit opt-in, and a fleet with
@@ -304,7 +308,7 @@ impl BridgeContext {
             mqtt_event_topic.contains("{type}") || payload_tpl.contains("{type}");
         if cli.mqtt_retain() && !type_distinguishable {
             warn!(
-                "mqtt_retain=true but {{type}} is absent from both mqtt_event_topic ('{mqtt_event_topic}') and mqtt_payload_template ('{payload_tpl}'). State recovery on reconnect works, but live event automations subscribed to the snapshot topic may double-fire because active deltas and retained snapshots collide. Add {{type}} to either template to let consumers filter."
+                "mqtt_retain=true but {{type}} is absent from both mqtt_event_topic ('{mqtt_event_topic}') and mqtt_payload_template ('{payload_tpl}'). State recovery on reconnect works, but live subscribers can't separate active/passive deltas from the retained state snapshot — all three collide on one topic. Add {{type}} to either template to let consumers filter."
             );
         }
         let effective_retain = cli.mqtt_retain();
@@ -339,7 +343,7 @@ impl BridgeContext {
             .unwrap_or_else(|| crate::config::DEFAULT_MQTT_ROOT_TOPIC.to_string());
 
         let (seed_state_wildcard, seed_state_regex) = if seed_supported {
-            let tpl = mqtt_event_topic.replace("{type}", "passive");
+            let tpl = mqtt_event_topic.replace("{type}", "state");
             let wildcard = tpl_to_wildcard(&tpl, &root_topic_str);
             let regex = compile_topic_regex(&tpl);
             (Some(wildcard), regex)
@@ -1249,10 +1253,9 @@ impl BridgeContext {
         name: Option<&str>,
         cid: Option<&str>,
         dps: &Value,
-        is_passive: bool,
+        event_type: &str,
     ) -> Vec<(String, String)> {
         let dps_str = dps.to_string();
-        let event_type = if is_passive { "passive" } else { "active" };
 
         let replace_vars_local = |s: &str, dp: Option<&str>, val: Option<&Value>| {
             self.replace_vars(
@@ -1294,18 +1297,19 @@ impl BridgeContext {
 
     /// Renders the configured event topic / payload templates for a device
     /// update and pushes each rendered (topic, payload) onto the MQTT outbound
-    /// channel. Single low-level publish helper used by both pass-through
-    /// and cache-mode active/snapshot publishes; retain is decided by the caller.
+    /// channel. Single low-level publish helper used by pass-through publishes
+    /// and by both cache-mode routes (raw delta and state snapshot); the
+    /// caller picks the `{type}` value (`active`/`passive`/`state`) and retain.
     async fn publish_event_templates(
         &self,
         id: &str,
         name: Option<&str>,
         cid: Option<&str>,
         dps: &Value,
-        is_passive: bool,
+        event_type: &str,
         retain: bool,
     ) {
-        let templates = self.generate_device_templates(id, name, cid, dps, is_passive);
+        let templates = self.generate_device_templates(id, name, cid, dps, event_type);
         if templates.is_empty() {
             return;
         }
@@ -1326,11 +1330,14 @@ impl BridgeContext {
     /// This preserves the historical bridge behavior for retain-off users.
     ///
     /// cache mode (`mqtt_retain=true`): two parallel routes.
-    /// 1. *Direct route* (active only): publish the incoming delta on
-    ///    `{type}=active`, no retain — for HA event automations etc.
+    /// 1. *Direct route* (active AND passive): publish the incoming raw delta,
+    ///    no retain, on `{type}=active` (active) or `{type}=passive` (passive).
+    ///    Fires unconditionally — even for a passive that matches the cache, so
+    ///    a `get`/status readback is still observable, and even during the seed
+    ///    window. This is the live "something arrived" signal.
     /// 2. *Cache route*: merge the incoming DPs into the in-memory cache; if
     ///    any value actually changed AND the seed phase has finished, publish
-    ///    the full merged snapshot on `{type}=passive` retained. During the
+    ///    the full merged snapshot on `{type}=state` retained. During the
     ///    seed window the device id is queued in `seed_pending` for a single
     ///    deferred flush — this is what avoids overwriting the broker's
     ///    full-state snapshot with a partial passive (e.g. a battery-only
@@ -1356,20 +1363,24 @@ impl BridgeContext {
 
         let name_opt = name.as_deref();
         let cid_opt = cid.as_deref();
+        let delta_type = if is_passive { "passive" } else { "active" };
 
         // pass-through. mqtt_retain=false here either by user choice or by
         // the {type}-missing downgrade in `BridgeContext::new`.
         if !self.mqtt_retain {
-            self.publish_event_templates(&id, name_opt, cid_opt, &dps, is_passive, false)
+            self.publish_event_templates(&id, name_opt, cid_opt, &dps, delta_type, false)
                 .await;
             return;
         }
 
-        // cache-mode direct route: active delta to {type}=active, no retain.
-        if !is_passive {
-            self.publish_event_templates(&id, name_opt, cid_opt, &dps, false, false)
-                .await;
-        }
+        // cache-mode direct route: raw incoming delta, no retain, for BOTH
+        // active and passive (active → {type}=active, passive → {type}=passive).
+        // Fires unconditionally — even for a passive whose values all match the
+        // cache (so a `get`/status readback is observable) and even during the
+        // seed window. The retained `{type}=state` snapshot below is what
+        // dedupes; this live signal never does.
+        self.publish_event_templates(&id, name_opt, cid_opt, &dps, delta_type, false)
+            .await;
 
         // cache-mode cache route: merge then publish snapshot (gated by seed_done).
         let Some(cache) = &self.cache else { return };
@@ -1434,7 +1445,7 @@ impl BridgeContext {
         }
     }
 
-    /// Publishes the cached snapshot for one device on the `{type}=passive`
+    /// Publishes the cached snapshot for one device on the `{type}=state`
     /// topic with retain. `only_keys` narrows what gets published in
     /// single-DP mode (one topic per DP) so an event that changed DP 1
     /// doesn't republish a still-current DP 2's retained — pass
@@ -1486,7 +1497,7 @@ impl BridgeContext {
                 "Stripping retain for snapshot from '{id}': no template identifier resolvable (name={name:?}, cid={cid:?})"
             );
         }
-        self.publish_event_templates(id, name, cid, &snap_value, true, retain)
+        self.publish_event_templates(id, name, cid, &snap_value, "state", retain)
             .await;
     }
 
@@ -3033,11 +3044,11 @@ mod context_tests {
         let active = msgs.iter().find(|m| !m.retain).expect("active no-retain");
         let snapshot = msgs.iter().find(|m| m.retain).expect("snapshot retained");
         assert!(active.topic.contains("/active/"));
-        assert!(snapshot.topic.contains("/passive/"));
+        assert!(snapshot.topic.contains("/state/"));
     }
 
     #[tokio::test]
-    async fn cache_mode_passive_publishes_only_snapshot_after_seed() {
+    async fn cache_mode_passive_publishes_delta_then_snapshot_after_seed() {
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })
@@ -3060,9 +3071,15 @@ mod context_tests {
         .await;
 
         let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(msgs.len(), 1, "passive in cache mode must produce snapshot only");
-        assert!(msgs[0].retain, "snapshot must be retained");
-        assert!(msgs[0].topic.contains("/passive/"));
+        assert_eq!(
+            msgs.len(),
+            2,
+            "passive in cache mode produces a no-retain delta + a retained snapshot"
+        );
+        let delta = msgs.iter().find(|m| !m.retain).expect("passive delta no-retain");
+        let snapshot = msgs.iter().find(|m| m.retain).expect("snapshot retained");
+        assert!(delta.topic.contains("/passive/"), "delta on {{type}}=passive");
+        assert!(snapshot.topic.contains("/state/"), "snapshot on {{type}}=state");
     }
 
     #[tokio::test]
@@ -3102,8 +3119,10 @@ mod context_tests {
         .await;
 
         let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(msgs.len(), 1);
-        let payload: serde_json::Value = serde_json::from_str(&msgs[0].payload).unwrap();
+        // Battery-only passive → a no-retain delta (battery only) + the merged
+        // retained snapshot. The snapshot is what must still carry DPs 1 and 2.
+        let snapshot = msgs.iter().find(|m| m.retain).expect("merged snapshot retained");
+        let payload: serde_json::Value = serde_json::from_str(&snapshot.payload).unwrap();
         assert_eq!(payload.get("1"), Some(&serde_json::json!(true)));
         assert_eq!(payload.get("2"), Some(&serde_json::json!(50)));
         assert_eq!(payload.get("battery"), Some(&serde_json::json!(80)));
@@ -3142,7 +3161,10 @@ mod context_tests {
     }
 
     #[tokio::test]
-    async fn cache_mode_dedupes_unchanged_values() {
+    async fn cache_mode_dedupes_unchanged_snapshot_but_always_emits_delta() {
+        // The retained `state` snapshot dedupes on unchanged values, but the
+        // no-retain delta always fires so a repeated `get`/status readback is
+        // still observable (the whole reason passive gets a live delta).
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })
@@ -3161,9 +3183,11 @@ mod context_tests {
         )
         .await;
         let first = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(first.len(), 1, "first passive publishes snapshot");
+        assert_eq!(first.len(), 2, "first passive: delta + snapshot");
+        assert_eq!(first.iter().filter(|m| m.retain).count(), 1, "one retained snapshot");
 
-        // Same value again — cache.merge returns no changed keys, no snapshot.
+        // Same value again — cache.merge returns no changed keys → no snapshot,
+        // but the no-retain delta still publishes.
         ctx.publish_device_event(
             "dev-1".into(),
             Some("name-dev-1".into()),
@@ -3174,10 +3198,9 @@ mod context_tests {
         )
         .await;
         let second = drain_mqtt(&mut mqtt_rx).await;
-        assert!(
-            second.is_empty(),
-            "same-value passive must dedupe to no publish"
-        );
+        assert_eq!(second.len(), 1, "same-value passive still emits the delta");
+        assert!(!second[0].retain, "no retained snapshot on unchanged value");
+        assert!(second[0].topic.contains("/passive/"));
     }
 
     #[tokio::test]
@@ -3239,7 +3262,7 @@ mod context_tests {
         })
         .await;
         let (id, dp) = ctx
-            .match_seed_topic("rustuya/event/passive/dev-1")
+            .match_seed_topic("rustuya/event/state/dev-1")
             .expect("topic should match");
         assert_eq!(id, "dev-1");
         assert!(dp.is_none(), "multi-DP mode has no {{dp}}");
@@ -3253,7 +3276,7 @@ mod context_tests {
         })
         .await;
         let (id, dp) = ctx
-            .match_seed_topic("rustuya/event/passive/dev-1/42")
+            .match_seed_topic("rustuya/event/state/dev-1/42")
             .expect("topic should match");
         assert_eq!(id, "dev-1");
         assert_eq!(dp.as_deref(), Some("42"));
@@ -3327,7 +3350,7 @@ mod context_tests {
         let post = drain_mqtt(&mut mqtt_rx).await;
         assert_eq!(post.len(), 1, "flush publishes one snapshot");
         assert!(post[0].retain, "flush snapshot is retained");
-        assert!(post[0].topic.contains("/passive/"));
+        assert!(post[0].topic.contains("/state/"));
     }
 
     #[tokio::test]
@@ -3367,12 +3390,14 @@ mod context_tests {
         .await;
 
         let msgs = drain_mqtt(&mut mqtt_rx).await;
+        // passive → no-retain delta + retained snapshot.
+        let snaps: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
         assert_eq!(
-            msgs.len(),
+            snaps.len(),
             1,
             "runtime-added device must publish snapshot on first cache change"
         );
-        assert!(msgs[0].retain);
+        assert!(snaps[0].topic.contains("/state/"));
         assert!(
             ctx.seed_pending.lock().unwrap().is_empty(),
             "must not queue when seed already done"
@@ -3419,7 +3444,7 @@ mod context_tests {
         // with multiple DPs, an event changing one DP should NOT also
         // republish snapshots for unchanged DPs in single-DP topic mode.
         // Each per-DP topic already has the correct retained from prior
-        // snapshots — re-emitting them as type=passive on every unrelated
+        // snapshots — re-emitting them on {type}=state on every unrelated
         // event spuriously surfaces "events" for DPs that didn't change.
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
@@ -3496,8 +3521,8 @@ mod context_tests {
     #[tokio::test]
     async fn handle_event_classifies_root_dps_as_passive() {
         // User-confirmed wire shape: DP_QUERY response (cmd 16) puts dps
-        // at the root with no `data` wrapper. Must be classified as
-        // passive: snapshot publish only, no active.
+        // at the root with no `data` wrapper. Classified as passive: a
+        // no-retain passive delta plus a retained state snapshot — never active.
         let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
             cli.mqtt_retain = Some(true);
         })
@@ -3515,8 +3540,12 @@ mod context_tests {
             "root dps without data wrapper must NOT produce active publish"
         );
         assert!(
-            msgs.iter().any(|m| m.topic.contains("/passive/")),
-            "passive must still produce a snapshot publish"
+            msgs.iter().any(|m| m.topic.contains("/passive/") && !m.retain),
+            "passive must produce a no-retain delta"
+        );
+        assert!(
+            msgs.iter().any(|m| m.topic.contains("/state/") && m.retain),
+            "passive must also produce a retained state snapshot"
         );
     }
 

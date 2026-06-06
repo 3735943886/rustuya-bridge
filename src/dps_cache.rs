@@ -2,7 +2,7 @@
 //!
 //! Only instantiated in cache mode (`mqtt_retain=true`); pass-through mode passes device
 //! messages straight through without caching. The cache is the source of truth
-//! for retained state snapshots published on the `type=passive` topic.
+//! for retained state snapshots published on the `type=state` topic.
 //!
 //! See `docs/internals.md` §4 for the full retain model and how this cache
 //! interacts with the broker-seeded startup phase.

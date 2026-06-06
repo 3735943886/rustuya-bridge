@@ -138,7 +138,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
 | `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
 | `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | `{value}` | MQTT payload template (e.g., `{"val": {value}}`) |
-| `--mqtt-retain` | `MQTT_RETAIN` | `false` | `true` enables the cache + snapshot retain model: live deltas publish to `{type}=active` no-retain, merged state snapshots to `{type}=passive` retained — recommended when subscribers need to recover device state immediately on reconnect. `false` (default) passes events through with no retain. See [docs/internals.md §4](docs/internals.md). |
+| `--mqtt-retain` | `MQTT_RETAIN` | `false` | `true` enables the cache + snapshot retain model: live deltas publish no-retain to `{type}=active`/`{type}=passive`, and merged full-state snapshots publish retained to `{type}=state` — recommended when subscribers need to recover device state immediately on reconnect. `false` (default) passes events through with no retain. See [docs/internals.md §4](docs/internals.md). |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
 | `--scavenger-timeout-secs`| `SCAVENGER_TIMEOUT_SECS` | `1` | Seconds the retain scavenger waits for retained MQTT messages before exiting after `remove`/`clear`. Raise on slow brokers. |
@@ -165,29 +165,30 @@ Run with:
 
 ### MQTT Usage
 - **Commands**: Publish a JSON payload to the `mqtt-command-topic`.
-- **Events**: Device events are published to the `mqtt-event-topic`. Each event carries a `{type}` of `active` or `passive`:
-  - **Active**: real-time push initiated by the device, physical interaction, firmware-driven change, or response to a SET. Payload arrives with the `data.dps` wrapper.
-  - **Passive**: status reports without an initiating change (DP_QUERY response, or periodic report). Payload arrives with root `dps`, no `data` wrapper.
+- **Events**: Device events are published to the `mqtt-event-topic`, tagged with a `{type}`:
+  - **Active**: real-time push initiated by the device, physical interaction, firmware-driven change, or response to a SET. Payload arrives with the `data.dps` wrapper. Published **no-retain**.
+  - **Passive**: status reports without an initiating change (DP_QUERY response, or periodic report). Payload arrives with root `dps`, no `data` wrapper. Published **no-retain**.
+  - **State** (only with `--mqtt-retain true`): the bridge's own merged full-state snapshot, published **retained** to `{type}=state` so late subscribers recover current state on connect. Not a device event type — it's synthesized by the cache. See [docs/internals.md §4](docs/internals.md).
 - **Responses/Errors**: Command results and errors are published to `mqtt-message-topic`.
   - **Success**: Published with `{level}` set to `response`.
   - **Error**: Published with `{level}` set to `error`.
 - **Scanner**: Results are published to `mqtt-scanner-topic`.
 
-#### Why a single state change can show up as two messages
+#### Why `--mqtt-retain` emits a separate `state` snapshot
 
-With `--mqtt-retain true` (recommended when subscribers need to recover device state on reconnect), a single DP change publishes **two** event messages — this is intentional, not a duplicate:
+With `--mqtt-retain true` (recommended when subscribers need to recover device state on reconnect), the bridge splits every device update into a **live no-retain delta** (on `{type}=active`/`{type}=passive`) and a **retained full-state snapshot** on a separate `{type}=state` topic. A single DP change therefore shows up as two messages — intentional, not a duplicate:
 
 ```text
-rustuya/event/active/aabbccdd11223344eeff   →  {"1":true}                  (no retain)
-rustuya/event/passive/aabbccdd11223344eeff  →  {"1":true,"2":50,"9":0}     (retain)
+rustuya/event/active/aabbccdd11223344eeff  →  {"1":true}                  (no retain — the delta that just arrived)
+rustuya/event/state/aabbccdd11223344eeff   →  {"1":true,"2":50,"9":0}     (retain — full merged snapshot)
 ```
 
-- **`active`** — the **delta** that just changed (only the DPs that moved). Published without retain so each event fires exactly once — useful as an automation trigger when you want to react to the moment of change.
-- **`passive`** — the **full merged snapshot** of the device, retained. A subscriber that connects late (after a reconnect or restart) reads it once and immediately knows the current state without waiting for the next device update.
+- **`active` / `passive`** — the raw delta exactly as it arrived from the device, published **no-retain**. `active` = a device-initiated change (button, toggle); `passive` = a readback or periodic report (e.g. the reply to a `get`/`status`). Use these as automation triggers or to observe that *something arrived*. Both fire on every update — so a `get` readback is never silent, even when it doesn't change anything.
+- **`state`** — the **full merged snapshot** of the device, **retained**. A subscriber that connects late (after a reconnect or restart) reads it once and immediately knows the current state without waiting for the next device update. Deduped: republished only when a value actually changed.
 
-If you only need *current state*, subscribing to `passive` is sufficient. If you need *event semantics*, watch `active`. Many consumers want both — `active` for the moment, `passive` for state at rest.
+If you only need *current state*, subscribe to `state`. If you need *event semantics*, watch `active` (and `passive` for readbacks). Many consumers want both — the deltas for the moment, `state` for state at rest.
 
-In pass-through mode (`--mqtt-retain false`, the default), the bridge publishes a single message per event with no retain; `{type}` simply reflects which Tuya cmd produced it. There is no snapshot.
+In pass-through mode (`--mqtt-retain false`, the default), there is no `state` snapshot: each event publishes a single no-retain `active`/`passive` message reflecting which Tuya cmd produced it, and that's it.
 
 ### Examples (MQTT)
 
@@ -267,7 +268,7 @@ MQTT topics and payloads can be fully customized using templates.
 - `{id}`: Device ID (or `bridge` for bridge-level responses)
 - `{name}`: Device Name (or `bridge` for bridge-level responses)
 - `{cid}`: Sub-device CID (if applicable, otherwise empty)
-- `{type}`: `active` or `passive` (only for event topic)
+- `{type}`: `active` or `passive` (raw device deltas) or `state` (retained merged snapshot, `--mqtt-retain true` only) — only for the event topic
 - `{dp}`: Data Point ID (only in single DP mode)
 - `{value}`: Data Point Value (only in single DP mode)
 - `{dps}`: JSON string of all Data Points
