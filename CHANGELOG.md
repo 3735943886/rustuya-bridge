@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.18] — Python 0.2.0-rc.18 — 2026-06-06
+
+### Changed
+- **BREAKING (cache mode, `--mqtt-retain true`): the retained state snapshot
+  moved from `{type}=passive` to a new `{type}=state`, and passive events now
+  also emit a live no-retain delta.** Previously cache mode swallowed passive
+  events into the cache and published the merged snapshot on `{type}=passive`,
+  so a `get`/`status` readback that didn't change anything produced no MQTT
+  traffic at all — silent. Now `{type}` cleanly separates three kinds:
+  `active`/`passive` are the raw device deltas (both **no-retain**, fired on
+  every update so a readback is always observable), and `state` is the merged
+  full-state snapshot (**retained**, deduped — republished only when a value
+  changed). Cache mode is now exactly "pass-through + a retained `state`
+  snapshot". The startup seed phase now recovers from `{type}=state`.
+
+  Migration: consumers that subscribed to `{type}=passive` for *retained
+  current state* must switch to `{type}=state`. Snapshots previously retained on
+  `{type}=passive` become orphans on the broker — a plain upgrade does not clear
+  them (the template string didn't change, so `reconfigure`'s skip-guard treats
+  it as unchanged). Clear them once with a `clear` (then re-register) or by
+  publishing an empty retained message to the old `{root}/event/passive/#`
+  topics.
+
 ## [0.3.0-rc.17] — Python 0.2.0-rc.17 — 2026-06-05
 
 ### Changed
