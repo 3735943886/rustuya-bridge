@@ -545,29 +545,91 @@ user opted in explicitly, and a fleet with no event automations doesn't care
 (state entities are idempotent). The WARN points at the templates to add
 `{type}` to if the user does care.
 
-### 4.4 The retain gate (`IdentifierSet`) — unchanged
+### 4.4 The retain gate (`IdentifierSet`)
 
-[IdentifierSet::satisfied_by](../src/bridge.rs) decides per-event
-whether `retain=true` is safe. The rule:
+[IdentifierSet::satisfied_by](../src/bridge.rs) decides, **per snapshot
+publish**, whether `retain=true` is safe. The gate exists so that every
+retained message the bridge leaves on the broker can later be *located and
+cleared* by the scavenger (§4.7) — a retained message whose topic carries no
+resolvable identifier would orphan forever.
 
-- Scan the event topic and payload templates once at startup, record which
-  of `{id}`/`{name}`/`{cid}` they reference → `event_identifiers`.
-- For each retained publish (snapshot in cache mode): retain only if at least
-  one referenced identifier *actually has a value for this device*.
-- `{id}` is always satisfiable (every device has an id). `{name}` and
-  `{cid}` are only satisfiable when the device's config has a non-empty
-  value for them.
+**What the gate reads.** At startup it scans **both** the event topic *and*
+the payload template (their union) for `{id}`/`{name}`/`{cid}` →
+`event_identifiers` ([from_templates](../src/bridge.rs)). So "has `{id}`"
+means *either* template references it — not the topic alone.
 
-So if your event topic is `rustuya/event/{type}/{name}/{dp}` and you
-publish a snapshot for a device with no name, the bridge **strips
-retain** for that snapshot. The per-device shortfall is logged at
-`debug` only. Delta publishes (active and passive) are never retained,
-so this gate only affects the `{type}=state` snapshots.
+```rust
+// satisfied_by(name, cid):
+self.id
+    || (self.name && name.is_some_and(|s| !s.is_empty()))
+    || (self.cid  && cid.is_some_and(|s| !s.is_empty()))
+```
 
-If the templates reference no identifier at all (e.g.
-`rustuya/event/{type}`), `IdentifierSet::is_empty()` is true and
-retain becomes structurally impossible to scavenge — the bridge warns
-**once at startup** rather than on every event.
+`{id}` is **always** satisfiable (every device has an id). `{name}`/`{cid}`
+are satisfiable only when *this device's* config has a non-empty value.
+
+**Two things this gate does NOT do:**
+
+- It does **not** gate whether the `{type}=state` snapshot is *published*.
+  In cache mode a changed snapshot is **always** published (post-seed); the
+  gate only flips its `retain` flag. A "stripped" snapshot still goes out —
+  as `retain=false`.
+- It does **not** affect delta publishes. Active/passive deltas are
+  *unconditionally* `retain=false`, so the gate only ever touches the
+  `{type}=state` snapshot.
+
+#### Behavior by identifier case
+
+Hold `{type}` constant (present) to isolate the identifier axis — the
+`{type}` warning is orthogonal (see below). "id referenced" = `{id}` is in
+the event topic **or** the payload template.
+
+| Templates reference… | Startup identifier warn | `{type}=state` published | `retain` on the snapshot | Runtime log |
+| --- | --- | --- | --- | --- |
+| **① `{id}`** (± name/cid) | no | yes | **always retained** — every device, regardless of name/cid | none |
+| **② no `{id}`, but `{name}` and/or `{cid}`** | no | yes | **per-device**: retained iff this device has a non-empty value for a referenced identifier; otherwise retain stripped | stripped devices log one `debug` line per snapshot ([publish_snapshot](../src/bridge.rs)) |
+| **③ no identifier at all** (`is_empty`) | **yes, once at startup** ([BridgeContext::new](../src/bridge.rs)) | yes | **never retained** — `satisfied_by` is `false` for all devices, so every snapshot is `retain=false` | every device logs one `debug` strip line per snapshot |
+
+Case ① — `self.id == true` short-circuits `satisfied_by` to `true`
+unconditionally, so a nameless device or a direct (no-cid) device still
+retains fine. Case ② — e.g. `rustuya/event/{type}/{name}/{dp}`: a device with
+a name retains; a nameless one has *that device's* snapshot published
+no-retain (logged at `debug`). If both `{name}` and `{cid}` are referenced,
+**any one** resolvable value is enough. Case ③ — e.g. `rustuya/event/{type}`:
+the startup warning's "…will be dropped" means the **retain flag** is
+dropped, **not** the message — the snapshot is still published, just
+`retain=false`.
+
+#### ⚠️ Retaining by `{name}`/`{cid}` without `{id}` — collision hazard
+
+`{id}` is unique per device; `{name}` and `{cid}` are **not guaranteed
+unique**. If you build a retained state topic from a non-unique identifier
+(e.g. `rustuya/event/{type}/{name}` with no `{id}`), then **two devices that
+share a name render the same `state` topic**. Because that topic is
+*retained*, their snapshots **overwrite each other on the broker** —
+last-writer-wins — and a re-subscribing consumer sees a single payload that
+flip-flops between the two devices' DPS. The bridge's caches stay correct
+(they're keyed by the unique device id — see §4.1), and the scavenger still
+works (the name *is* resolvable), so **nothing logs a warning** for this:
+the gate only checks "is the identifier resolvable?", not "is it unique?".
+
+Guidance: if you want retained per-device state, **put `{id}` in the event
+topic** (or the payload). Use `{name}`/`{cid}` for retain *only* when you can
+guarantee they're unique across your fleet — otherwise keep them as
+*additional* segments alongside `{id}`, never as the sole identifier. The
+same caution applies to `{cid}` when sub-devices on different gateways can
+share a cid.
+
+#### Orthogonal: the `{type}` warning
+
+Independent of the identifier gate, if `mqtt_retain=true` and `{type}` is
+absent from **both** the event topic and payload template, the bridge emits a
+**second** one-time startup warning ([BridgeContext::new](../src/bridge.rs)):
+active/passive/state then collide on one topic and live subscribers can't
+tell deltas from the retained snapshot. This warning changes nothing about
+retain or publishing — it's purely advisory. The two startup warnings are
+independent: `event/{type}` → identifier warn only; `event/{id}` → `{type}`
+warn only; `event` alone → **both**.
 
 ### 4.5 The seed phase — recovering broker state on startup
 
