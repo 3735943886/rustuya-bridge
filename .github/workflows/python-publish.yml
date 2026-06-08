@@ -127,6 +127,9 @@ jobs:
     needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyrustuyabridge
     permissions:
       id-token: write
     steps:
@@ -142,6 +145,9 @@ jobs:
     needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/pyrustuyabridge
     permissions:
       id-token: write
     steps:
