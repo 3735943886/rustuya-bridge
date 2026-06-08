@@ -2,7 +2,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
 use rustuyabridge::config::Cli;
-use rustuyabridge::payload::{parse_mqtt_payload, parse_payload_with_template, validate_payload_template};
+use rustuyabridge::payload::{
+    parse_mqtt_payload, parse_payload_with_template, parse_seed_dps, validate_payload_template,
+};
 use rustuyabridge::server::BridgeServer;
 use rustuyabridge::template::{compile_topic_regex, match_topic, render_template, tpl_to_wildcard};
 use serde_json::Value;
@@ -116,6 +118,33 @@ fn parse_payload_with_template_py<'py>(
     };
     let dict = PyDict::new(py);
     for (k, v) in &captures {
+        dict.set_item(k, json_value_to_py(py, v)?)?;
+    }
+    Ok(Some(dict.into_any()))
+}
+
+/// Extracts the DPS map from an event payload, byte-identical to the
+/// bridge's seed phase (`rustuyabridge::payload::parse_seed_dps`).
+///
+/// `dp` is the topic-extracted DP id when the event topic carries
+/// `{dp}` (single-DP mode); pass `None` for multi-DP topics where the
+/// payload is the full DPS object. `template` is the configured
+/// `mqtt_payload_template` (`None`/`"{value}"` = default fast path).
+/// Returns `None` when no DPS can be extracted.
+#[pyfunction]
+#[pyo3(name = "parse_seed_dps")]
+#[pyo3(signature = (payload, dp=None, template=None))]
+fn parse_seed_dps_py<'py>(
+    py: Python<'py>,
+    payload: &str,
+    dp: Option<&str>,
+    template: Option<&str>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(map) = parse_seed_dps(payload, dp, template) else {
+        return Ok(None);
+    };
+    let dict = PyDict::new(py);
+    for (k, v) in &map {
         dict.set_item(k, json_value_to_py(py, v)?)?;
     }
     Ok(Some(dict.into_any()))
@@ -337,6 +366,7 @@ fn pyrustuyabridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render_template_py, m)?)?;
     m.add_function(wrap_pyfunction!(parse_payload_py, m)?)?;
     m.add_function(wrap_pyfunction!(parse_payload_with_template_py, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_seed_dps_py, m)?)?;
     m.add_function(wrap_pyfunction!(validate_payload_template_py, m)?)?;
     Ok(())
 }

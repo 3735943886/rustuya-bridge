@@ -154,6 +154,9 @@ match the bridge's wire format:
 - `parse_payload(payload, vars)` — parses an MQTT payload into a structured value.
 - `parse_payload_with_template(payload, template)` — reverse of `render_template`:
   recovers placeholder values from a rendered payload, or `None` if not reversible.
+- `parse_seed_dps(payload, dp=None, template=None)` — extracts the DPS map from an
+  event payload exactly as the bridge's seed phase does; pass `dp` for single-DP
+  (`{dp}`) topics, `None` for multi-DP topics whose payload is the full DPS object.
 - `validate_payload_template(template)` — `(ok, message)`; checks whether a payload
   template can be reverse-parsed.
 

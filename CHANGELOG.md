@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.19] — Python 0.2.0-rc.19 — 2026-06-08
+
+### Added
+- **Python: `parse_seed_dps(payload, dp=None, template=None)`** is now exposed in
+  `pyrustuyabridge`. It extracts the DPS map from an event payload byte-identical
+  to the bridge's seed phase (`rustuyabridge::payload::parse_seed_dps`), so an
+  embedding host (e.g. the manager) can interpret `{root}/event/{type}/{id}`
+  payloads — including the multi-DP case where the topic carries no `{dp}` and the
+  payload is the full DPS object — without re-implementing the logic. Pass `dp`
+  for single-DP (`{dp}`) topics, `None` for multi-DP topics.
+
 ## [0.3.0-rc.18] — Python 0.2.0-rc.18 — 2026-06-06
 
 ### Changed
