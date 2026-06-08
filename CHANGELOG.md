@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.20] — Python 0.2.0-rc.20 — 2026-06-08
+
+### Changed
+- **Bumped `rustuya` to `0.3.0-rc.4`.** Pulls in tinytuya payload-parity
+  hardening — device22 now layers on the base version (v3.4/v3.5 keep the
+  modern `Control` envelope), v3.2 is treated as device22 with a `ControlNew`
+  status query, and `LanExtStream` wraps its body under `data` for every
+  version — plus a wire-claimed frame-length bound (256 KiB) and the
+  tuyamock device-emulator integration tests. No bridge API change.
+
 ## [0.3.0-rc.19] — Python 0.2.0-rc.19 — 2026-06-08
 
 ### Added
