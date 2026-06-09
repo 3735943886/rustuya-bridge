@@ -106,17 +106,26 @@ class Collector:
         self._c.disconnect()
 
 
-def fresh_retained(topic_filter, settle=1.0):
+def fresh_retained(topic_filter, settle=2.0):
     """Connect a brand-new subscriber and return the retained messages the
     broker replays for `topic_filter`. This is the only reliable way to assert
     "is X actually retained?" — a live delivery to an existing subscription
-    arrives with retain=False even when published retained."""
+    arrives with retain=False even when published retained.
+
+    Order matters: start the network loop and wait for CONNACK *before*
+    subscribing, otherwise the SUBSCRIBE can race the connection and the broker
+    never replays the retained set (silently returning nothing). Best for
+    presence/absence checks; for exact counts at scale prefer the bridge's own
+    `status` (broker retained delivery isn't instantaneous under load)."""
     got = queue.Queue()
+    connected = threading.Event()
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"fresh-{uuid.uuid4().hex[:6]}")
+    c.on_connect = lambda *a: connected.set()
     c.on_message = lambda cl, u, m: got.put((m.topic, m.payload.decode("utf-8", "replace"), bool(m.retain)))
     c.connect(BROKER_HOST, BROKER_PORT, 60)
-    c.subscribe(topic_filter, qos=1)
     c.loop_start()
+    connected.wait(timeout=5)
+    c.subscribe(topic_filter, qos=1)
     time.sleep(settle)
     c.loop_stop()
     c.disconnect()
