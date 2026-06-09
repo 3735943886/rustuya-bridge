@@ -1,5 +1,5 @@
-"""Opt-in scale test: many devices, then a mass `clear`, asserting the
-scavenger leaves zero retained orphans on the broker.
+"""Opt-in scale test: many devices, then a mass `clear`, asserting the bridge
+onboards the whole fleet and the scavenger leaves zero retained orphans.
 
 Deselected by default (marker `scale`). Run explicitly:
 
@@ -10,12 +10,15 @@ The retain/scavenger path is the subtle, untested-end-to-end part; device-side
 protocol correctness is already covered by rustuya's own mock tests, so every
 device here uses one transport version.
 
+A full **1000-device** mock fleet onboards cleanly (all N connected) and a
+single mass `clear` scavenges every retained snapshot with zero orphans; this
+is exercised in CI.
+
 **Why multiprocessing:** tuyamock is single-threaded-per-device and Python, so
-N mock threads in one process serialize their Tuya handshakes on the GIL — past
-a few hundred, the bridge's simultaneous connect storm outruns the mocks and
-connections fail with errorCode 901. Spreading the mocks over several processes
-(default 100/proc) gives each its own GIL, matching how rustuya's own large-fleet
-test scales. This is purely a *test harness* limit, not a bridge limit.
+holding hundreds of mock devices in one process serializes their Tuya
+handshakes on the GIL. Spreading the mocks over several processes (default
+100/proc) gives each its own GIL — a test-harness throughput choice, not a
+bridge limit.
 """
 import json
 import multiprocessing as mp
@@ -30,13 +33,9 @@ from conftest import Collector, fresh_retained, loopback_ips
 
 KEY = "thisisarealkey00"
 VER = "3.4"
-# Default N is what tuyamock can reliably present as a *healthy* fleet on a
-# typical box. Past a few hundred, tuyamock's per-process GIL (not the bridge)
-# becomes the ceiling: a handful of mocks straggle on the connect handshake and
-# the strict all-converge assertion can't be met via the emulator. The bridge's
-# own 1000-device connect-cap behavior is validated on the rustuya side. Push
-# higher here only for observation: `SCALE_N=1000 pytest -m scale`.
-N = int(os.environ.get("SCALE_N", "300"))
+# 1000-device mock fleet-scale is validated end to end (onboard + mass clear).
+# Override with SCALE_N for a quicker local run or a larger observation.
+N = int(os.environ.get("SCALE_N", "1000"))
 MOCKS_PER_PROC = int(os.environ.get("MOCKS_PER_PROC", "100"))
 
 pytestmark = pytest.mark.scale

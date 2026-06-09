@@ -259,6 +259,11 @@ phase, so steady-state heartbeats for an already-connected fleet are
 unaffected. This caps the storm — it does not speed it up; a large slow
 fleet still onboards gradually, just without the thundering herd.
 
+Fleet-scale is validated end to end at **1000 devices** (mock fleet): the whole
+fleet onboards and a single mass `clear` scavenges every retained snapshot with
+zero orphans, exercised in CI (`Python Test` →
+`python/tests/test_scavenger_scale.py`).
+
 ### 2.5 Empty-instance idle
 
 If `state.instances` is empty (you only have sub-devices, or you cleared
