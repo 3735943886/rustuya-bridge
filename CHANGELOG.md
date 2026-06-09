@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.21] — Python 0.2.0-rc.21 — 2026-06-09
+
+### Added
+- **`--connect-concurrency` (`CONNECT_CONCURRENCY`, default 128).** Caps how
+  many devices establish a connection at once, taming the onboarding "connect
+  storm" when a large fleet is added in one go: a 1000-wide add otherwise fires
+  1000 simultaneous handshakes that saturate the runtime, so early-connected
+  devices miss their idle/heartbeat window and drop into a reconnect storm that
+  may never converge. The permit is held only during the handshake (an idle
+  connection is cheap), so steady-state heartbeats are unaffected. `0` =
+  unbounded. Bumps `rustuya` `0.3.0-rc.4` → `rc.5` for the underlying cap.
+
+### Fixed
+- **Lifted rumqttc's 10 KiB client packet cap.** rumqttc defaults
+  `max_outgoing_packet_size` to 10 KiB and refuses any larger publish
+  *client-side, before it reaches the broker* — surfacing as a misleading
+  "greater than the broker's maximum packet size of '10240'" and wedging the
+  connection on a retry loop that blocks all publishes. A big `status` reply or
+  multi-DP snapshot could stall everything. Raised the client cap to 1 MiB (the
+  broker still enforces its own).
+- **`status` is now paginated.** It serialized every registered device into one
+  reply (~127 KB for 1000 devices), which the above cap refused. It now returns
+  the id-sorted `[offset, offset+limit)` window (default 50, max 500) always
+  alongside the full `device_count` plus `offset`/`limit`/`returned`/`has_more`.
+  Small fleets (≤ 50) are unchanged bar the added metadata.
+
 ## [0.3.0-rc.20] — Python 0.2.0-rc.20 — 2026-06-08
 
 ### Changed
