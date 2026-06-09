@@ -164,10 +164,20 @@ See the [project repository](https://github.com/3735943886/rustuya-bridge)
 for full documentation.
 """
 
+[project.optional-dependencies]
+test = ["pytest", "paho-mqtt>=2", "tuyamock"]
+
 [project.urls]
 Homepage = "https://github.com/3735943886/rustuya-bridge"
 Repository = "https://github.com/3735943886/rustuya-bridge"
 Issues = "https://github.com/3735943886/rustuya-bridge/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not scale'"
+markers = [
+    "scale: large-N broker-backed scavenger stress test; opt-in, run with -m scale",
+]
 
 [tool.maturin]
 module-name = "pyrustuyabridge"
