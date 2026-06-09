@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.22] — Python 0.2.0-rc.22 — 2026-06-09
+
+### Added
+- **Panic logging for background tasks.** `setup()` now installs
+  `rustuya::install_panic_logging()` (new in `rustuya` `0.3.0-rc.6`), a global
+  hook that routes every panic — including those on background
+  connection-establishment threads — through the `log` facade (so it reaches
+  `pyo3-log` in the Python binding) with its `file:line:col` location and a
+  best-effort backtrace, before the default hook aborts. Under our release build
+  (`panic = "abort"` + `strip`) such a worker panic would otherwise vanish to
+  raw stderr with no symbols; the location survives even stripped. Added to
+  diagnose an intermittent panic seen during large-fleet mock testing.
+
+### Changed
+- **Bumped `rustuya` `0.3.0-rc.5` → `rc.6`** for `install_panic_logging()`.
+
 ## [0.3.0-rc.21] — Python 0.2.0-rc.21 — 2026-06-09
 
 ### Added

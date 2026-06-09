@@ -58,6 +58,13 @@ impl BridgeServer {
     /// directory is not writable, another bridge instance is already running, or
     /// the MQTT task fails to start.
     pub async fn setup(&mut self) -> Result<Arc<BridgeContext>> {
+        // Route panics (including those on background connection-task threads)
+        // through the `log` facade with their location, before the default hook
+        // aborts. Under our release build (`panic = "abort"` + `strip`) a worker
+        // panic would otherwise vanish to raw stderr with no symbols; this keeps
+        // the file:line even in stripped builds. Idempotent; install once here.
+        rustuya::install_panic_logging();
+
         // Maximize file descriptor limit for better performance
         rustuya::maximize_fd_limit()?;
 
