@@ -60,7 +60,13 @@ def _require_broker():
         probe.connect(BROKER_HOST, BROKER_PORT, 5)
         probe.disconnect()
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"no MQTT broker at {BROKER_HOST}:{BROKER_PORT} ({exc}); set MQTT_BROKER")
+        msg = f"no MQTT broker at {BROKER_HOST}:{BROKER_PORT} ({exc}); set MQTT_BROKER"
+        # Locally a missing broker is a friendly skip. In CI (REQUIRE_BROKER=1)
+        # it must be a hard failure: a silently-skipped broker test reads as a
+        # green check while actually validating nothing.
+        if os.environ.get("REQUIRE_BROKER") == "1":
+            pytest.fail(msg, pytrace=False)
+        pytest.skip(msg)
 
 
 class Collector:

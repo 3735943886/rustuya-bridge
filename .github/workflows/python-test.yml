@@ -36,18 +36,24 @@ jobs:
       - name: Start mosquitto broker
         run: |
           sudo apt-get update
-          sudo apt-get install -y mosquitto
-          printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/ci.conf
-          sudo pkill mosquitto || true
-          mosquitto -d -c /etc/mosquitto/conf.d/ci.conf
-          # wait for the listener to accept connections
-          for i in $(seq 1 20); do
-            if timeout 1 bash -c '</dev/tcp/127.0.0.1/1883' 2>/dev/null; then
-              echo "broker up"; exit 0
+          sudo apt-get install -y mosquitto mosquitto-clients
+          # Drop the auto-started, loopback-only/non-anonymous service and run
+          # our own daemon with a deterministic anonymous config.
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo systemctl disable mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          sleep 1
+          printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' > /tmp/mosquitto-ci.conf
+          mosquitto -d -c /tmp/mosquitto-ci.conf
+          # Readiness via a REAL anonymous MQTT round-trip — a bare TCP probe
+          # would pass against a broker that then refuses anonymous CONNECT.
+          for i in $(seq 1 30); do
+            if mosquitto_pub -h localhost -p 1883 -t ci/health -m ok 2>/dev/null; then
+              echo "broker accepting anonymous MQTT"; exit 0
             fi
             sleep 0.5
           done
-          echo "::error::mosquitto did not come up"; exit 1
+          echo "::error::mosquitto not accepting anonymous connections"; exit 1
 
       - name: Build binding + install test deps
         working-directory: python
@@ -62,16 +68,18 @@ jobs:
         working-directory: python
         env:
           MQTT_BROKER: mqtt://localhost:1883
+          REQUIRE_BROKER: '1'
         run: |
           . .venv/bin/activate
-          pytest -v
+          pytest -v -rs
 
       - name: 1000-device fleet-scale (onboard + mass clear scavenge)
         working-directory: python
         env:
           MQTT_BROKER: mqtt://localhost:1883
+          REQUIRE_BROKER: '1'
           SCALE_N: '1000'
           MOCKS_PER_PROC: '100'
         run: |
           . .venv/bin/activate
-          pytest -m scale -v -s
+          pytest -m scale -v -s -rs
