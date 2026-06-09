@@ -25,6 +25,20 @@ use std::sync::Mutex as StdMutex;
 // (active delta + state snapshot). At 100, a sustained 50-msg/sec active
 // burst against a slow broker could trip `try_send_mqtt`'s 500ms timeout.
 pub const MQTT_CHANNEL_CAPACITY: usize = 200;
+/// Default devices per `status` response page. ~50 device records stay well
+/// under restrictive broker packet limits (~6 KB) so the default `status`
+/// never stalls the connection, regardless of fleet size.
+pub const STATUS_DEFAULT_PAGE: usize = 50;
+/// Hard cap on a `status` page even when a larger `limit` is requested —
+/// bounds the worst-case response size for capable brokers.
+pub const STATUS_MAX_PAGE: usize = 500;
+/// Client-side MQTT packet size cap (incoming and outgoing). rumqttc defaults
+/// *both* to a tiny 10 KiB, which silently refuses any larger publish — a big
+/// `status` reply, a multi-DP snapshot — *before it ever reaches the broker*,
+/// stalling the connection on a retry loop. Raise it to a generous bound so
+/// the client is never the bottleneck; the broker still enforces its own
+/// limit, and `status` is paginated independently as defense in depth.
+pub const MAX_MQTT_PACKET_SIZE: usize = 1024 * 1024;
 pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
 pub const LISTENER_TIMEOUT_SECS: u64 = 300;
@@ -1116,6 +1130,10 @@ impl BridgeContext {
         };
 
         opts.set_keep_alive(Duration::from_secs(30));
+        // rumqttc caps both directions at 10 KiB by default — far too small for
+        // a fleet `status` reply or a large snapshot. Lift the client cap so it
+        // isn't the bottleneck (the broker still enforces its own).
+        opts.set_max_packet_size(MAX_MQTT_PACKET_SIZE, MAX_MQTT_PACKET_SIZE);
 
         if with_lwt {
             // Set Last Will and Testament (LWT) to clear the config on abnormal termination
@@ -2370,11 +2388,31 @@ impl BridgeContext {
             && file_cli.mqtt_retain() == self.mqtt_retain
     }
 
-    /// Returns current bridge status and registered devices
-    pub async fn get_bridge_status(&self) -> ApiResponse {
+    /// Returns current bridge status and a **page** of registered devices.
+    ///
+    /// The device list is paginated so the response stays within MQTT broker
+    /// packet limits at fleet scale — serializing all of a 1000-device fleet
+    /// into one message produces ~127 KB, which exceeds many brokers' max
+    /// packet size and stalls the connection. `device_count` is always the
+    /// full total; `devices` is the `[offset, offset+limit)` window (ids
+    /// sorted for stable paging). `limit` defaults to
+    /// [`STATUS_DEFAULT_PAGE`] and is capped at [`STATUS_MAX_PAGE`].
+    pub async fn get_bridge_status(
+        &self,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> ApiResponse {
+        let off = offset.unwrap_or(0);
+        let lim = limit.unwrap_or(STATUS_DEFAULT_PAGE).min(STATUS_MAX_PAGE);
+
         let state = self.state.read().await;
+        let total = state.configs.len();
+        let mut ids: Vec<&String> = state.configs.keys().collect();
+        ids.sort();
+
         let mut devices = serde_json::Map::new();
-        for (id, cfg) in &state.configs {
+        for id in ids.into_iter().skip(off).take(lim) {
+            let cfg = &state.configs[id];
             if let Ok(mut dev_val) = serde_json::to_value(cfg) {
                 if let Some(obj) = dev_val.as_object_mut() {
                     let status = Self::determine_device_status(cfg, &state.instances);
@@ -2385,9 +2423,15 @@ impl BridgeContext {
         }
         drop(state);
 
+        let returned = devices.len();
         let mqtt_drop_count = self.mqtt_drop_count.load(Ordering::Relaxed);
         ApiResponse::ok_action("status")
             .with_extra("devices", Value::Object(devices))
+            .with_extra("device_count", Value::from(total))
+            .with_extra("offset", Value::from(off))
+            .with_extra("limit", Value::from(lim))
+            .with_extra("returned", Value::from(returned))
+            .with_extra("has_more", Value::from(off + returned < total))
             .with_extra("mqtt_drop_count", Value::from(mqtt_drop_count))
     }
 
@@ -2930,13 +2974,44 @@ mod context_tests {
         // Simulate a drop having happened.
         ctx.mqtt_drop_count.store(3, Ordering::Relaxed);
 
-        let res = ctx.get_bridge_status().await;
+        let res = ctx.get_bridge_status(None, None).await;
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(
             v.get("mqtt_drop_count").and_then(|n| n.as_u64()),
             Some(3),
             "status must surface the cumulative MQTT drop count"
         );
+    }
+
+    #[tokio::test]
+    async fn status_paginates_large_fleet() {
+        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+        {
+            let mut state = ctx.state.write().await;
+            for i in 0..60 {
+                let id = format!("dev{i:03}");
+                state.configs.insert(
+                    id.clone(),
+                    serde_json::from_value(serde_json::json!({"id": id, "key": "k"})).unwrap(),
+                );
+            }
+        }
+
+        // Default: one capped page, but the full count is always reported.
+        let v = serde_json::to_value(ctx.get_bridge_status(None, None).await).unwrap();
+        assert_eq!(v["device_count"], 60);
+        assert_eq!(v["returned"], STATUS_DEFAULT_PAGE);
+        assert_eq!(v["devices"].as_object().unwrap().len(), STATUS_DEFAULT_PAGE);
+        assert_eq!(v["has_more"], true);
+
+        // Second page drains the remainder.
+        let v2 = serde_json::to_value(ctx.get_bridge_status(Some(50), None).await).unwrap();
+        assert_eq!(v2["returned"], 10);
+        assert_eq!(v2["has_more"], false);
+
+        // An over-large limit is capped, never honored verbatim.
+        let v3 = serde_json::to_value(ctx.get_bridge_status(Some(0), Some(100_000)).await).unwrap();
+        assert_eq!(v3["limit"], STATUS_MAX_PAGE as u64);
     }
 
     // ── cache mode bring-up ────────────────────────────────────────────────────
@@ -3714,7 +3789,7 @@ mod context_tests {
             let req: BridgeRequest = serde_json::from_value(req_val)
                 .unwrap_or_else(|e| panic!("must parse to a request for {tmpl:?}: {e}"));
             assert!(
-                matches!(req, BridgeRequest::Status),
+                matches!(req, BridgeRequest::Status { .. }),
                 "probe must parse to Status for {tmpl:?}, got {:?}",
                 req.action_name()
             );
@@ -3731,7 +3806,7 @@ mod context_tests {
             let (ctx, _tmp, mut mqtt_rx, _s, _r) =
                 make_ctx(|cli| cli.mqtt_message_topic = Some((*msg_tmpl).to_string())).await;
 
-            let resp = ctx.get_bridge_status().await;
+            let resp = ctx.get_bridge_status(None, None).await;
             ctx.publish_api_response(resp).await;
 
             let published = mqtt_rx

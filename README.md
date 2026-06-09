@@ -142,6 +142,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
 | `--scavenger-timeout-secs`| `SCAVENGER_TIMEOUT_SECS` | `1` | Seconds the retain scavenger waits for retained MQTT messages before exiting after `remove`/`clear`. Raise on slow brokers. |
+| `--connect-concurrency`| `CONNECT_CONCURRENCY` | `128` | Max devices establishing a connection concurrently (handshake cap). Bounds the onboarding "connect storm" when a large fleet is added at once — once connected a device is cheap, so only the establishment phase is capped. `0` disables the cap (unbounded). |
 | `--log-level`, `-l` | `LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Configuration File
@@ -249,6 +250,17 @@ mosquitto_pub -h localhost -t "rustuya/command" -m '{
 #### Query Bridge Status
 ```bash
 mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "status"}'
+```
+
+The reply always reports the full `device_count` and `mqtt_drop_count`, but
+the `devices` list is **paginated** so the response stays within broker packet
+limits at fleet scale (the default page is 50). The reply carries
+`offset`/`limit`/`returned`/`has_more`; page through a large fleet with:
+```bash
+# next 50 devices
+mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "status", "offset": 50}'
+# bigger page (capped at 500) on a broker that allows large packets
+mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "status", "limit": 200}'
 ```
 
 #### Clear All Devices

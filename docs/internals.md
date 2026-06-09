@@ -234,7 +234,32 @@ consumer of the multiplexed broadcast. So the 300s timeout is a
 liveness *signal*, not a recovery mechanism: rustuya is already trying
 to reconnect underneath you regardless.
 
-### 2.4 Empty-instance idle
+### 2.4 Onboarding the fleet — the connect-storm cap
+
+Each `add` inserts a `Device` and pokes `request_refresh()` (a capacity-1
+channel, so a burst of adds coalesces into one rebuild). On refresh the
+listener rebuilds `unified_listener(instances)` over **all** devices —
+existing ones keep their live actor connection, only the new ones connect.
+So registering N devices at once fires up to N *simultaneous* connection
+establishments.
+
+That's a "connect storm": each handshake (TCP + crypto round-trips, plus
+session-key negotiation on v3.4/3.5) is expensive, and a thousand at once
+saturate the runtime — meanwhile devices that connected early can miss
+their idle/heartbeat window and get dropped, feeding a reconnect storm
+that may never converge. The fix lives in rustuya: a global
+establishment-concurrency semaphore (permit acquired *before* connect,
+released the instant the handshake finishes — an idle connection is cheap
+and must not hold a permit, or fleets larger than the cap would deadlock).
+
+The bridge opts in via `--connect-concurrency` (`CONNECT_CONCURRENCY`,
+default **128**; `0` = unbounded), wired once at startup with
+`rustuya::set_connect_concurrency`. The cap bounds only the *establishment*
+phase, so steady-state heartbeats for an already-connected fleet are
+unaffected. This caps the storm — it does not speed it up; a large slow
+fleet still onboards gradually, just without the thundering herd.
+
+### 2.5 Empty-instance idle
 
 If `state.instances` is empty (you only have sub-devices, or you cleared
 everything), the listener doesn't try to construct a stream at all (the
@@ -1185,6 +1210,30 @@ Graceful shutdown:
 The whole sequence is wrapped in a 7s outer timeout in
 [BridgeServer::close](../src/server.rs), so a misbehaving broker can't hang
 shutdown indefinitely.
+
+### 8.4 Packet size & the `status` paging gotcha
+
+rumqttc caps **both** incoming and outgoing packets at a tiny **10 KiB by
+default** — and crucially, the outgoing check fires *client-side, before the
+packet ever reaches the broker*: an oversized publish surfaces as
+`Cannot send packet of size '…'. It's greater than the broker's maximum
+packet size of: '10240'` (misleading — that 10 KiB is rumqttc's own default,
+not the broker's) and wedges the connection on a 10s retry loop, blocking
+*all* other publishes. The bridge lifts this with
+`set_max_packet_size(MAX_MQTT_PACKET_SIZE, …)` ([1 MiB](../src/bridge.rs)) so
+the client is never the bottleneck; the broker still enforces its own limit.
+
+This bit `status` hardest: it serialized **every** registered device into one
+reply (~127 bytes each), so a 1000-device fleet produced a ~127 KB packet that
+the client refused. `status` is now **paginated** —
+[get_bridge_status](../src/bridge.rs) returns the `[offset, offset+limit)`
+window of id-sorted devices (`limit` default
+[`STATUS_DEFAULT_PAGE`](../src/bridge.rs) = 50, capped at
+[`STATUS_MAX_PAGE`](../src/bridge.rs) = 500), always alongside the full
+`device_count`, plus `offset`/`limit`/`returned`/`has_more`. The default reply
+stays a few KB regardless of fleet size; page through a large fleet with
+`{"action":"status","offset":50}`. Small fleets (≤ 50) are unchanged bar the
+added metadata fields.
 
 ---
 

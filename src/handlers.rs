@@ -149,7 +149,9 @@ async fn handle_request_inner(
         }
         BridgeRequest::Clear => Ok(vec![ctx.clear_devices().await?]),
         BridgeRequest::Reconfigure => Ok(vec![ctx.reconfigure().await?]),
-        BridgeRequest::Status => Ok(vec![ctx.get_bridge_status().await]),
+        BridgeRequest::Status { offset, limit } => {
+            Ok(vec![ctx.get_bridge_status(offset, limit).await])
+        }
         BridgeRequest::Get { id, name, cid } => {
             let targets = ctx
                 .get_targets(

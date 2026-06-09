@@ -50,7 +50,12 @@ pub enum BridgeRequest {
     },
     Clear,
     #[serde(rename = "status", alias = "query")]
-    Status,
+    Status {
+        /// Pagination: index of the first device to return (sorted by id).
+        offset: Option<usize>,
+        /// Pagination: max devices to return in this response (capped).
+        limit: Option<usize>,
+    },
     #[serde(rename = "get")]
     Get {
         id: Option<SingleOrList>,
@@ -89,7 +94,7 @@ impl BridgeRequest {
             Self::Add { .. } => "add",
             Self::Remove { .. } => "remove",
             Self::Clear => "clear",
-            Self::Status => "status",
+            Self::Status { .. } => "status",
             Self::Get { .. } => "get",
             Self::Set { .. } => "set",
             Self::Request { .. } => "request",
