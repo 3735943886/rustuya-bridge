@@ -1,6 +1,6 @@
 [package]
 name = "pyrustuyabridge"
-version = "0.2.0-rc.22"
+version = "0.2.0-rc.23"
 edition = "2024"
 publish = false
 
@@ -15,6 +15,7 @@ tokio = { version = "1.49", features = ["rt-multi-thread"] }
 tokio-util = "0.7"
 anyhow = "1.0"
 pyo3-log = "0.13"
+log = "0.4"
 rustuyabridge = { path = "../" }
 serde_json = "1"
 

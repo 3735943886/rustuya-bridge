@@ -10,6 +10,7 @@ use rustuyabridge::template::{compile_topic_regex, match_topic, render_template,
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -273,6 +274,7 @@ impl PyBridgeServer {
                 "server already stopped; construct a new PyBridgeServer to start again",
             ));
         }
+        SHUTTING_DOWN.store(false, Ordering::Relaxed);
         let inner = self.inner.clone();
 
         py.detach(move || {
@@ -302,6 +304,7 @@ impl PyBridgeServer {
                 "server already stopped; construct a new PyBridgeServer to start again",
             ));
         }
+        SHUTTING_DOWN.store(false, Ordering::Relaxed);
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
@@ -330,6 +333,10 @@ impl PyBridgeServer {
     /// completion. Safe to call before `start()` (no-op until something runs)
     /// and idempotent.
     fn stop(&self) {
+        // Suppress Python log forwarding for the shutdown window (see
+        // ShutdownSafeLogger): tokio workers may keep logging while the runtime
+        // drains, and re-entering a finalizing interpreter from them aborts.
+        SHUTTING_DOWN.store(true, Ordering::Relaxed);
         self.cancel.cancel();
     }
 
@@ -343,6 +350,7 @@ impl PyBridgeServer {
     /// lock that `run()` held for the whole server lifetime.
     fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let inner = self.inner.clone();
+        SHUTTING_DOWN.store(true, Ordering::Relaxed);
         // Trip the token BEFORE awaiting the lock: this unblocks run(), which
         // releases `inner` once it has finished its own graceful close.
         self.cancel.cancel();
@@ -358,9 +366,64 @@ impl PyBridgeServer {
     }
 }
 
+/// Set once a graceful shutdown has been requested (`stop()`/`close()`), cleared
+/// when a server (re)starts. While set, [`ShutdownSafeLogger`] stops forwarding
+/// records to Python — see its docs for why that is load-bearing.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// A `log::Log` wrapper around pyo3-log that drops records once shutdown has been
+/// requested.
+///
+/// Forwarding a record to Python requires acquiring the GIL. Doing that from a
+/// non-main thread (e.g. a tokio worker still draining at shutdown) once the
+/// interpreter has begun finalizing makes CPython forcibly terminate the calling
+/// thread via `PyThread_exit_thread` -> `pthread_exit`, whose forced unwind
+/// aborts the process at the Rust `panic = "abort"` nounwind boundary. We cannot
+/// portably detect finalization on the abi3 (≥3.9) limited API — `Py_IsFinalizing`
+/// is 3.13+ — so we instead suppress Python forwarding from the moment shutdown is
+/// requested, which brackets the dangerous window (cancel → runtime drain → exit).
+/// Steady-state logging is unaffected; only shutdown-time records are dropped from
+/// Python logging (rustuya's panic hook writes to raw stderr regardless).
+struct ShutdownSafeLogger(pyo3_log::Logger);
+
+impl ShutdownSafeLogger {
+    #[inline]
+    fn suppressed() -> bool {
+        SHUTTING_DOWN.load(Ordering::Relaxed)
+    }
+}
+
+impl log::Log for ShutdownSafeLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        if Self::suppressed() {
+            return false;
+        }
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if Self::suppressed() {
+            return;
+        }
+        self.0.log(record)
+    }
+
+    fn flush(&self) {
+        if Self::suppressed() {
+            return;
+        }
+        self.0.flush()
+    }
+}
+
 #[pymodule]
 fn pyrustuyabridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    pyo3_log::init();
+    // Finalize-guarded pyo3-log install (see FinalizeSafeLogger). Mirrors
+    // pyo3_log::init() (default logger, max level Debug) but cannot abort the
+    // process when a background thread logs during interpreter shutdown.
+    if log::set_boxed_logger(Box::new(ShutdownSafeLogger(pyo3_log::Logger::default()))).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
     m.add_class::<PyBridgeServer>()?;
     m.add_function(wrap_pyfunction!(tpl_to_wildcard_py, m)?)?;
     m.add_function(wrap_pyfunction!(match_topic_py, m)?)?;

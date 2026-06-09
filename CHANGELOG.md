@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.23] — Python 0.2.0-rc.23 — 2026-06-10
+
+### Fixed
+- **Python binding: shutdown-time process abort.** During a graceful shutdown a
+  tokio worker still draining could forward a log record to Python via pyo3-log;
+  acquiring the GIL from that non-main thread once the interpreter had begun
+  finalizing made CPython forcibly terminate the thread (`PyThread_exit_thread`
+  → `pthread_exit`), whose forced unwind aborts the process at our
+  `panic = "abort"` nounwind boundary. The binding now installs a
+  `ShutdownSafeLogger` wrapper that drops Python log forwarding from the moment
+  shutdown is requested (`stop()`/`close()`) until the next `start()`, bracketing
+  the dangerous cancel → drain → exit window. Steady-state logging is unchanged;
+  only shutdown-time records are dropped from Python logging (rustuya's panic
+  hook still writes to raw stderr regardless). `Py_IsFinalizing` is 3.13+ and
+  unavailable on the abi3 (≥3.9) limited API, so the window is bracketed by the
+  shutdown request rather than detected directly.
+
+### Changed
+- **Bumped `rustuya` `0.3.0-rc.6` → `rc.7`.** Pulls in *replay latched status to
+  listeners* — a device that had already latched a status before a listener
+  attached now replays it, fixing a large-fleet straggler tail where the last
+  few devices never surfaced their state — plus safe panic-hook output.
+
 ## [0.3.0-rc.22] — Python 0.2.0-rc.22 — 2026-06-09
 
 ### Added
