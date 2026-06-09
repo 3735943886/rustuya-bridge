@@ -220,6 +220,7 @@ impl PyBridgeServer {
                 "state_file"            => state_file,
                 "save_debounce_secs"    => save_debounce_secs,
                 "scavenger_timeout_secs" => scavenger_timeout_secs,
+                "connect_concurrency"   => connect_concurrency,
                 "log_level"             => log_level,
                 "no_signals"            => no_signals,
             }

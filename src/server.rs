@@ -61,6 +61,14 @@ impl BridgeServer {
         // Maximize file descriptor limit for better performance
         rustuya::maximize_fd_limit()?;
 
+        // Cap concurrent connection establishment to tame the onboarding
+        // "connect storm" when a large fleet is added at once. `0` opts out
+        // (unbounded). Idempotent global; set once before any device connects.
+        let cc = self.cli.connect_concurrency();
+        if cc > 0 {
+            rustuya::set_connect_concurrency(cc);
+        }
+
         let session_id = format!(
             "sid_{}",
             std::time::SystemTime::now()

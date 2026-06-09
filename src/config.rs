@@ -8,6 +8,9 @@ use std::path::Path;
 pub const DEFAULT_STATE_FILE: &str = "rustuya.json";
 pub const DEFAULT_SAVE_DEBOUNCE_SECS: u64 = 30;
 pub const DEFAULT_SCAVENGER_TIMEOUT_SECS: u64 = 1;
+/// Default cap on devices establishing a connection concurrently. Bounds the
+/// onboarding "connect storm" when a large fleet is added at once.
+pub const DEFAULT_CONNECT_CONCURRENCY: usize = 128;
 pub const DEFAULT_MQTT_ROOT_TOPIC: &str = "rustuya";
 pub const DEFAULT_MQTT_COMMAND_TOPIC: &str = "{root}/command";
 pub const DEFAULT_MQTT_EVENT_TOPIC: &str = "{root}/event/{type}/{id}";
@@ -83,6 +86,14 @@ pub struct Cli {
     #[arg(long, env = "SCAVENGER_TIMEOUT_SECS")]
     pub scavenger_timeout_secs: Option<u64>,
 
+    /// Max devices establishing a connection concurrently (the handshake cap).
+    /// Tames the onboarding "connect storm" when many devices are added at
+    /// once: once connected a device is cheap (idle + heartbeat), so only the
+    /// expensive establishment phase is bounded. `0` disables the cap
+    /// (unbounded — the historical behavior).
+    #[arg(long, env = "CONNECT_CONCURRENCY")]
+    pub connect_concurrency: Option<usize>,
+
     /// Log level (error, warn, info, debug, trace)
     #[arg(short = 'l', long, env = "LOG_LEVEL")]
     pub log_level: Option<String>,
@@ -118,6 +129,7 @@ impl Default for Cli {
             state_file: Some(DEFAULT_STATE_FILE.into()),
             save_debounce_secs: Some(DEFAULT_SAVE_DEBOUNCE_SECS),
             scavenger_timeout_secs: Some(DEFAULT_SCAVENGER_TIMEOUT_SECS),
+            connect_concurrency: Some(DEFAULT_CONNECT_CONCURRENCY),
             log_level: Some(DEFAULT_LOG_LEVEL.into()),
             no_signals: Some(false),
             session_id: None,
@@ -242,6 +254,7 @@ impl Cli {
             state_file,
             save_debounce_secs,
             scavenger_timeout_secs,
+            connect_concurrency,
             log_level,
             no_signals,
             session_id,
@@ -264,6 +277,7 @@ impl Cli {
             state_file,
             save_debounce_secs,
             scavenger_timeout_secs,
+            connect_concurrency,
             log_level,
             no_signals,
             session_id,
@@ -321,6 +335,13 @@ impl Cli {
     pub fn scavenger_timeout_secs(&self) -> u64 {
         self.scavenger_timeout_secs
             .unwrap_or(DEFAULT_SCAVENGER_TIMEOUT_SECS)
+    }
+
+    /// Connection-establishment concurrency cap (`0` = unbounded).
+    #[must_use]
+    pub fn connect_concurrency(&self) -> usize {
+        self.connect_concurrency
+            .unwrap_or(DEFAULT_CONNECT_CONCURRENCY)
     }
 
     #[must_use]
