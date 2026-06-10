@@ -21,10 +21,16 @@ use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex as StdMutex;
 
-// 200 (not 100) because cache mode doubles per-active-event push count
-// (active delta + state snapshot). At 100, a sustained 50-msg/sec active
-// burst against a slow broker could trip `try_send_mqtt`'s 500ms timeout.
-pub const MQTT_CHANNEL_CAPACITY: usize = 200;
+// Sized to absorb a whole-fleet operation burst without shedding. A
+// name-addressed `set` (or cascade) to N devices makes every one of them ack
+// AND push its state change at once — in cache mode that's ~3 messages each
+// (api response + active delta + state snapshot), so a 500-device fan-out
+// transiently queues ~1500 messages. A small buffer (was 200) drops most of
+// them via `try_send_mqtt`'s 500ms timeout even though the broker would drain
+// them within a second. 4096 holds the full transient for fleets into the low
+// thousands while staying bounded (~600 KB worst case) so a genuinely wedged
+// broker still can't grow memory without limit.
+pub const MQTT_CHANNEL_CAPACITY: usize = 4096;
 /// Default devices per `status` response page. ~50 device records stay well
 /// under restrictive broker packet limits (~6 KB) so the default `status`
 /// never stalls the connection, regardless of fleet size.

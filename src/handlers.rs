@@ -59,11 +59,23 @@ pub async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> Vec<
     }
 }
 
+/// Max targets a fan-out operates on at once. A name-set or gateway cascade to
+/// a large fleet would otherwise run strictly sequentially — one device
+/// round-trip at a time, so a 500-device set is 500 back-to-back trips. Running
+/// targets through a bounded-concurrency window (a semaphore of this size)
+/// services the fleet in a few waves instead, while capping the simultaneous
+/// device + MQTT-publish load so the outbound channel isn't flooded all at once.
+const FANOUT_CONCURRENCY: usize = 100;
+
 /// Resolves targets, then runs `op(device, resolved_cid)` for each connected
 /// target with a timeout, collecting a per-target result. Unlike an
 /// abort-on-first-error fold, every target is attempted so each can report its
 /// own outcome. A target that isn't currently connected is skipped and recorded
 /// as `Ok` (its offline state surfaces separately on the device error topic).
+///
+/// Targets run concurrently, bounded to [`FANOUT_CONCURRENCY`] in flight at
+/// once. Results come back in completion order, not target order — every caller
+/// keys the per-target `ApiResponse` by id, so order is irrelevant.
 async fn run_per_target<F, Fut, T, E>(
     ctx: &Arc<BridgeContext>,
     targets: &[String],
@@ -72,32 +84,37 @@ async fn run_per_target<F, Fut, T, E>(
     op: F,
 ) -> Vec<(String, Result<(), BridgeError>)>
 where
-    F: Fn(Device, Option<String>) -> Fut,
-    Fut: Future<Output = Result<T, E>>,
+    F: Fn(Device, Option<String>) -> Fut + Sync,
+    Fut: Future<Output = Result<T, E>> + Send,
     E: std::fmt::Display,
 {
-    let mut results = Vec::with_capacity(targets.len());
-    for target_id in targets {
-        let actual_cid = ctx.resolve_cid(target_id, cid.clone()).await;
-        let Ok(dev) = ctx.get_connected_device(target_id).await else {
-            results.push((target_id.clone(), Ok(())));
-            continue;
-        };
-        let result = match timeout(
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            op(dev, actual_cid),
-        )
+    futures_util::stream::iter(targets.iter().cloned())
+        .map(|target_id| {
+            let cid = cid.clone();
+            let op = &op;
+            async move {
+                let actual_cid = ctx.resolve_cid(&target_id, cid).await;
+                let Ok(dev) = ctx.get_connected_device(&target_id).await else {
+                    return (target_id, Ok(()));
+                };
+                let result = match timeout(
+                    Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                    op(dev, actual_cid),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) => Err(BridgeError::DeviceError(e.to_string())),
+                    Err(_) => Err(BridgeError::Timeout(format!(
+                        "{op_label} timeout for {target_id}"
+                    ))),
+                };
+                (target_id, result)
+            }
+        })
+        .buffer_unordered(FANOUT_CONCURRENCY)
+        .collect()
         .await
-        {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(BridgeError::DeviceError(e.to_string())),
-            Err(_) => Err(BridgeError::Timeout(format!(
-                "{op_label} timeout for {target_id}"
-            ))),
-        };
-        results.push((target_id.clone(), result));
-    }
-    results
 }
 
 #[allow(
