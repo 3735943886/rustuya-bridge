@@ -38,7 +38,7 @@ import pytest
 
 import tuyamock
 
-from conftest import Collector, loopback_ips
+from conftest import Collector, fresh_retained, loopback_ips
 
 KEY = "thisisarealkey00"
 VER = "3.3"
@@ -193,6 +193,134 @@ def test_heartbeat_survives_then_name_fanout(bridge):
         stop.set()
         report.set()
         quiet_start.set()
+        for p in procs:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.terminate()
+        coll.close()
+
+
+def test_cache_mode_fanout_no_resets_then_scavenge(bridge):
+    """Cache-mode (retain=ON) sibling of the test above — the burst path the QoS
+    fix actually protects, and the one a CI guard was missing.
+
+    The retain=OFF test publishes its whole fan-out at **QoS0** (deltas +
+    responses), so it would stay green even if the non-blocking `try_publish`
+    were reverted to a blocking `publish().await`: QoS0 carries no PUBACK and
+    never fills rumqttc's in-flight window, so the loop can't self-deadlock.
+    THIS test runs **cache mode**, where each device's post-`set` state change
+    fires a retained `{type}=state` snapshot at **QoS1**. A name-addressed `set`
+    to the whole fleet therefore emits N QoS1 publishes at once — the exact burst
+    that once stalled the MQTT event loop (PUBACK round-trips + in-flight window
+    100) and starved the device actors until ~60% of the fleet reset. The
+    witness is mock-side: every device must stay continuously connected across
+    the burst (0 resets), and all N per-id responses must land.
+
+    Cleanup is mandatory (cache mode leaves a retained snapshot per device): the
+    test ends with a mass `clear` and asserts the scavenger leaves **zero**
+    retained orphans — both a real assertion (scavenge under load) and the
+    hygiene that stops repeated runs from piling up retained state.
+
+    **The guard needs the default N to bite.** Verified by reverting the loop's
+    non-blocking `try_publish` back to a blocking `publish().await`: at N=500 the
+    regressed build resets a chunk of the fleet (this test fails), but at N≈120
+    it still passes — the burst has to outrun the request channel (cap 100) +
+    in-flight window (100) for the loop to self-deadlock. So run this at the
+    default NAMEFAN_N=500; a quick small-N local run would pass even on the
+    broken code and give a false green.
+    """
+    ips = loopback_ips(N)
+    ids = [_dev_id(i) for i in range(N)]
+
+    watch_start = mp.Event()  # passed as the worker's `quiet_start`: snapshot who's
+    report = mp.Event()       # connected, then report who stayed up across the burst
+    stop = mp.Event()
+    results = mp.Queue()
+    procs = []
+    for k in range(0, N, MOCKS_PER_PROC):
+        sl = slice(k, min(k + MOCKS_PER_PROC, N))
+        p = mp.Process(target=_mock_worker,
+                       args=(ids[sl], ips[sl], k, watch_start, report, stop, results),
+                       daemon=True)
+        p.start()
+        procs.append(p)
+    print(f"\n[qos1-fanout] {N} mocks across {len(procs)} procs ({MOCKS_PER_PROC}/proc), name={NAME!r}")
+
+    # retain ON → cache mode → each post-set snapshot publishes at QoS1.
+    h = bridge(mqtt_retain=True)
+    coll = Collector(f"{h.root}-col")
+    coll.subscribe(f"{h.root}/response/#")
+
+    try:
+        # ── add storm: register all N under the SAME name ──
+        t0 = time.time()
+        for dev_id, ip in zip(ids, ips):
+            coll.publish(h.command(), json.dumps({
+                "action": "add", "id": dev_id, "key": KEY, "ip": ip,
+                "version": VER, "name": NAME}))
+
+        connected = 0
+
+        def all_connected():
+            nonlocal connected
+            connected, total = _status_connected(coll, h.command())
+            return total is not None and connected >= N
+
+        assert _wait(all_connected, timeout=max(120, N), interval=2.0), \
+            f"only {connected}/{N} devices onboarded"
+        print(f"[qos1-fanout] onboarded {connected}/{N} in {time.time()-t0:.1f}s")
+
+        # ── arm the reset-watch, let workers snapshot, THEN fire the fan-out ──
+        coll.drain()
+        watch_start.set()
+        time.sleep(1.0)  # each worker records its connected set before the burst
+        ts = time.time()
+        coll.publish(h.command(), json.dumps({
+            "action": "set", "name": NAME, "dps": {"1": False}}))
+
+        seen_ok = set()
+
+        def all_responded():
+            for topic, payload, _ in coll.drain():
+                if "/response/" not in topic:
+                    continue
+                try:
+                    msg = json.loads(payload)
+                except ValueError:
+                    continue
+                if msg.get("action") == "set" and msg.get("status") == "ok" and msg.get("id"):
+                    seen_ok.add(msg["id"])
+            return len(seen_ok) >= N
+
+        assert _wait(all_responded, timeout=RESP_TIMEOUT, interval=0.2), (
+            f"only {len(seen_ok)}/{N} per-id set responses arrived within "
+            f"{RESP_TIMEOUT:.0f}s of the QoS1 fan-out burst")
+        print(f"[qos1-fanout] {len(seen_ok)}/{N} per-id responses in {time.time()-ts:.1f}s")
+
+        # ── the property under test: NO reset during the QoS1 snapshot burst ──
+        report.set()
+        stayed = sum(results.get(timeout=10) for _ in procs)
+        assert stayed == N, (
+            f"{N - stayed}/{N} devices reset during the QoS1 snapshot fan-out — "
+            f"the MQTT loop starved the device actors (try_publish/QoS regression?)")
+        print(f"[qos1-fanout] {stayed}/{N} stayed connected through the burst")
+
+        # ── mandatory cleanup: mass clear must scavenge every retained snapshot ──
+        coll.publish(h.command(), json.dumps({"action": "clear"}))
+        assert _wait(lambda: _status_connected(coll, h.command())[1] == 0,
+                     timeout=max(60, N // 4), interval=2.0), "clear did not drop all devices"
+
+        def no_orphans():
+            got = fresh_retained(f"{h.root}/event/state/#", settle=5.0)
+            return not any(p for _t, p, r in got if r)
+
+        assert _wait(no_orphans, timeout=max(60, N // 4)), (
+            "scavenger left retained orphans after the cache-mode fan-out")
+        print("[qos1-fanout] retained scavenged clean")
+    finally:
+        stop.set()
+        report.set()
+        watch_start.set()
         for p in procs:
             p.join(timeout=10)
             if p.is_alive():
