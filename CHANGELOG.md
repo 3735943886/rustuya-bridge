@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.24] — Python 0.2.0-rc.24 — 2026-06-11
+
+### Fixed
+- **Fleet-scale fan-out reset connections under MQTT QoS1.** A name-addressed
+  `set`/`get` (or a gateway cascade) emits hundreds of device-event deltas and
+  per-id responses at once. The bridge published everything at QoS1, and the
+  burst of per-message PUBACK round-trips plus rumqttc's in-flight window (100)
+  stalled the MQTT event loop long enough to starve the device actors' runtime —
+  ~60% of a 500-device fleet's connections dropped, so those devices missed the
+  command and their responses were lost (~99/500 delivered). Two changes fix it:
+  - Live/transient messages (device-event deltas, error/connect notices, command
+    responses) now publish at **QoS0**; retained state (per-device snapshots, the
+    bridge-config sentinel) stays **QoS1**. A dropped live delta self-heals via
+    the next push or the retained snapshot.
+  - The main publish loop hands each message to a non-blocking `try_publish`
+    (a pending slot flushed at the loop top) instead of `publish().await`.
+    Awaiting `publish()` in the same `select!` as `eventloop.poll()` starved the
+    poll that drains PubAcks to free the in-flight window — a self-deadlock under
+    a QoS1 burst. This mirrors the try_publish+poll interleave `clear_and_flush`
+    already uses, so even a cache-mode (retain=on) 500-device concurrent control
+    stays stall-free.
+  A 500-device name fan-out now completes with **0 connection resets** in both
+  pass-through and cache mode.
+
+### Changed
+- Fan-out (`set`/`get`/`request`/`sub_discover` to a name or gateway cascade) now
+  runs **bounded-concurrent** (100 in flight) instead of strictly sequential —
+  a 500-device set is serviced in a few waves rather than 500 back-to-back trips
+  — and the outbound MQTT channel capacity is raised to 4096 to absorb a
+  whole-fleet transient without shedding.
+
+### Testing / CI
+- New name-fan-out + heartbeat-survival scale test (default **500** devices) and a
+  **1000-device** mock fleet-scale CI job; the broker-backed test gate now **fails**
+  (rather than skips) when no broker is reachable in CI.
+
 ## [0.3.0-rc.23] — Python 0.2.0-rc.23 — 2026-06-10
 
 ### Fixed

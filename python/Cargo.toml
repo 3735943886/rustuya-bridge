@@ -1,6 +1,6 @@
 [package]
 name = "pyrustuyabridge"
-version = "0.2.0-rc.23"
+version = "0.2.0-rc.24"
 edition = "2024"
 publish = false
 
