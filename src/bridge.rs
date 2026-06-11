@@ -1174,7 +1174,11 @@ impl BridgeContext {
             }
 
             if is_ssl {
-                opts.set_transport(rumqttc::Transport::tls(Vec::new(), None, None));
+                // Load the platform's native root certificates so `mqtts://`
+                // validates against public CAs (hosted brokers). Passing an
+                // empty CA Vec to `Transport::tls` builds an empty root store
+                // and fails every handshake with `NoValidCertInChain`.
+                opts.set_transport(rumqttc::Transport::tls_with_default_config());
             }
             opts
         } else {
