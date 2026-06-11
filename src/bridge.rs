@@ -681,7 +681,39 @@ impl BridgeContext {
             let mut seed_active = false;
             let mut seed_deadline: Option<Instant> = None;
             let mut seed_last_msg: Option<Instant> = None;
+            // At most one publish awaiting hand-off to rumqttc's request channel.
+            // It is flushed with the non-blocking `try_publish` at the loop top, not
+            // `publish().await` inside the arm: awaiting the latter blocks the
+            // sibling `eventloop.poll()` arm the instant the request channel fills,
+            // and that poll is what drains PubAcks to free the in-flight window — so
+            // a whole-fleet QoS1 snapshot burst would self-deadlock the loop. This is
+            // the same try_publish+poll interleave `clear_and_flush` relies on.
+            let mut pending: Option<MqttMessage> = None;
             loop {
+                // Flush the queued publish without blocking. If the request channel
+                // is full, keep it pending; the poll arm below drains the in-flight
+                // window and we retry next iteration. QoS by message kind: retained
+                // state (per-device snapshots, the bridge-config sentinel) → QoS1;
+                // live/transient deltas, error/connect notices, and command responses
+                // → QoS0 (a fan-out emits hundreds at once and QoS1 PUBACK round-trips
+                // would stall the loop; a dropped live delta self-heals via the next
+                // push or the retained snapshot).
+                let flushed = if let Some(msg) = &pending {
+                    let retain = msg.retain && !self.retain_suppressed.load(Ordering::Relaxed);
+                    let qos = if msg.retain {
+                        rumqttc::QoS::AtLeastOnce
+                    } else {
+                        rumqttc::QoS::AtMostOnce
+                    };
+                    client
+                        .try_publish(msg.topic.clone(), qos, retain, msg.payload.clone())
+                        .is_ok()
+                } else {
+                    false
+                };
+                if flushed {
+                    pending = None;
+                }
                 tokio::select! {
                     () = async {
                         if let Some(deadline) = next_retry {
@@ -814,16 +846,15 @@ impl BridgeContext {
                             _ => {}
                         }
                     }
-                    msg_opt = mqtt_tx_receiver.recv() => {
+                    msg_opt = mqtt_tx_receiver.recv(), if pending.is_none() => {
                         if let Some(Some(msg)) = msg_opt {
-                            debug!("MQTT Publish: [{}] {}", msg.topic, msg.payload);
-                            // `reconfigure` latches `retain_suppressed` so no
-                            // new retained snapshots land while the old scheme
-                            // is being purged ahead of a restart.
-                            let retain = msg.retain && !self.retain_suppressed.load(Ordering::Relaxed);
-                            if let Err(e) = client.publish(msg.topic, rumqttc::QoS::AtLeastOnce, retain, msg.payload).await {
-                                error!("Publish failed: {e}");
-                            }
+                            debug!("MQTT Publish queued: [{}] {}", msg.topic, msg.payload);
+                            // Hand off to the non-blocking flush at the loop top.
+                            // Gating this arm on `pending.is_none()` backpressures
+                            // into `mqtt_tx` (cap 4096) rather than blocking here on
+                            // a full request channel — which would starve the poll
+                            // arm that frees it.
+                            pending = Some(msg);
                         } else {
                                 debug!("MQTT shutdown signal received, clearing and disconnecting...");
 

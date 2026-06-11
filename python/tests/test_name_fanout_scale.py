@@ -41,17 +41,18 @@ import tuyamock
 from conftest import Collector, loopback_ips
 
 KEY = "thisisarealkey00"
-VER = "3.4"
+VER = "3.3"
 NAME = "fleetlight"  # every device shares this name → set-by-name fans out to all
 
-# Default 64. The fan-out set phase drives every mock to process a control AND
-# push its state change at the same instant. Past ~100 co-located Python mocks
-# on a small CI box (~4 cores) that simultaneous wake-up saturates CPU and the
-# mocks reset their own connections — a harness limit, not the bridge (verified:
-# 100% clean at N<=75, reset count is concurrency-independent and grows with
-# more processes; a real fleet is independent hardware with no shared CPU). 64
-# stays under that ceiling; raise NAMEFAN_N on bigger hardware to push harder.
-N = int(os.environ.get("NAMEFAN_N", "64"))
+# Default 500. An earlier ceiling here (~75) was misdiagnosed as a harness CPU
+# limit; the real cause was the bridge publishing every device-event delta at
+# MQTT QoS1 — a whole-fleet fan-out fired hundreds of QoS1 publishes whose PUBACK
+# round-trips + rumqttc's in-flight window (100) stalled the MQTT event loop long
+# enough to starve the device actors' runtime, dropping ~60% of connections. With
+# device-event deltas now published QoS0 (retained snapshots stay QoS1), a
+# 500-device name fan-out completes clean (0 connection resets). Raise NAMEFAN_N
+# on bigger hardware to push harder.
+N = int(os.environ.get("NAMEFAN_N", "500"))
 MOCKS_PER_PROC = int(os.environ.get("MOCKS_PER_PROC", "100"))
 
 # tuyamock's idle-drop is ~30s; sit quiet past it so the heartbeat is the only
@@ -124,7 +125,11 @@ def test_heartbeat_survives_then_name_fanout(bridge):
         procs.append(p)
     print(f"\n[fanout] {N} mocks across {len(procs)} procs ({MOCKS_PER_PROC}/proc), name={NAME!r}")
 
-    h = bridge()  # starts bridge, settles past seed
+    # retain OFF: this test exercises heartbeat keepalive + name fan-out, neither
+    # of which needs cache mode. Running it retain=True would leave a retained
+    # state snapshot per device on the broker that nothing clears (the test never
+    # sends `clear`), so repeated local runs pile up tens of thousands of orphans.
+    h = bridge(mqtt_retain=False)
     coll = Collector(f"{h.root}-col")
     coll.subscribe(f"{h.root}/response/#")
 
