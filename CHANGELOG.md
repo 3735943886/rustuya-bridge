@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **TLS (`mqtts://`) was fully broken.** The transport was built with an empty
+  root-certificate store, so every `mqtts://`/`ssl://` handshake failed with
+  `NoValidCertInChain` — TLS never connected to any broker. It now loads the
+  platform's native root CAs, so `mqtts://` validates against public-CA brokers.
+  Plaintext `mqtt://` is unaffected.
+
 ## [0.3.0-rc.24] — Python 0.2.0-rc.24 — 2026-06-11
 
 ### Fixed
