@@ -130,7 +130,7 @@ The bridge can be configured via command-line arguments or environment variables
 | Argument | Environment Variable | Default | Description |
 |----------|----------------------|---------|-------------|
 | `--config`, `-C` | `CONFIG` | - | Path to a JSON configuration file |
-| `--mqtt-broker`, `-m` | `MQTT_BROKER` | - | MQTT Broker address (e.g., `mqtt://user:pass@localhost:1883`) |
+| `--mqtt-broker`, `-m` | `MQTT_BROKER` | - | MQTT broker address. Scheme selects transport: `mqtt://`/`tcp://` (plaintext, default port 1883) or `mqtts://`/`ssl://` (TLS, default port 8883). Credentials inline (`mqtt://user:pass@host`) or via `--mqtt-user`/`--mqtt-password`. TLS validates against the system root CA store, so public-CA brokers work out of the box; self-signed / private-CA brokers are not supported (no custom CA option). |
 | `--mqtt-root-topic` | `MQTT_ROOT_TOPIC` | `rustuya` | MQTT root topic prefix |
 | `--mqtt-command-topic`| `MQTT_COMMAND_TOPIC` | `{root}/command` | MQTT topic for commands |
 | `--mqtt-event-topic` | `MQTT_EVENT_TOPIC` | `{root}/event/{type}/{id}` | MQTT topic for events |
