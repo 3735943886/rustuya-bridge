@@ -60,6 +60,28 @@ fn unix_millis() -> u128 {
 pub struct MqttMessage {
     pub topic: String,
     pub payload: String,
+    /// Drives BOTH the MQTT retain flag and the publish QoS — they are not
+    /// independent. The outbound loop (`spawn_mqtt_task`) maps `retain` → QoS:
+    /// `retain=true → QoS1 (AtLeastOnce)`, `retain=false → QoS0 (AtMostOnce)`.
+    /// There is no other QoS knob; this field is the single source of truth.
+    ///
+    /// Per message kind (see the `retain:` call sites):
+    ///   retain=true  → QoS1 : state snapshots (`{type}=state`, cache mode only),
+    ///                         bridge-config sentinel. Durable state a re-subscriber
+    ///                         must recover, so PUBACK-acknowledged delivery is worth it.
+    ///   retain=false → QoS0 : active/passive deltas, error/connect notices,
+    ///                         API/command responses. Live & transient — a drop
+    ///                         self-heals via the next push or the retained snapshot.
+    ///
+    /// Why live = QoS0 (do NOT blanket-revert to QoS1): a whole-fleet fan-out emits
+    /// hundreds of these at once; per-message PUBACK round-trips + rumqttc's in-flight
+    /// window (100) stalled the event loop and starved the device actors (~60% reset
+    /// on a 500-device name fan-out). The non-blocking `try_publish` in the loop is the
+    /// structural burst-safety fix; QoS0 on the live path is defense-in-depth that keeps
+    /// that path's protocol load low. NOTE: the one kind with a real delivery-guarantee
+    /// argument is command *responses* — if that ever matters, scope QoS1 to responses
+    /// specifically rather than reverting the whole `else` branch (it re-adds N PUBACKs
+    /// to the fan-out path).
     pub retain: bool,
 }
 

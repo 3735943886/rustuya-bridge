@@ -355,10 +355,12 @@ extraction.
 3. For DP `2`:
    - Topic: `rustuya/event/active/ebabc.../2`
    - Payload: `50`
-4. Each message is QoS 1. Because these are **active** deltas, cache mode
+4. Because these are **active** deltas, cache mode
    (`mqtt_retain: true`) publishes them **no-retain** on `{type}=active`; only
    the merged `{type}=state` snapshot is retained — see §4. (Retain is
-   structurally safe there because `{id}` resolves.)
+   structurally safe there because `{id}` resolves.) Being no-retain, each delta
+   goes out at **QoS 0**; only the retained snapshot is QoS 1 — QoS is derived
+   from `retain`, see §8.5.
 
 **Outbound error** — device reports `{"errorCode": xxx}`:
 
@@ -1239,6 +1241,59 @@ window of id-sorted devices (`limit` default
 stays a few KB regardless of fleet size; page through a large fleet with
 `{"action":"status","offset":50}`. Small fleets (≤ 50) are unchanged bar the
 added metadata fields.
+
+### 8.5 Publish QoS — derived from `retain`, and the burst-safety design
+
+The bridge has **no separate QoS knob**. The outbound loop ([spawn_mqtt_task](../src/bridge.rs))
+maps each message's `retain` flag straight to a QoS level — `MqttMessage::retain`
+is the single source of truth for both:
+
+| `retain` | QoS | Message kinds |
+|----------|-----|---------------|
+| `true`   | **1** (`AtLeastOnce`) | `{type}=state` snapshots (cache mode only), the `bridge/config` sentinel |
+| `false`  | **0** (`AtMostOnce`)  | active/passive deltas, error/connect notices, API/command responses |
+
+The split mirrors the message's purpose: retained messages are **durable state** a
+re-subscribing client must recover, so PUBACK-acknowledged delivery (QoS 1) is worth
+the round-trip; the QoS-0 kinds are **live & transient** — a dropped delta self-heals
+on the next push, and a dropped snapshot is re-published whenever the cache next
+changes.
+
+**Why live = QoS 0 (and why you must not blanket-revert to QoS 1).** Publishing
+*everything* at QoS 1 — the bridge's original behavior — made a whole-fleet fan-out
+fatal. A single name/command fan-out hits hundreds of already-connected devices at
+once; each emits a delta **and** a per-id response within ~0.2 s (≈ thousands/s). At
+QoS 1 every one needs a PUBACK round-trip, and rumqttc's in-flight window (100) plus
+the request channel (cap 100) saturate instantly — the publish blocks the very
+`eventloop.poll()` that drains PubAcks, so the loop self-deadlocks and the device
+actors (on rustuya's separate runtime) starve until ~60 % of a 500-device fleet drops
+its connection (a clean EOF relabeled "Connection reset").
+
+Two independent changes fixed this, and they are **not** the same lever:
+
+1. **Non-blocking `try_publish` (the structural fix).** The loop holds at most one
+   `pending` message and flushes it with `try_publish` at the loop top instead of
+   `publish().await` inside a `select!` arm. On a full request channel it re-pends and
+   lets the poll arm drain between attempts — so a QoS-1 burst can no longer deadlock
+   the loop. This is the same `try_publish`+poll interleave the scavenger's
+   `clear_and_flush` (§4.7) has always used.
+2. **QoS 0 on the live path (defense-in-depth).** Even burst-safe, there's no reason
+   to pay a PUBACK round-trip for transient, self-healing deltas — QoS 0 keeps that
+   high-volume path's protocol load low.
+
+> **Why the 1000-device scavenge never hit this but the 500-name fan-out did.** QoS
+> *level* was never the root cause — it was *tight simultaneous burst × blocking
+> publish*. The scavenge never created that condition: its heavy mass-clear runs on a
+> **separate, already-non-blocking client** (`clear_and_flush`), and its onboarding
+> snapshots *were* QoS 1 through the main loop but were paced by connection setup
+> (1000 connects over ~6.7 s ≈ 150/s — the in-flight window drains that easily). The
+> name fan-out was the first thing to slam thousands-per-second of QoS-1 publishes
+> into the blocking main loop at once.
+
+If command-**response** delivery reliability ever matters (a QoS-0 response can be
+dropped, so the caller times out even though the device acted), scope QoS 1 to
+responses *specifically* rather than reverting the whole `else` branch — a blanket
+revert re-adds one PUBACK per response to the exact fan-out path this design protects.
 
 ---
 
