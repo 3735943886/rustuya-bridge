@@ -1181,12 +1181,14 @@ next attempt — even though the broker is healthy. If you need faster
 recovery during an incident, restart the bridge (`systemctl restart
 rustuya-bridge`) — startup resets the delay to 10s.
 
-### 8.2 Outbound channel: 100-deep buffer
+### 8.2 Outbound channel: 4096-deep buffer
 
-The `MQTT_CHANNEL_CAPACITY = 100` constant bounds the event-publish queue.
-`try_send_mqtt` uses a 500ms `send` timeout — if the channel is full for
-half a second, the message is dropped at `error` log level. This protects
-against a wedged MQTT broker causing unbounded memory growth.
+The `MQTT_CHANNEL_CAPACITY = 4096` constant bounds the bridge's own
+event-publish queue (the `mqtt_tx` mpsc feeding the publish loop — distinct from
+rumqttc's internal request channel, cap 100, in `AsyncClient::new`).
+`try_send_mqtt` uses a 500ms `send` timeout — if the channel stays full for half
+a second, the message is dropped at `error` log level. This protects against a
+wedged MQTT broker causing unbounded memory growth.
 
 Drops are counted in `BridgeContext::mqtt_drop_count` (an `AtomicU64`) and
 the cumulative count is exposed in `status` responses under
@@ -1196,9 +1198,9 @@ losing the last-known state of devices that drop messages.
 
 Implications:
 
-- During broker reconnect, publishes pile up. 100 messages buffer ≈ enough
-  for a few seconds of normal activity. Heavy publishers (chatty devices,
-  multi-DP mode with many DPs) may see drops during outages.
+- During broker reconnect, publishes pile up. 4096 messages buffer a generous
+  window of normal activity before drops begin — but a long outage with chatty
+  publishers (many devices, multi-DP mode with many DPs) can still fill it.
 - No retry, no persistence, no replay — once dropped, the value is gone.
   For retain-sensitive setups the broker may serve stale retained data
   until the device's next change.
