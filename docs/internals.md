@@ -788,14 +788,25 @@ messages were ever published.
 ### 4.9 The bridge config topic
 
 `{root}/bridge/config` is published
-retained at startup with the full running config + `session_id`. It serves
-three purposes simultaneously:
+retained at startup with the running config + `session_id` + the bridge
+`version` (the `CARGO_PKG_VERSION` build constant, injected at publish time —
+it is not a `Cli` field, so it never round-trips through the config file). It
+serves three purposes simultaneously:
 
 - **Presence** — dashboards can watch it to know the bridge is up.
 - **Duplicate-instance detection** — see §7.
 - **Last Will and Testament** — registered as an empty retained payload on
   abnormal disconnect, so the
   topic clears itself if the bridge crashes.
+
+> **Credentials are stripped.** `mqtt_user` and `mqtt_password` carry
+> `#[serde(skip_serializing)]`, so they never appear in this retained topic
+> (any broker client with read access — a separate ACL'd account, a hosted
+> broker's other keys — would otherwise learn the bridge's credentials). Input
+> via CLI/env/config file is unaffected. **Caveat:** credentials embedded
+> *inline* in the broker URL (`mqtt://user:pass@host`) still serialize as part
+> of `mqtt_broker` — pass them via `--mqtt-user`/`--mqtt-password` or env to
+> keep them off the wire.
 
 On graceful shutdown the bridge publishes the empty retained payload itself
 and waits for the PubAck before disconnecting

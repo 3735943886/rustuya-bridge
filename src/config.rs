@@ -33,11 +33,18 @@ pub struct Cli {
     pub mqtt_broker: Option<String>,
 
     /// MQTT User
+    // Never serialize credentials: the running Cli is published to the retained
+    // `{root}/bridge/config` topic, which any broker client with read access can
+    // see. `skip_serializing` keeps input (CLI/env/config file) working while
+    // keeping the secret off the wire. NOTE: credentials embedded inline in the
+    // broker URL (`mqtt://user:pass@host`) still leak — prefer these flags/env.
     #[arg(long, env = "MQTT_USER")]
+    #[serde(skip_serializing)]
     pub mqtt_user: Option<String>,
 
     /// MQTT Password
     #[arg(long, env = "MQTT_PASSWORD")]
+    #[serde(skip_serializing)]
     pub mqtt_password: Option<String>,
 
     /// MQTT Root topic (defaults to rustuya)
@@ -480,6 +487,34 @@ mod tests {
         let json = serde_json::to_string(&cli).expect("serialize");
         let back: Cli = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.scavenger_timeout_secs(), 42);
+    }
+
+    #[test]
+    fn serialized_cli_omits_credentials_but_keeps_session_id() {
+        // The running Cli is published to the retained bridge/config topic, so
+        // credentials must not serialize. session_id must survive (duplicate-
+        // instance detection reads it back off that topic).
+        let cli = Cli {
+            mqtt_user: Some("secretuser".into()),
+            mqtt_password: Some("S3cret-pw".into()),
+            session_id: Some("sid_123".into()),
+            ..Cli::default()
+        };
+        let json = serde_json::to_string(&cli).expect("serialize");
+        assert!(!json.contains("mqtt_user"), "mqtt_user key leaked: {json}");
+        assert!(
+            !json.contains("mqtt_password"),
+            "mqtt_password key leaked: {json}"
+        );
+        assert!(!json.contains("secretuser"), "user value leaked: {json}");
+        assert!(!json.contains("S3cret-pw"), "password value leaked: {json}");
+        assert!(json.contains("session_id"), "session_id missing: {json}");
+
+        // Input still works: skip_serializing must not break deserialization.
+        let back: Cli =
+            serde_json::from_str(r#"{"mqtt_password":"p","mqtt_user":"u"}"#).expect("deserialize");
+        assert_eq!(back.mqtt_password.as_deref(), Some("p"));
+        assert_eq!(back.mqtt_user.as_deref(), Some("u"));
     }
 
     #[test]

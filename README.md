@@ -328,9 +328,12 @@ The bridge publishes events to the following MQTT topics:
 - `mqtt-event-topic`: Device status changes (Active/Passive).
 - `mqtt-message-topic`: Errors and logs.
 - `mqtt-scanner-topic`: Results from the `scan` action. Returns an empty object `{}` when a scan cycle is finished.
-- `{root}/bridge/config`: Retained snapshot of the running configuration,
-  published at startup and cleared on graceful shutdown (also serves as the
-  presence/heartbeat topic).
+- `{root}/bridge/config`: Retained snapshot of the running configuration
+  (including the bridge `version`), published at startup and cleared on
+  graceful shutdown (also serves as the presence/heartbeat topic). MQTT
+  credentials (`mqtt_user`/`mqtt_password`) are **not** included; note that
+  credentials embedded inline in the broker URL still are — prefer the
+  user/password flags or env vars.
 
 ## Operational Notes
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Bridge `version` in the retained `{root}/bridge/config` topic.** The
+  payload now carries the running bridge version (`CARGO_PKG_VERSION`), so
+  dashboards/operators can read which build is live without inspecting the
+  deployment. Injected at publish time, not a config field, so it never
+  round-trips through the config file.
+
 ### Fixed
 - **TLS (`mqtts://`) was fully broken.** The transport was built with an empty
   root-certificate store, so every `mqtts://`/`ssl://` handshake failed with
@@ -19,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `add` using `local_key` silently registered the device with no key.
 
 ### Security
+- **MQTT credentials no longer published to `{root}/bridge/config`.** `mqtt_user`
+  and `mqtt_password` now carry `#[serde(skip_serializing)]`, so they are stripped
+  from the retained config snapshot (previously the full running `Cli` — including
+  both — was serialized verbatim). Any broker client with read access to the topic
+  could otherwise read the bridge's credentials, which matters on brokers with
+  per-client accounts/ACLs or hosted brokers. Input via CLI/env/config file is
+  unaffected. Credentials embedded inline in the broker URL still serialize — use
+  the user/password flags or env vars to keep them off the wire.
 - **Bumped PyO3 0.28 → 0.29** (with `pyo3-async-runtimes` 0.29 and `pyo3-log`
   0.13.4) for the `pyrustuyabridge` binding, clearing two Dependabot advisories
   on `pyo3 < 0.29` (GHSA-36hh-v3qg-5jq4 high — OOB read in PyList/PyTuple

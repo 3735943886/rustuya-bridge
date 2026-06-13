@@ -938,15 +938,28 @@ impl BridgeContext {
         Ok(Some(handle))
     }
 
+    /// Serializes the running config for the `{root}/bridge/config` topic,
+    /// injecting the bridge `version` (a build constant, not a `Cli` field, so
+    /// it never round-trips through the config file). Credentials are stripped
+    /// by `#[serde(skip_serializing)]` on the `Cli` fields themselves.
+    fn build_bridge_config_payload(cli: &crate::config::Cli) -> String {
+        let mut v =
+            serde_json::to_value(cli).unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "version".to_string(),
+                Value::String(env!("CARGO_PKG_VERSION").to_string()),
+            );
+        }
+        serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string())
+    }
+
     pub async fn publish_bridge_config(&self, cli: Option<&crate::config::Cli>, clear: bool) {
         let topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
         let payload = if clear {
             String::new()
         } else {
-            cli.map_or_else(
-                || "{}".to_string(),
-                |c| serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string()),
-            )
+            cli.map_or_else(|| "{}".to_string(), Self::build_bridge_config_payload)
         };
         self.try_send_mqtt(Some(MqttMessage {
             topic,
@@ -2586,6 +2599,27 @@ impl Drop for BridgeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── bridge/config payload ──────────────────────────────────────────────────
+
+    #[test]
+    fn bridge_config_payload_injects_version_and_hides_password() {
+        let cli = crate::config::Cli {
+            mqtt_password: Some("S3cret-pw".into()),
+            session_id: Some("sid_1".into()),
+            ..crate::config::Cli::default()
+        };
+        let json = BridgeContext::build_bridge_config_payload(&cli);
+        assert!(
+            json.contains(&format!(r#""version":"{}""#, env!("CARGO_PKG_VERSION"))),
+            "version not injected: {json}"
+        );
+        assert!(json.contains("session_id"), "session_id missing: {json}");
+        assert!(
+            !json.contains("S3cret-pw"),
+            "password leaked into bridge/config: {json}"
+        );
+    }
 
     // ── IdentifierSet ──────────────────────────────────────────────────────────
 
