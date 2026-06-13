@@ -800,13 +800,30 @@ serves three purposes simultaneously:
   topic clears itself if the bridge crashes.
 
 > **Credentials are stripped.** `mqtt_user` and `mqtt_password` carry
-> `#[serde(skip_serializing)]`, so they never appear in this retained topic
-> (any broker client with read access — a separate ACL'd account, a hosted
-> broker's other keys — would otherwise learn the bridge's credentials). Input
-> via CLI/env/config file is unaffected. **Caveat:** credentials embedded
-> *inline* in the broker URL (`mqtt://user:pass@host`) still serialize as part
-> of `mqtt_broker` — pass them via `--mqtt-user`/`--mqtt-password` or env to
-> keep them off the wire.
+> `#[serde(skip_serializing)]`, so they never appear in this retained topic.
+> Input via CLI/env/config file is unaffected (`skip_serializing` only blocks
+> output, not deserialization).
+>
+> *Why this matters even though the topic lives behind broker auth.* The
+> tempting argument is "anyone who can SUBSCRIBE already authenticated, so they
+> already know the password." That conflates two different secrets: subscribing
+> proves you hold **your own** credential, not the **bridge's**. There is no
+> single "the MQTT password" — each client authenticates with its own. So the
+> redaction is a genuine no-op in exactly one setup and a real fix everywhere
+> else:
+>
+> | Broker setup | Leak? |
+> | --- | --- |
+> | **Single shared credential** (bridge and every reader use the same user/pass) | None — a reader's credential *is* the bridge's, nothing new is disclosed |
+> | **Per-client credentials + topic ACLs** (the production norm), or a **hosted broker** (one account, many client keys) | Real — a reader authenticated with *its* credential and never held the bridge's; the retained payload hands it over |
+>
+> The cost of closing it is one serde attribute with no functional downside —
+> the password has no legitimate reason to sit in a presence/introspection
+> payload — so it's stripped unconditionally regardless of which setup you run.
+>
+> **Caveat:** credentials embedded *inline* in the broker URL
+> (`mqtt://user:pass@host`) still serialize as part of `mqtt_broker` — pass them
+> via `--mqtt-user`/`--mqtt-password` or env to keep them off the wire.
 
 On graceful shutdown the bridge publishes the empty retained payload itself
 and waits for the PubAck before disconnecting
