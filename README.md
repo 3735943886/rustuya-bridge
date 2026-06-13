@@ -135,7 +135,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--mqtt-command-topic`| `MQTT_COMMAND_TOPIC` | `{root}/command` | MQTT topic for commands |
 | `--mqtt-event-topic` | `MQTT_EVENT_TOPIC` | `{root}/event/{type}/{id}` | MQTT topic for events |
 | `--mqtt-scanner-topic` | `MQTT_SCANNER_TOPIC` | `{root}/scanner` | MQTT topic for scanner results |
-| `--mqtt-client-id` | `MQTT_CLIENT_ID` | `rustuya-bridge` | MQTT client identifier |
+| `--mqtt-client-id` | `MQTT_CLIENT_ID` | `{root}-bridge` | MQTT client identifier (defaults to the root topic with a `-bridge` suffix, e.g. `rustuya-bridge`) |
 | `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
 | `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | `{value}` | MQTT payload template (e.g., `{"val": {value}}`) |
 | `--mqtt-retain` | `MQTT_RETAIN` | `false` | `true` enables the cache + snapshot retain model: live deltas publish no-retain to `{type}=active`/`{type}=passive`, and merged full-state snapshots publish retained to `{type}=state` — recommended when subscribers need to recover device state immediately on reconnect. `false` (default) passes events through with no retain. See [docs/internals.md §4](docs/internals.md). |

@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NoValidCertInChain` — TLS never connected to any broker. It now loads the
   platform's native root CAs, so `mqtts://` validates against public-CA brokers.
   Plaintext `mqtt://` is unaffected.
+- **`add` now accepts `local_key`/`localKey`/`localkey` as aliases for `key`.**
+  The README documented `local_key` as an alias, but the `add` command parser
+  ignored it (the aliases existed only on the persisted config struct), so an
+  `add` using `local_key` silently registered the device with no key.
 
 ## [0.3.0-rc.24] — Python 0.2.0-rc.24 — 2026-06-11
 

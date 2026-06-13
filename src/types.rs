@@ -32,7 +32,12 @@ pub enum BridgeRequest {
     Add {
         id: String,
         name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            alias = "local_key",
+            alias = "localKey",
+            alias = "localkey",
+            skip_serializing_if = "Option::is_none"
+        )]
         key: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         ip: Option<String>,

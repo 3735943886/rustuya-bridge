@@ -296,7 +296,7 @@ Three derived operations use this:
 The set of "known keys" for wildcard/regex purposes is hardcoded:
 
 ```rust
-const TOPIC_WILDCARD_KEYS: &[&str] = &["id", "name", "dp", "action", "cid", "type", "level"];
+const TOPIC_VARS: &[&str] = &["id", "name", "dp", "action", "cid", "type", "level"];
 ```
 
 Anything not in this list (e.g. `{timestamp}`) is left literal in the
@@ -849,7 +849,7 @@ clean path:
 1. **Latch retain off** — sets `retain_suppressed` (an `AtomicBool` on
    `BridgeContext`). The outbound publish loop in `spawn_mqtt_task` ANDs every
    message's `retain` with `!retain_suppressed`, so from this instant no new
-   retained snapshots land — *even ones already queued* in the 100-deep channel,
+   retained snapshots land — *even ones already queued* in the 4096-deep channel,
    because the override is applied at the `client.publish` call, not at message
    creation. Live (non-retained) delivery continues, so unlike a hard publish
    stop there is **no event loss**.
@@ -1276,7 +1276,7 @@ guarantee, scope QoS 1 to responses specifically rather than reverting the whole
 
 ## 9. Payload parsing details
 
-[parse_mqtt_payload](../src/bridge.rs) is the bridge's compatibility
+[parse_mqtt_payload](../src/payload.rs) is the bridge's compatibility
 layer. It tries to make sense of whatever shape arrives.
 
 ### 9.1 Topic variables → payload merge
@@ -1325,7 +1325,7 @@ fragile and depends on which action the topic happens to specify.
 
 ### 9.3 The `set` heuristic
 
-[apply_set_heuristic](../src/bridge.rs): if `action == "set"` and the
+[apply_set_heuristic](../src/payload.rs): if `action == "set"` and the
 payload has neither `dps` nor `data`, treat all remaining fields (minus a
 deny-list that covers every `BridgeRequest` field — `action`/`id`/`name`/
 `key`/`ip`/`version`/`cid`/`parent_id`/`cmd`/`data`/`dps` plus the synthetic
@@ -1520,7 +1520,7 @@ or CLI: `--scavenger-timeout-secs 5`. Cost is just a 5-second delay after
 ## 11. Python binding API — `pyrustuyabridge`
 
 Besides the `PyBridgeServer` class, the [pyrustuyabridge](../python/src/lib.rs)
-module exposes six free functions so any Python code can interpret the
+module exposes a set of free functions so any Python code can interpret the
 bridge's wire format **identically to the bridge itself**. Every one is a thin wrapper over the canonical Rust implementation
 in [src/template.rs](../src/template.rs) / [src/payload.rs](../src/payload.rs)
 — there is no second implementation to drift out of sync. If you need to match
@@ -1605,8 +1605,8 @@ ok, msg = rb.validate_payload_template("v={value};ts={timestamp}")
 | Why a retain didn't fire                 | [IdentifierSet](../src/bridge.rs)       |
 | Why a retained message isn't clearing    | [spawn_retain_scavenger](../src/bridge.rs) |
 | How to apply a template/retain change     | [reconfigure](../src/bridge.rs), [purge_all_retained](../src/bridge.rs) (§4.11) |
-| Why a topic substitution is wrong        | [render_template](../src/bridge.rs), [replace_vars](../src/bridge.rs) |
-| Why a command isn't matching             | [parse_mqtt_payload](../src/bridge.rs), [compile_topic_regex](../src/bridge.rs) |
+| Why a topic substitution is wrong        | [render_template](../src/template.rs), [replace_vars](../src/bridge.rs) |
+| Why a command isn't matching             | [parse_mqtt_payload](../src/payload.rs), [compile_topic_regex](../src/template.rs) |
 | Why a sub-device command goes nowhere    | [get_connected_device](../src/bridge.rs), [resolve_cid](../src/bridge.rs) |
 | Why the listener seems wedged            | [spawn_device_listener](../src/bridge.rs) |
 | Why MQTT keeps reconnecting              | [spawn_mqtt_task](../src/bridge.rs)   |
