@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.25] — Python 0.2.0-rc.25 — 2026-06-14
+
 ### Added
 - **Bridge `version` in the retained `{root}/bridge/config` topic.** The
   payload now carries the running bridge version (`CARGO_PKG_VERSION`), so
