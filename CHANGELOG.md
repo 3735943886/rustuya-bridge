@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored it (the aliases existed only on the persisted config struct), so an
   `add` using `local_key` silently registered the device with no key.
 
+### Security
+- **Bumped PyO3 0.28 → 0.29** (with `pyo3-async-runtimes` 0.29 and `pyo3-log`
+  0.13.4) for the `pyrustuyabridge` binding, clearing two Dependabot advisories
+  on `pyo3 < 0.29` (GHSA-36hh-v3qg-5jq4 high — OOB read in PyList/PyTuple
+  `nth`/`nth_back`; GHSA-chgr-c6px-7xpp moderate — missing `Sync` bound on
+  `PyCFunction::new_closure`). Neither vulnerable API is used by the binding;
+  the bump removes the alerts. The abi3 floor stays at `py39` to match
+  `requires-python = ">=3.9"`.
+
 ## [0.3.0-rc.24] — Python 0.2.0-rc.24 — 2026-06-11
 
 ### Fixed
