@@ -1623,6 +1623,41 @@ ok, msg = rb.validate_payload_template("v={value};ts={timestamp}")
 # -> (False, "payload template '...' isn't valid JSON after placeholder ...")
 ```
 
+### 11.3 Three ways to run the bridge — and why they perform the same
+
+There are three deployment shapes. The key fact: **all three run the actual
+bridge work (MQTT I/O, device actors, payload parsing) inside a Rust tokio
+*multi-thread* runtime** — so steady-state throughput is effectively identical.
+The differences are footprint and host-integration ergonomics, not bridge speed.
+
+| Mode | Entry point | Runtime | GIL during run | Footprint |
+| --- | --- | --- | --- | --- |
+| **Pure Rust binary** | [`rustuya-bridge`](../src/bin/rustuya-bridge.rs) (`#[tokio::main]`) | multi-thread tokio, no interpreter | n/a | minimal |
+| **`.start()` (thread)** | [`PyBridgeServer::start`](../python/src/lib.rs) | `py.detach()` releases the GIL, then builds a fresh multi-thread `Runtime` and `block_on`s it | **fully released** | + interpreter |
+| **`.start_async()` (asyncio)** | [`PyBridgeServer::start_async`](../python/src/lib.rs) (`future_into_py`) | runs on pyo3's tokio runtime; **one** completion future is bridged to the asyncio loop | **released** (held only at start/finish) | + interpreter |
+
+`.start()` blocks the calling thread (run it in a `threading.Thread`);
+`.start_async()` is `await`ed and joins an existing asyncio loop. Throughput is
+the same because both release the GIL and the bridge never calls back into
+Python per message — it talks MQTT directly via rumqttc.
+
+> **The shared resource is the GIL, not the asyncio loop.** The bridge runs on
+> its own tokio threads, so blocking the host's asyncio loop does **not** starve
+> it. The *only* steady-state Python re-entry is log forwarding ([`ShutdownSafeLogger`](../python/src/lib.rs),
+> wrapping pyo3-log) — every record reacquires the GIL. So a host that holds the
+> GIL with a CPU-bound Python burst makes log delivery jittery (CPython's
+> ~5 ms switch interval prevents a hard deadlock), but device handling keeps
+> running. A loop that's blocked *without* holding the GIL (blocking C I/O,
+> `run_in_executor`) costs nothing but deferred observation of shutdown — the
+> completion future from `start_async()`/`close()` can't resolve until the loop
+> runs again, though the Rust cleanup itself still executes on tokio.
+
+Picking between them: prefer the **binary** when you can deploy a separate
+process. Embed via **`.start()`** for a sync/thread host, **`.start_async()`**
+for an asyncio host — choose by integration model, not performance. A host that
+must run CPU-bound sync work on its loop is better served by `.start()` or the
+binary (no shutdown-observation coupling at all).
+
 ---
 
 ## Appendix: where to look in the source
