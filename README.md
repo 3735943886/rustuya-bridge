@@ -8,12 +8,12 @@
 An MQTT-based bridge server for managing Tuya devices via [`rustuya`](https://github.com/3735943886/rustuya).
 
 ```text
-          Tuya local protocol                              MQTT
-         (encrypted TCP · rustuya)                  (commands ↔ events)
+                      Tuya local protocol                          MQTT
+                   (encrypted TCP · rustuya)               (commands ↔ events)
 
   ┌──────────────────┐                  ┌──────────────────┐                  ┌──────────────────┐
   │   Tuya devices   │                  │  Rustuya Bridge  │                  │   MQTT broker    │
-  │  plugs · lights  │ ◀══════════════▶ │  device actors   │ ◀══════════════▶ │  Home Assistant  │
+  │  plugs · lights  │   ════════════   │  device actors   │   ════════════   │  Home Assistant  │
   │ gateways · subs  │                  │  + state cache   │                  │  scripts · apps  │
   └──────────────────┘                  └──────────────────┘                  └──────────────────┘
 ```
