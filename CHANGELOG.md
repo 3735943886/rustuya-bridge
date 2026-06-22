@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Single-source versioning across the workspace.** The bridge crate and the
+  `pyrustuyabridge` wheel now both inherit their version from
+  `[workspace.package].version` in the root `Cargo.toml` (via
+  `version.workspace = true`); the PyPI package keeps following automatically
+  through maturin's `dynamic = ["version"]`. Previously `pyrustuyabridge`
+  carried its own `0.2.x` line (an accident of starting later at `0.1`),
+  drifting from the bridge's `0.3.x`. The wheel is realigned to the unified
+  `0.3.0-rc.25`, so a single edit now bumps every artifact. The
+  `[profile.release]` is likewise consolidated at the workspace root (one
+  `opt-level = 3` profile); the wheel's separate size-optimized profile is
+  dropped (Cargo ignores `[profile.*]` in non-root members anyway).
+
 ## [0.3.0-rc.25] — Python 0.2.0-rc.25 — 2026-06-14
 
 ### Added

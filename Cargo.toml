@@ -1,6 +1,15 @@
+[workspace]
+members = ["python"]
+
+# Single source of truth for the version, inherited by both the bridge crate
+# and the pyrustuyabridge wheel via `version.workspace = true`. The PyPI
+# package follows automatically (pyproject `dynamic = ["version"]` → maturin).
+[workspace.package]
+version = "0.3.0-rc.25"
+
 [package]
 name = "rustuyabridge"
-version = "0.3.0-rc.25"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "An MQTT bridge for managing Tuya devices via the Tuya Local API."

@@ -23,15 +23,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Verify tag matches python/Cargo.toml version
+      - name: Verify tag matches workspace version
         if: github.event_name == 'push'
         shell: bash
         run: |
           TAG="${GITHUB_REF#refs/tags/py-v}"
-          CARGO_VER=$(grep -m1 '^version' python/Cargo.toml | cut -d'"' -f2)
-          echo "tag=$TAG cargo=$CARGO_VER"
+          # The version is inherited from [workspace.package] in the root
+          # Cargo.toml (python/Cargo.toml carries `version.workspace = true`).
+          # Match `^version = ` (space-equals) to hit the quoted workspace
+          # value, not the `version.workspace = true` inheritance line.
+          CARGO_VER=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "tag=$TAG workspace=$CARGO_VER"
           if [ "$TAG" != "$CARGO_VER" ]; then
-            echo "::error::Tag version ($TAG) does not match python/Cargo.toml version ($CARGO_VER)"
+            echo "::error::Tag version ($TAG) does not match workspace version ($CARGO_VER)"
             exit 1
           fi
 
