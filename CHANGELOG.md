@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.26] — 2026-06-23
+
+### Fixed
+- **Mass `clear` / `remove` could strand retained device state on large fleets.**
+  The retain scavenger collected retained messages in a single window that ended
+  on the first `> scavenger_timeout_secs` idle gap, then cleared only what it had
+  seen — with no retry. The broker delivers retained once per `SUBSCRIBE`, so a
+  gappy or slow replay (a large fleet on a cold or loaded broker) left most
+  retained uncleared, surfacing as intermittent "scavenger left orphans"
+  failures. It now sweeps in **repeated passes** — re-subscribe, collect, clear —
+  stopping only when a pass clears nothing, so scavenging no longer bets the whole
+  sweep on one uninterrupted replay. (The scale tests' orphan check was also
+  broadened to assert *every* retained topic under the root is cleared, not just
+  `event/state`, so a half-done scavenge can't pass as green.)
+
 ### Changed
 - **Single-source versioning across the workspace.** The bridge crate and the
   `pyrustuyabridge` wheel now both inherit their version from
