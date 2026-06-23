@@ -131,8 +131,17 @@ def test_mass_clear_leaves_no_orphans(bridge):
                      timeout=max(60, N // 4), interval=2.0), "clear did not drop all devices"
 
         def no_orphans():
-            got = fresh_retained(f"{h.root}/event/state/#", settle=5.0)
-            return not any(p for t, p, r in got if r)
+            # Check EVERY retained topic under the root, not just event/state. A
+            # device leaves more than its state snapshot retained — onboarding
+            # also publishes a retained error/{id} (errorCode 0 = "connected").
+            # An early-exiting scavenger can clear the state snapshots while
+            # stranding the error topics, so scoping this to event/state would
+            # pass on a half-done scavenge (it did, at large N, before the
+            # loop-until-dry fix). The bridge's own {root}/bridge/config is
+            # retained for the bridge's whole lifetime (not a device orphan), so
+            # it's the one expected retained topic — exclude it.
+            got = fresh_retained(f"{h.root}/#", settle=5.0)
+            return not any("/bridge/" not in t for t, p, r in got if r)
 
         assert _wait(no_orphans, timeout=max(60, N // 4)), (
             "scavenger left retained orphans after mass clear")

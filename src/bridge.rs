@@ -1874,105 +1874,142 @@ impl BridgeContext {
         tokio::spawn(async move {
             let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 64);
 
-            for sub in &subs {
-                if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
-                    error!("Scavenger subscription failed for {sub}: {e}");
-                } else {
-                    debug!("Scavenger subscribed to {sub}");
-                }
-            }
-
+            // Loop-until-dry. A single collect window ends on an idle gap, but
+            // the broker delivers retained only once per SUBSCRIBE — so a bursty
+            // or slow replay (a large fleet, or a cold/loaded broker) that falls
+            // silent for > scavenger_timeout_secs mid-stream strands every
+            // retained the one-shot pass never saw, with no second chance. Each
+            // pass re-subscribes (re-triggering replay of whatever is *still*
+            // retained, i.e. only what the prior pass missed) and clears what it
+            // matches; we stop once a pass clears nothing (proving the broker is
+            // clean) or hit the cap. This makes scavenging independent of replay
+            // timing instead of betting the whole sweep on one uninterrupted run.
+            //
+            // MAX_PASSES is a runaway backstop, NOT a tuned value — the real exit
+            // is the dry pass above. It's generous on purpose: the number of
+            // passes needed grows with fleet size, because each pass only collects
+            // as much of the gappy retained replay as arrives before a
+            // > scavenger_timeout_secs gap. Measured against tuyamock fleets (each
+            // device leaves ~2 retained: an event/state snapshot + an error/{id}
+            // errorCode topic): 1000 devices converged in ~4 passes, 2500 in ~9.
+            // 30 keeps ~3x headroom over the largest measured case for slower
+            // brokers / bigger fleets while staying finite. Overshoot is cheap — a
+            // needless pass costs at most one scavenger_timeout_secs of idle, and
+            // a dry pass ends the loop the instant the broker is actually clean —
+            // so don't "optimize" this down to a tight number; that just
+            // reintroduces the early-give-up bug at scale.
+            const MAX_PASSES: u32 = 30;
             let mut active_targets = targets;
-            // Collect every retained message during the receive window, then
-            // match at the end. Retained is delivered once (at subscribe), but
-            // coalesced targets (a burst of `remove`s forwarded via `rx`)
-            // accumulate over time — matching per-message-as-it-arrives would
-            // miss devices whose `remove` landed after their retained was
-            // already received and discarded. Collecting and clearing are kept
-            // separate so our PUBACKs stay prompt (no broker throttle) and the
-            // bounded request channel can't fill and deadlock mid-receive.
-            let mut seen: Vec<(String, bytes::Bytes)> = Vec::new();
-            let mut deadline =
-                tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
-
-            loop {
-                tokio::select! {
-                    // Biased: process new-target arrivals before the deadline branch
-                    // so a simultaneous send + expiry can't lose the extension.
-                    biased;
-                    new_targets_opt = rx.recv() => {
-                        if let Some(new_targets) = new_targets_opt {
-                            let count = new_targets.len();
-                            active_targets.extend(new_targets);
-                            deadline = tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
-                            debug!("Scavenger added {count} new targets, extended timeout");
-                        } else {
-                            break;
-                        }
+            let mut closed = false;
+            for pass in 1..=MAX_PASSES {
+                for sub in &subs {
+                    if let Err(e) = client.subscribe(sub, rumqttc::QoS::AtLeastOnce).await {
+                        error!("Scavenger subscription failed for {sub}: {e}");
+                    } else {
+                        debug!("Scavenger subscribed to {sub} (pass {pass})");
                     }
-                    () = tokio::time::sleep_until(deadline) => break,
-                    notification = eventloop.poll() => {
-                        match notification {
-                            Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
-                                if !p.retain || p.topic == config_topic {
-                                    continue;
-                                }
-                                seen.push((p.topic.clone(), p.payload.clone()));
-                                // Keep the window open while retained keep arriving.
+                }
+
+                // Collect every retained message during the receive window, then
+                // match at the end. Retained is delivered once (at subscribe), but
+                // coalesced targets (a burst of `remove`s forwarded via `rx`)
+                // accumulate over time — matching per-message-as-it-arrives would
+                // miss devices whose `remove` landed after their retained was
+                // already received and discarded. Collecting and clearing are kept
+                // separate so our PUBACKs stay prompt (no broker throttle) and the
+                // bounded request channel can't fill and deadlock mid-receive.
+                let mut seen: Vec<(String, bytes::Bytes)> = Vec::new();
+                let mut deadline =
+                    tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
+
+                loop {
+                    tokio::select! {
+                        // Biased: process new-target arrivals before the deadline branch
+                        // so a simultaneous send + expiry can't lose the extension.
+                        biased;
+                        new_targets_opt = rx.recv() => {
+                            if let Some(new_targets) = new_targets_opt {
+                                let count = new_targets.len();
+                                active_targets.extend(new_targets);
                                 deadline = tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
+                                debug!("Scavenger added {count} new targets, extended timeout");
+                            } else {
+                                closed = true;
+                                break;
                             }
-                            Err(_) => break, // Connection error
-                            _ => {}
+                        }
+                        () = tokio::time::sleep_until(deadline) => break,
+                        notification = eventloop.poll() => {
+                            match notification {
+                                Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(p))) => {
+                                    if !p.retain || p.topic == config_topic {
+                                        continue;
+                                    }
+                                    seen.push((p.topic.clone(), p.payload.clone()));
+                                    // Keep the window open while retained keep arriving.
+                                    deadline = tokio::time::Instant::now() + Duration::from_secs(scavenger_timeout_secs);
+                                }
+                                Err(_) => break, // Connection error
+                                _ => {}
+                            }
                         }
                     }
                 }
-            }
 
-            // Match the full set against the final target list, then clear.
-            let mut to_clear: Vec<String> = Vec::new();
-            for (topic, payload) in &seen {
-                // 1. Precise topic match.
-                let vars = match_topic(topic, &event_tpl, event_re.as_ref())
-                    .or_else(|| match_topic(topic, &msg_tpl, msg_re.as_ref()));
-                let mut matched = false;
-                if let Some(vars) = vars {
-                    let v_id = vars.get("id");
-                    let v_name = vars.get("name");
-                    let v_chan = vars.get("cid");
-                    matched = active_targets.iter().any(|t| {
-                        let id_hit = v_id.is_some_and(|v| v == &t.id);
-                        let cid_hit = v_chan.is_some() && t.cid.as_ref() == v_chan;
-                        let name_hit = v_name.is_some() && t.name.as_ref() == v_name;
-                        id_hit || cid_hit || name_hit
-                    });
+                // Match the full set against the final target list, then clear.
+                let mut to_clear: Vec<String> = Vec::new();
+                for (topic, payload) in &seen {
+                    // 1. Precise topic match.
+                    let vars = match_topic(topic, &event_tpl, event_re.as_ref())
+                        .or_else(|| match_topic(topic, &msg_tpl, msg_re.as_ref()));
+                    let mut matched = false;
+                    if let Some(vars) = vars {
+                        let v_id = vars.get("id");
+                        let v_name = vars.get("name");
+                        let v_chan = vars.get("cid");
+                        matched = active_targets.iter().any(|t| {
+                            let id_hit = v_id.is_some_and(|v| v == &t.id);
+                            let cid_hit = v_chan.is_some() && t.cid.as_ref() == v_chan;
+                            let name_hit = v_name.is_some() && t.name.as_ref() == v_name;
+                            id_hit || cid_hit || name_hit
+                        });
+                    }
+                    // 2. Exact payload (quoted-id) fallback.
+                    if !matched {
+                        let payload = String::from_utf8_lossy(payload);
+                        matched = active_targets.iter().any(|t| {
+                            let id_match = payload.contains(&format!("\"{}\"", t.id));
+                            let cid_match = t.cid.as_ref().is_some_and(|cid| payload.contains(&format!("\"{cid}\"")));
+                            let name_match = t.name.as_ref().is_some_and(|name| payload.contains(&format!("\"{name}\"")));
+                            id_match || cid_match || name_match
+                        });
+                    }
+                    if matched {
+                        to_clear.push(topic.clone());
+                    }
                 }
-                // 2. Exact payload (quoted-id) fallback.
-                if !matched {
-                    let payload = String::from_utf8_lossy(payload);
-                    matched = active_targets.iter().any(|t| {
-                        let id_match = payload.contains(&format!("\"{}\"", t.id));
-                        let cid_match = t.cid.as_ref().is_some_and(|cid| payload.contains(&format!("\"{cid}\"")));
-                        let name_match = t.name.as_ref().is_some_and(|name| payload.contains(&format!("\"{name}\"")));
-                        id_match || cid_match || name_match
-                    });
-                }
-                if matched {
-                    to_clear.push(topic.clone());
+                to_clear.sort();
+                to_clear.dedup();
+                debug!(
+                    "Scavenger pass {pass} collected={:?} to_clear={to_clear:?}",
+                    seen.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                );
+                let matched = to_clear.len();
+                let acked = Self::clear_and_flush(&client, &mut eventloop, &to_clear).await;
+                info!(
+                    "Scavenger pass {pass}: collected {} retained, matched {matched} of {} targets, cleared {acked}",
+                    seen.len(),
+                    active_targets.len()
+                );
+
+                // An empty pass (nothing left to clear) proves the broker is
+                // clean — only then are we done. A pass that *did* clear may have
+                // been cut short by an idle gap with more still retained, so it
+                // earns another sweep. Bail too if the target channel closed.
+                if to_clear.is_empty() || closed {
+                    break;
                 }
             }
-            to_clear.sort();
-            to_clear.dedup();
-            debug!(
-                "Scavenger collected={:?} to_clear={to_clear:?}",
-                seen.iter().map(|(t, _)| t).collect::<Vec<_>>()
-            );
-            let matched = to_clear.len();
-            let acked = Self::clear_and_flush(&client, &mut eventloop, &to_clear).await;
-            info!(
-                "Scavenger: collected {} retained, matched {matched} of {} targets, cleared {acked}",
-                seen.len(),
-                active_targets.len()
-            );
             let _ = client.disconnect().await;
         });
     }

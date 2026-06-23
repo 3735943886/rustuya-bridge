@@ -311,8 +311,13 @@ def test_cache_mode_fanout_no_resets_then_scavenge(bridge):
                      timeout=max(60, N // 4), interval=2.0), "clear did not drop all devices"
 
         def no_orphans():
-            got = fresh_retained(f"{h.root}/event/state/#", settle=5.0)
-            return not any(p for _t, p, r in got if r)
+            # Check every retained topic under the root, not just event/state:
+            # onboarding also leaves a retained error/{id} (errorCode 0), which a
+            # half-done scavenge can strand while state looks clean. Exclude the
+            # bridge's own {root}/bridge/config (retained for its lifetime, not a
+            # device orphan). See test_scavenger_scale for the full rationale.
+            got = fresh_retained(f"{h.root}/#", settle=5.0)
+            return not any("/bridge/" not in t for t, p, r in got if r)
 
         assert _wait(no_orphans, timeout=max(60, N // 4)), (
             "scavenger left retained orphans after the cache-mode fan-out")
