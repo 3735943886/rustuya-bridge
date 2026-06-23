@@ -17,6 +17,11 @@ RUN apt-get update && \
 COPY Cargo.toml ./
 RUN mkdir src
 COPY src ./src
+# The root Cargo.toml is a workspace whose only other member is the `python`
+# PyO3 crate. cargo must read python/Cargo.toml (+ its source) to load the
+# workspace at all, even though `default-members = ["."]` means we never build
+# it here. Copy it so the manifest resolves; it is not compiled.
+COPY python ./python
 
 # 3. Perform cross-compilation
 RUN --mount=type=cache,target=/usr/local/cargo/git/db \

@@ -1,5 +1,11 @@
 [workspace]
 members = ["python"]
+# A bare `cargo build`/`test` at the root builds only the bridge — the python
+# crate is a PyO3 extension (needs python headers) and is built via maturin, not
+# cargo. `python` stays a member purely to inherit [workspace.package].version.
+# The Dockerfile relies on this: it builds the workspace but must not try to
+# compile the extension (it copies python/ only so the workspace manifest loads).
+default-members = ["."]
 
 # Single source of truth for the version, inherited by both the bridge crate
 # and the pyrustuyabridge wheel via `version.workspace = true`. The PyPI
