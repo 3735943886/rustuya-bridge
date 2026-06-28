@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.27] — 2026-06-29
+
+### Changed
+- **Bumped `rustuya` from `0.3.0-rc.7` to `0.3.0-rc.9`.** This pulls in two
+  upstream improvements: device connect now accepts IPv6 literals, link-local
+  zone ids, and NAT64-synthesized addresses (the connect path passes
+  `(host, port)` as a tuple instead of `format!("{addr}:{port}")`, which
+  mangled bracketless IPv6), and the crypto stack moves to `aes-gcm` 0.11.0
+  final — clearing the last pre-release dependency from the tree. No bridge
+  code change; both are transparent through the dependency.
+
 ## [0.3.0-rc.26] — 2026-06-23
 
 ### Fixed
