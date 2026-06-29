@@ -27,10 +27,29 @@ jobs:
             echo "value=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Use the hand-written CHANGELOG section for this version as the release
+      # body. GitHub's `generate_release_notes` only lists merged PRs — changes
+      # landed as direct commits (most of this project) would be invisible, and
+      # its "previous tag" heuristic skips pre-releases.
+      - name: Extract changelog section for this tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ ("^## \\[" ver "\\]") { cap=1; next }
+            cap && /^## \[/ { exit }
+            cap { print }
+          ' CHANGELOG.md | sed '1{/^$/d}' > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "Release ${GITHUB_REF_NAME}. See CHANGELOG.md for details." > release-notes.md
+          fi
+
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
+          body_path: release-notes.md
           draft: false
           prerelease: ${{ steps.prerel.outputs.value }}
         env:
