@@ -150,26 +150,31 @@ The bridge can be configured via command-line arguments or environment variables
 | `--config`, `-C` | `CONFIG` | - | Path to a JSON configuration file |
 | `--mqtt-broker`, `-m` | `MQTT_BROKER` | - | MQTT broker address. Scheme selects transport: `mqtt://`/`tcp://` (plaintext, default port 1883) or `mqtts://`/`ssl://` (TLS, default port 8883). Credentials inline (`mqtt://user:pass@host`) or via `--mqtt-user`/`--mqtt-password`. TLS validates against the system root CA store, so public-CA brokers work out of the box; self-signed / private-CA brokers are not supported (no custom CA option). |
 | `--mqtt-root-topic` | `MQTT_ROOT_TOPIC` | `rustuya` | MQTT root topic prefix |
-| _config file / `set_config`_ | — | `{root}/command` | MQTT topic for commands. **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
-| _config file / `set_config`_ | — | `{root}/event/{type}/{id}` | MQTT topic for events. **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
-| _config file / `set_config`_ | — | `{root}/scanner` | MQTT topic for scanner results. **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `{root}-bridge` | MQTT client identifier (defaults to the root topic with a `-bridge` suffix, e.g. `rustuya-bridge`) |
-| _config file / `set_config`_ | — | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`). **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
-| _config file / `set_config`_ | — | `{value}` | MQTT payload template (e.g., `{"val": {value}}`). **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
-| _config file / `set_config`_ | — | `false` | `true` enables the cache + snapshot retain model: live deltas publish no-retain to `{type}=active`/`{type}=passive`, and merged full-state snapshots publish retained to `{type}=state` — recommended when subscribers need to recover device state immediately on reconnect. `false` (default) passes events through with no retain. **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). See [docs/internals.md §4](docs/internals.md). |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
 | `--scavenger-timeout-secs`| `SCAVENGER_TIMEOUT_SECS` | `1` | Seconds the retain scavenger waits for retained MQTT messages before exiting after `remove`/`clear`. Raise on slow brokers. |
 | `--connect-concurrency`| `CONNECT_CONCURRENCY` | `128` | Max devices establishing a connection concurrently (handshake cap). Bounds the onboarding "connect storm" when a large fleet is added at once — once connected a device is cheap, so only the establishment phase is capped. `0` disables the cap (unbounded). |
 | `--log-level`, `-l` | `LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 
+> Six topic / template / retain settings have **no CLI flag or env var** — they are config-file-only. See [Topic / template settings](#topic--template-settings) below.
+
 ### Topic / template settings
 
-The six topic / template / retain settings — `mqtt_command_topic`, `mqtt_event_topic`, `mqtt_message_topic`, `mqtt_scanner_topic`, `mqtt_payload_template`, and `mqtt_retain` — are managed **only** through the config file or the [`set_config`](#mqtt-command-reference) command. They have no CLI flag and no environment variable: the config file is their single source of truth, so a runtime `set_config` write is always authoritative (it can't be silently overridden by an env var). `mqtt_root_topic` and all other settings keep their usual CLI/env path.
+These six settings have **no CLI flag and no environment variable**. They are set only through the config file (their single source of truth) or the [`set_config`](#api-summary) command — so a runtime `set_config` write is always authoritative and can't be silently overridden by an env var that wins on the next restart. `mqtt_root_topic` and everything in the argument table above keep their usual CLI/env path.
+
+| Config key | Default | Description |
+|------------|---------|-------------|
+| `mqtt_command_topic` | `{root}/command` | MQTT topic the bridge listens on for commands |
+| `mqtt_event_topic` | `{root}/event/{type}/{id}` | MQTT topic for device events |
+| `mqtt_message_topic` | `{root}/{level}/{id}` | MQTT topic for responses/errors (e.g., `tuya/logs/{level}`) |
+| `mqtt_scanner_topic` | `{root}/scanner` | MQTT topic for scanner results |
+| `mqtt_payload_template` | `{value}` | Payload template for device events (e.g., `{"val": {value}}`) |
+| `mqtt_retain` | `false` | `true` enables the cache + snapshot retain model: live deltas publish no-retain to `{type}=active`/`{type}=passive`, and merged full-state snapshots publish retained to `{type}=state` — recommended when subscribers need to recover device state immediately on reconnect. `false` (default) passes events through with no retain. See [docs/internals.md §4](docs/internals.md). |
+
+Set them by editing the config file directly, or at runtime with [`set_config`](#api-summary). Either way the change is written to the config file and takes effect on the next [`reconfigure`](#changing-templates-or-retain)/restart, since the bridge reads these only at startup.
 
 > **Breaking change (from earlier versions):** these settings were previously also accepted via `--mqtt-*` flags and `MQTT_*` env vars. Those paths are gone. If `MQTT_COMMAND_TOPIC`, `MQTT_EVENT_TOPIC`, `MQTT_MESSAGE_TOPIC`, `MQTT_SCANNER_TOPIC`, `MQTT_PAYLOAD_TEMPLATE`, or `MQTT_RETAIN` is set in the environment, the bridge **ignores it and logs a warning at startup** — move the value into the config file (mount one in Docker) or set it with `set_config`.
-
-Changes made with `set_config` are written to the config file but take effect on the next [`reconfigure`](#changing-templates-or-retain)/restart, since the bridge reads these only at startup.
 
 ### Configuration File
 A JSON file can be used to manage all settings. Command-line arguments take priority over settings in the config file (except the topic/template settings above, which are config-file/`set_config` only).
@@ -195,16 +200,16 @@ Run with:
 - **Events**: Device events are published to the `mqtt-event-topic`, tagged with a `{type}`:
   - **Active**: real-time push initiated by the device, physical interaction, firmware-driven change, or response to a SET. Payload arrives with the `data.dps` wrapper. Published **no-retain**.
   - **Passive**: status reports without an initiating change (DP_QUERY response, or periodic report). Payload arrives with root `dps`, no `data` wrapper. Published **no-retain**.
-  - **State** (only with `--mqtt-retain true`): the bridge's own merged full-state snapshot, published **retained** to `{type}=state` so late subscribers recover current state on connect. Not a device event type — it's synthesized by the cache. See [docs/internals.md §4](docs/internals.md).
+  - **State** (only with `mqtt_retain` enabled): the bridge's own merged full-state snapshot, published **retained** to `{type}=state` so late subscribers recover current state on connect. Not a device event type — it's synthesized by the cache. See [docs/internals.md §4](docs/internals.md).
 - **Responses/Errors**: Command results and errors are published to `mqtt-message-topic`.
   - **Success**: Published with `{level}` set to `response`.
   - **Error**: Published with `{level}` set to `error`.
-  - **Retain**: command responses/errors (the ack for a command you sent) are always **no-retain** — they're one-shot. **Device-reported errors** — the `errorCode` the bridge pushes from device events, where `errorCode: 0` means *connected* — instead follow `--mqtt-retain`: **retained when on**, so the last-known connect/error state stays on the broker and a late subscriber reads online (`0`) vs offline (non-zero) without polling; no-retain when off.
+  - **Retain**: command responses/errors (the ack for a command you sent) are always **no-retain** — they're one-shot. **Device-reported errors** — the `errorCode` the bridge pushes from device events, where `errorCode: 0` means *connected* — instead follow `mqtt_retain`: **retained when on**, so the last-known connect/error state stays on the broker and a late subscriber reads online (`0`) vs offline (non-zero) without polling; no-retain when off.
 - **Scanner**: Results are published to `mqtt-scanner-topic`.
 
-#### Why `--mqtt-retain` emits a separate `state` snapshot
+#### Why `mqtt_retain` emits a separate `state` snapshot
 
-With `--mqtt-retain true` (recommended when subscribers need to recover device state on reconnect), the bridge splits every device update into a **live no-retain delta** (on `{type}=active`/`{type}=passive`) and a **retained full-state snapshot** on a separate `{type}=state` topic. A single DP change therefore shows up as two messages — intentional, not a duplicate:
+With `mqtt_retain` enabled (recommended when subscribers need to recover device state on reconnect), the bridge splits every device update into a **live no-retain delta** (on `{type}=active`/`{type}=passive`) and a **retained full-state snapshot** on a separate `{type}=state` topic. A single DP change therefore shows up as two messages — intentional, not a duplicate:
 
 ```text
 rustuya/event/active/aabbccdd11223344eeff  →  {"1":true}                  (no retain — the delta that just arrived)
@@ -216,7 +221,7 @@ rustuya/event/state/aabbccdd11223344eeff   →  {"1":true,"2":50,"9":0}     (ret
 
 If you only need *current state*, subscribe to `state`. If you need *event semantics*, watch `active` (and `passive` for readbacks). Many consumers want both — the deltas for the moment, `state` for state at rest.
 
-In pass-through mode (`--mqtt-retain false`, the default), there is no `state` snapshot: each event publishes a single no-retain `active`/`passive` message reflecting which Tuya cmd produced it, and that's it.
+In pass-through mode (`mqtt_retain` off, the default), there is no `state` snapshot: each event publishes a single no-retain `active`/`passive` message reflecting which Tuya cmd produced it, and that's it.
 
 ### Examples (MQTT)
 
@@ -299,15 +304,15 @@ mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "clear"}'
 MQTT topics and payloads can be fully customized using templates.
 
 #### Publishing Templates
-- **Topic Template (`--mqtt-event-topic`)**: Used for device status updates.
-- **Message Topic (`--mqtt-message-topic`)**: Used for errors and responses.
+- **Topic Template (`mqtt_event_topic`)**: Used for device status updates.
+- **Message Topic (`mqtt_message_topic`)**: Used for errors and responses.
 
 **Variables:**
 - `{root}`: MQTT root topic prefix
 - `{id}`: Device ID (or `bridge` for bridge-level responses)
 - `{name}`: Device Name (or `bridge` for bridge-level responses)
 - `{cid}`: Sub-device CID (if applicable, otherwise empty)
-- `{type}`: `active` or `passive` (raw device deltas) or `state` (retained merged snapshot, `--mqtt-retain true` only) — only for the event topic
+- `{type}`: `active` or `passive` (raw device deltas) or `state` (retained merged snapshot, `mqtt_retain` only) — only for the event topic
 - `{dp}`: Data Point ID (only in single DP mode)
 - `{value}`: Data Point Value (only in single DP mode)
 - `{dps}`: JSON string of all Data Points
@@ -315,7 +320,7 @@ MQTT topics and payloads can be fully customized using templates.
 - `{level}`: `response` or `error` (only for message topic)
 
 #### Command Topic Matching
-If `--mqtt-command-topic` contains variables like `{id}`, the bridge will automatically extract them from the incoming topic.
+If `mqtt_command_topic` contains variables like `{id}`, the bridge will automatically extract them from the incoming topic.
 
 **Example:**
 - Command Topic: `tuya/command/{id}/set`
@@ -323,7 +328,7 @@ If `--mqtt-command-topic` contains variables like `{id}`, the bridge will automa
 - Action: Sets the device `light_1` to `true` (if `{dp}` is also in the topic, it sets that specific DP).
 
 #### Multi-DP vs Single-DP Mode
-- If `--mqtt-payload-template` contains `{value}` or `{dp}`, the bridge will publish a separate message for **each changed DP**.
+- If `mqtt_payload_template` contains `{value}` or `{dp}`, the bridge will publish a separate message for **each changed DP**.
 - Otherwise, it will publish a **single message** containing all changed DPs in `{dps}`.
 
 ## API Summary
@@ -377,7 +382,7 @@ Day-to-day essentials. Each is covered in depth in
 - **State file.** Device registrations persist to `--state-file` (default
   `rustuya.json`) with debounced writes. The path is relative to the working
   directory — use an absolute path (or the Docker default
-  `/data/rustuya.json`) under systemd. **With `--mqtt-retain` enabled, don't
+  `/data/rustuya.json`) under systemd. **With `mqtt_retain` enabled, don't
   delete the state file to "reset" the bridge** — it leaves stale retained
   messages on the broker for devices it no longer knows about. Send a `clear`
   (or per-device `remove`) first. With the default `mqtt_retain = false`,
