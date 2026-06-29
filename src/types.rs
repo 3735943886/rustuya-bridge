@@ -89,6 +89,21 @@ pub enum BridgeRequest {
         name: Option<SingleOrList>,
     },
     Scan,
+    /// Patch the topic/template/retain settings in the config file. Only the
+    /// fields provided are changed; all take effect on the next `reconfigure`
+    /// (restart), since the bridge reads these only at startup. With
+    /// `apply: true` a `reconfigure` is chained automatically.
+    #[serde(rename = "set_config", alias = "configure")]
+    SetConfig {
+        mqtt_command_topic: Option<String>,
+        mqtt_event_topic: Option<String>,
+        mqtt_message_topic: Option<String>,
+        mqtt_scanner_topic: Option<String>,
+        mqtt_payload_template: Option<String>,
+        mqtt_retain: Option<bool>,
+        /// When true, immediately `reconfigure` (restart) to apply the change.
+        apply: Option<bool>,
+    },
     Reconfigure,
 }
 
@@ -105,6 +120,7 @@ impl BridgeRequest {
             Self::Request { .. } => "request",
             Self::SubDiscover { .. } => "sub_discover",
             Self::Scan => "scan",
+            Self::SetConfig { .. } => "set_config",
             Self::Reconfigure => "reconfigure",
         }
     }

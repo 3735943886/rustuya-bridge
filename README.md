@@ -150,21 +150,29 @@ The bridge can be configured via command-line arguments or environment variables
 | `--config`, `-C` | `CONFIG` | - | Path to a JSON configuration file |
 | `--mqtt-broker`, `-m` | `MQTT_BROKER` | - | MQTT broker address. Scheme selects transport: `mqtt://`/`tcp://` (plaintext, default port 1883) or `mqtts://`/`ssl://` (TLS, default port 8883). Credentials inline (`mqtt://user:pass@host`) or via `--mqtt-user`/`--mqtt-password`. TLS validates against the system root CA store, so public-CA brokers work out of the box; self-signed / private-CA brokers are not supported (no custom CA option). |
 | `--mqtt-root-topic` | `MQTT_ROOT_TOPIC` | `rustuya` | MQTT root topic prefix |
-| `--mqtt-command-topic`| `MQTT_COMMAND_TOPIC` | `{root}/command` | MQTT topic for commands |
-| `--mqtt-event-topic` | `MQTT_EVENT_TOPIC` | `{root}/event/{type}/{id}` | MQTT topic for events |
-| `--mqtt-scanner-topic` | `MQTT_SCANNER_TOPIC` | `{root}/scanner` | MQTT topic for scanner results |
+| _config file / `set_config`_ | — | `{root}/command` | MQTT topic for commands. **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
+| _config file / `set_config`_ | — | `{root}/event/{type}/{id}` | MQTT topic for events. **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
+| _config file / `set_config`_ | — | `{root}/scanner` | MQTT topic for scanner results. **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
 | `--mqtt-client-id` | `MQTT_CLIENT_ID` | `{root}-bridge` | MQTT client identifier (defaults to the root topic with a `-bridge` suffix, e.g. `rustuya-bridge`) |
-| `--mqtt-message-topic` | `MQTT_MESSAGE_TOPIC` | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`) |
-| `--mqtt-payload-template` | `MQTT_PAYLOAD_TEMPLATE` | `{value}` | MQTT payload template (e.g., `{"val": {value}}`) |
-| `--mqtt-retain` | `MQTT_RETAIN` | `false` | `true` enables the cache + snapshot retain model: live deltas publish no-retain to `{type}=active`/`{type}=passive`, and merged full-state snapshots publish retained to `{type}=state` — recommended when subscribers need to recover device state immediately on reconnect. `false` (default) passes events through with no retain. See [docs/internals.md §4](docs/internals.md). |
+| _config file / `set_config`_ | — | `{root}/{level}/{id}` | MQTT topic for errors/responses (e.g., `tuya/logs/{level}`). **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
+| _config file / `set_config`_ | — | `{value}` | MQTT payload template (e.g., `{"val": {value}}`). **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). |
+| _config file / `set_config`_ | — | `false` | `true` enables the cache + snapshot retain model: live deltas publish no-retain to `{type}=active`/`{type}=passive`, and merged full-state snapshots publish retained to `{type}=state` — recommended when subscribers need to recover device state immediately on reconnect. `false` (default) passes events through with no retain. **Not a CLI flag or env var** — see [Topic / template settings](#topic--template-settings). See [docs/internals.md §4](docs/internals.md). |
 | `--state-file`, `-s` | `STATE_FILE` | `rustuya.json` | Path to the file where device snapshots are stored |
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
 | `--scavenger-timeout-secs`| `SCAVENGER_TIMEOUT_SECS` | `1` | Seconds the retain scavenger waits for retained MQTT messages before exiting after `remove`/`clear`. Raise on slow brokers. |
 | `--connect-concurrency`| `CONNECT_CONCURRENCY` | `128` | Max devices establishing a connection concurrently (handshake cap). Bounds the onboarding "connect storm" when a large fleet is added at once — once connected a device is cheap, so only the establishment phase is capped. `0` disables the cap (unbounded). |
 | `--log-level`, `-l` | `LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 
+### Topic / template settings
+
+The six topic / template / retain settings — `mqtt_command_topic`, `mqtt_event_topic`, `mqtt_message_topic`, `mqtt_scanner_topic`, `mqtt_payload_template`, and `mqtt_retain` — are managed **only** through the config file or the [`set_config`](#mqtt-command-reference) command. They have no CLI flag and no environment variable: the config file is their single source of truth, so a runtime `set_config` write is always authoritative (it can't be silently overridden by an env var). `mqtt_root_topic` and all other settings keep their usual CLI/env path.
+
+> **Breaking change (from earlier versions):** these settings were previously also accepted via `--mqtt-*` flags and `MQTT_*` env vars. Those paths are gone. If `MQTT_COMMAND_TOPIC`, `MQTT_EVENT_TOPIC`, `MQTT_MESSAGE_TOPIC`, `MQTT_SCANNER_TOPIC`, `MQTT_PAYLOAD_TEMPLATE`, or `MQTT_RETAIN` is set in the environment, the bridge **ignores it and logs a warning at startup** — move the value into the config file (mount one in Docker) or set it with `set_config`.
+
+Changes made with `set_config` are written to the config file but take effect on the next [`reconfigure`](#changing-templates-or-retain)/restart, since the bridge reads these only at startup.
+
 ### Configuration File
-A JSON file can be used to manage all settings. Command-line arguments take priority over settings in the config file.
+A JSON file can be used to manage all settings. Command-line arguments take priority over settings in the config file (except the topic/template settings above, which are config-file/`set_config` only).
 
 **config.json example:**
 ```json
@@ -331,6 +339,7 @@ If `--mqtt-command-topic` contains variables like `{id}`, the bridge will automa
 | `request` | `id` or `name`, `cmd`, `data`?, `cid`? | Send raw command. Supports lists `[...]`. |
 | `sub_discover` | `id` or `name` | Trigger sub-device discovery (Gateways). |
 | `scan` | - | Scan for local devices (UDP 6666/6667). |
+| `set_config` | any of `mqtt_command_topic`, `mqtt_event_topic`, `mqtt_message_topic`, `mqtt_scanner_topic`, `mqtt_payload_template`, `mqtt_retain`; `apply`? | Patch topic/template/retain settings in the config file. Only provided fields change; applied on the next `reconfigure`/restart. `apply: true` chains a `reconfigure`. Alias: `configure`. Requires `--config`. See [Topic / template settings](#topic--template-settings). |
 | `reconfigure` | - | Clear old-scheme retained messages and restart to apply config changes. See [Changing templates or retain](#changing-templates-or-retain). |
 
 ### Target Selection Rules
@@ -384,10 +393,16 @@ scheme (turn retain off and they're never cleared; change topics and they sit
 as ghosts). The `reconfigure` action handles this cleanly:
 
 ```bash
-# 1. Edit your config FIRST (file / flags / env) — the running bridge ignores
-#    it until restart.
+# 1. Change the config FIRST — the running bridge ignores it until restart.
+#    Either edit the config file directly, or patch it over MQTT:
+mosquitto_pub -h localhost -t "rustuya/command" \
+  -m '{"action": "set_config", "mqtt_event_topic": "tuya/{name}/{dp}/state"}'
 # 2. Then trigger reconfigure:
 mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "reconfigure"}'
+
+# Or do both at once with apply:true (set_config writes the file, then reconfigures):
+mosquitto_pub -h localhost -t "rustuya/command" \
+  -m '{"action": "set_config", "mqtt_retain": true, "apply": true}'
 ```
 
 It stops retaining new publishes (live events keep flowing), clears the

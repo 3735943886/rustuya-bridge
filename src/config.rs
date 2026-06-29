@@ -51,32 +51,38 @@ pub struct Cli {
     #[arg(long, env = "MQTT_ROOT_TOPIC")]
     pub mqtt_root_topic: Option<String>,
 
-    /// MQTT Command topic (defaults to {root}/command)
-    #[arg(long, env = "MQTT_COMMAND_TOPIC")]
+    /// MQTT Command topic (defaults to {root}/command).
+    /// Config-file/`set_config` only — no CLI flag or env (single-source policy).
+    #[arg(skip)]
     pub mqtt_command_topic: Option<String>,
 
-    /// MQTT Event topic (defaults to {root}/event/{type})
-    #[arg(long, env = "MQTT_EVENT_TOPIC")]
+    /// MQTT Event topic (defaults to {root}/event/{type}).
+    /// Config-file/`set_config` only — no CLI flag or env (single-source policy).
+    #[arg(skip)]
     pub mqtt_event_topic: Option<String>,
 
     /// MQTT Client ID
     #[arg(long, env = "MQTT_CLIENT_ID")]
     pub mqtt_client_id: Option<String>,
 
-    /// MQTT Topic template for messages/errors (defaults to {root}/{level}/{id})
-    #[arg(long, env = "MQTT_MESSAGE_TOPIC")]
+    /// MQTT Topic template for messages/errors (defaults to {root}/{level}/{id}).
+    /// Config-file/`set_config` only — no CLI flag or env (single-source policy).
+    #[arg(skip)]
     pub mqtt_message_topic: Option<String>,
 
-    /// MQTT Payload template for device events (e.g. "{\"val\": {value}}", defaults to {value})
-    #[arg(long, env = "MQTT_PAYLOAD_TEMPLATE")]
+    /// MQTT Payload template for device events (e.g. "{\"val\": {value}}", defaults to {value}).
+    /// Config-file/`set_config` only — no CLI flag or env (single-source policy).
+    #[arg(skip)]
     pub mqtt_payload_template: Option<String>,
 
-    /// MQTT Topic for scanner results
-    #[arg(long, env = "MQTT_SCANNER_TOPIC")]
+    /// MQTT Topic for scanner results.
+    /// Config-file/`set_config` only — no CLI flag or env (single-source policy).
+    #[arg(skip)]
     pub mqtt_scanner_topic: Option<String>,
 
-    /// MQTT Retain flag for device status updates
-    #[arg(long, env = "MQTT_RETAIN")]
+    /// MQTT Retain flag for device status updates.
+    /// Config-file/`set_config` only — no CLI flag or env (single-source policy).
+    #[arg(skip)]
     pub mqtt_retain: Option<bool>,
 
     /// State file path to persist registered devices
@@ -357,6 +363,31 @@ impl Cli {
     }
 }
 
+/// Env vars for the topic/template/retain fields that are now managed solely via
+/// the config file and the `set_config` command (single-source policy). They are
+/// intentionally NOT wired as CLI/env args, so if one is set in the environment
+/// it is silently ignored — [`ignored_topic_env_overrides`] surfaces that.
+pub const MANAGED_TOPIC_ENV_VARS: [&str; 6] = [
+    "MQTT_COMMAND_TOPIC",
+    "MQTT_EVENT_TOPIC",
+    "MQTT_MESSAGE_TOPIC",
+    "MQTT_SCANNER_TOPIC",
+    "MQTT_PAYLOAD_TEMPLATE",
+    "MQTT_RETAIN",
+];
+
+/// Returns the subset of [`MANAGED_TOPIC_ENV_VARS`] currently present in the
+/// environment. These are no longer honored (see the field docs on [`Cli`]); the
+/// binary logs a warning for each so an operator migrating from the old
+/// env-driven setup sees a loud no-op instead of a silent one.
+#[must_use]
+pub fn ignored_topic_env_overrides() -> Vec<&'static str> {
+    MANAGED_TOPIC_ENV_VARS
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceConfig {
     #[serde(alias = "devId", alias = "device_id", default)]
@@ -609,6 +640,65 @@ mod tests {
         assert_eq!(
             cli.state_file.as_deref(),
             Some("/var/lib/foo/state.json")
+        );
+    }
+
+    // ── topic fields: no CLI flag / env (single-source policy) ──────────
+
+    #[test]
+    fn topic_fields_are_not_cli_flags() {
+        // The 6 managed fields use `#[arg(skip)]`, so passing them as flags must
+        // be rejected as unknown args — proving they're config-file/`set_config`
+        // only.
+        for flag in [
+            "--mqtt-command-topic",
+            "--mqtt-event-topic",
+            "--mqtt-message-topic",
+            "--mqtt-scanner-topic",
+            "--mqtt-payload-template",
+            "--mqtt-retain",
+        ] {
+            let res = Cli::try_parse_from(["rustuyabridge", flag, "x"]);
+            assert!(res.is_err(), "{flag} should not be a recognized CLI flag");
+        }
+    }
+
+    #[test]
+    fn topic_fields_still_round_trip_through_config_json() {
+        // env/CLI removal must not touch serde: config-file load is the source.
+        let cli = Cli {
+            mqtt_command_topic: Some("{root}/cmd".into()),
+            mqtt_event_topic: Some("{root}/ev/{id}".into()),
+            mqtt_message_topic: Some("{root}/msg/{id}".into()),
+            mqtt_scanner_topic: Some("{root}/scan".into()),
+            mqtt_payload_template: Some(r#"{"v":{value}}"#.into()),
+            mqtt_retain: Some(true),
+            ..Cli::default()
+        };
+        let json = serde_json::to_string(&cli).expect("serialize");
+        let back: Cli = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.mqtt_command_topic.as_deref(), Some("{root}/cmd"));
+        assert_eq!(back.mqtt_event_topic.as_deref(), Some("{root}/ev/{id}"));
+        assert_eq!(back.mqtt_message_topic.as_deref(), Some("{root}/msg/{id}"));
+        assert_eq!(back.mqtt_scanner_topic.as_deref(), Some("{root}/scan"));
+        assert_eq!(back.mqtt_payload_template.as_deref(), Some(r#"{"v":{value}}"#));
+        assert_eq!(back.mqtt_retain, Some(true));
+    }
+
+    #[test]
+    fn managed_env_var_list_is_stable() {
+        // The boot warning iterates these names; keep them in sync with the
+        // fields above so a renamed field can't silently drop its warning.
+        assert_eq!(
+            MANAGED_TOPIC_ENV_VARS,
+            [
+                "MQTT_COMMAND_TOPIC",
+                "MQTT_EVENT_TOPIC",
+                "MQTT_MESSAGE_TOPIC",
+                "MQTT_SCANNER_TOPIC",
+                "MQTT_PAYLOAD_TEMPLATE",
+                "MQTT_RETAIN",
+            ]
         );
     }
 

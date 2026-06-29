@@ -248,6 +248,68 @@ async fn verify_write_permission(state_file: &str) -> Result<()> {
     Ok(())
 }
 
+/// Atomically writes `bytes` to `path`: write + fsync a temp file, rename it
+/// over the target, then fsync the parent dir so the rename itself survives an
+/// unclean shutdown. Shared by the state file and the config file persistence.
+///
+/// # Errors
+/// Returns an error if the temp file cannot be created/written/synced or the
+/// rename fails (the temp file is cleaned up on rename failure).
+async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await?;
+        f.write_all(bytes).await?;
+        f.sync_all().await?;
+    }
+
+    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        anyhow::bail!("Failed to commit file {}: {}", path.display(), e);
+    }
+
+    // Fsync the directory entry (Unix). On Windows this is a no-op and
+    // `File::open` on a directory fails — silently ignore.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = tokio::fs::File::open(parent).await
+    {
+        let _ = dir.sync_all().await;
+    }
+
+    Ok(())
+}
+
+/// Validates a topic/template string supplied to `set_config`: it must be
+/// non-empty and contain no MQTT wildcards (`+` or `#`). Wildcards in publish
+/// topics (event/message/scanner) are illegal MQTT; the command (subscribe)
+/// topic could legally use them, but they are rejected there too for a uniform,
+/// footgun-free rule (a stray `#` would silently widen the command subscription).
+fn validate_topic_template(name: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    if value.contains('+') || value.contains('#') {
+        return Err(format!(
+            "{name} must not contain MQTT wildcards ('+' or '#')"
+        ));
+    }
+    Ok(())
+}
+
 impl BridgeContext {
     /// Constructs a new bridge context. Verifies write permission to the state
     /// file, then loads existing device configs and prepares background channels.
@@ -1233,47 +1295,12 @@ impl BridgeContext {
     /// # Errors
     /// Returns an error if the state file cannot be serialized, written, or atomically renamed.
     pub async fn save_state(&self) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-
         let json = {
             let state = self.state.read().await;
             serde_json::to_string_pretty(&state.configs)?
         };
 
-        let path = Path::new(&self.state_file);
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Atomic write: write + fsync temp file, rename, then fsync parent
-        // dir so the rename itself survives an unclean shutdown.
-        let tmp_path = path.with_extension("tmp");
-        {
-            let mut f = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .await?;
-            f.write_all(json.as_bytes()).await?;
-            f.sync_all().await?;
-        }
-
-        if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            anyhow::bail!("Failed to commit state file {}: {}", self.state_file, e);
-        }
-
-        // Fsync the directory entry (Unix). On Windows this is a no-op and
-        // `File::open` on a directory fails — silently ignore.
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && let Ok(dir) = tokio::fs::File::open(parent).await
-        {
-            let _ = dir.sync_all().await;
-        }
+        write_atomic(Path::new(&self.state_file), json.as_bytes()).await?;
 
         info!("State persisted to {}", self.state_file);
         Ok(())
@@ -2389,6 +2416,138 @@ impl BridgeContext {
         acked
     }
 
+    /// Applies a `set_config` request: validates the provided topic / template /
+    /// retain fields, patches them into the config file (the single source for
+    /// these settings — they have no CLI/env path), and reports which fields
+    /// changed. All changes take effect on the next `reconfigure`/restart, since
+    /// the bridge reads these only at startup; with `apply = true` a
+    /// `reconfigure` is chained here so the response can carry the diff.
+    ///
+    /// # Errors
+    /// Returns [`BridgeError::InvalidRequest`] when no config file is configured,
+    /// the file can't be read / parsed / written, or a value fails validation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one optional per settable config field; a struct would just be unpacked here"
+    )]
+    pub async fn set_config(
+        &self,
+        mqtt_command_topic: Option<String>,
+        mqtt_event_topic: Option<String>,
+        mqtt_message_topic: Option<String>,
+        mqtt_scanner_topic: Option<String>,
+        mqtt_payload_template: Option<String>,
+        mqtt_retain: Option<bool>,
+        apply: bool,
+    ) -> Result<ApiResponse, BridgeError> {
+        // The config file is the only place these settings persist to, and the
+        // restart re-reads it — without one there is nothing to apply.
+        let Some(config_path) = self.cli.config.clone() else {
+            return Err(BridgeError::InvalidRequest(
+                "set_config requires a config file (start the bridge with --config)".into(),
+            ));
+        };
+
+        // Validate up front so a bad value never reaches the file.
+        for (name, val) in [
+            ("mqtt_command_topic", mqtt_command_topic.as_deref()),
+            ("mqtt_event_topic", mqtt_event_topic.as_deref()),
+            ("mqtt_message_topic", mqtt_message_topic.as_deref()),
+            ("mqtt_scanner_topic", mqtt_scanner_topic.as_deref()),
+        ] {
+            if let Some(t) = val {
+                validate_topic_template(name, t).map_err(BridgeError::InvalidRequest)?;
+            }
+        }
+        if let Some(tpl) = mqtt_payload_template.as_deref() {
+            if tpl.trim().is_empty() {
+                return Err(BridgeError::InvalidRequest(
+                    "mqtt_payload_template must not be empty".into(),
+                ));
+            }
+            crate::payload::validate_payload_template(tpl).map_err(|e| {
+                BridgeError::InvalidRequest(format!("mqtt_payload_template: {e}"))
+            })?;
+        }
+
+        // Read the current file (source of truth). Diff is computed against the
+        // *effective* values (file merged with defaults) so an omitted field
+        // reads as its default rather than a spurious change.
+        let content = tokio::fs::read_to_string(&config_path).await.map_err(|e| {
+            BridgeError::InvalidRequest(format!("cannot read config file {config_path}: {e}"))
+        })?;
+        let mut file_cli: Cli = serde_json::from_str(&content).map_err(|e| {
+            BridgeError::InvalidRequest(format!("cannot parse config file {config_path}: {e}"))
+        })?;
+        let mut effective = file_cli.clone();
+        effective.merge(Cli::default());
+
+        let mut changed = serde_json::Map::new();
+        macro_rules! patch_str {
+            ($field:ident, $name:literal) => {
+                if let Some(new_val) = &$field {
+                    let old_val = effective.$field.clone().unwrap_or_default();
+                    if *new_val != old_val {
+                        changed.insert(
+                            $name.to_string(),
+                            serde_json::json!({ "from": old_val, "to": new_val }),
+                        );
+                        file_cli.$field = Some(new_val.clone());
+                    }
+                }
+            };
+        }
+        patch_str!(mqtt_command_topic, "mqtt_command_topic");
+        patch_str!(mqtt_event_topic, "mqtt_event_topic");
+        patch_str!(mqtt_message_topic, "mqtt_message_topic");
+        patch_str!(mqtt_scanner_topic, "mqtt_scanner_topic");
+        patch_str!(mqtt_payload_template, "mqtt_payload_template");
+        if let Some(new_retain) = mqtt_retain {
+            let old_retain = effective.mqtt_retain.unwrap_or(false);
+            if new_retain != old_retain {
+                changed.insert(
+                    "mqtt_retain".to_string(),
+                    serde_json::json!({ "from": old_retain, "to": new_retain }),
+                );
+                file_cli.mqtt_retain = Some(new_retain);
+            }
+        }
+
+        let reconfigure_required = !changed.is_empty();
+        if reconfigure_required {
+            let json = serde_json::to_string_pretty(&file_cli)
+                .map_err(BridgeError::SerializationError)?;
+            write_atomic(Path::new(&config_path), json.as_bytes())
+                .await
+                .map_err(|e| {
+                    BridgeError::InvalidRequest(format!(
+                        "cannot write config file {config_path}: {e}"
+                    ))
+                })?;
+            info!(
+                "set_config: patched {} field(s) in {config_path}; reconfigure required to apply.",
+                changed.len()
+            );
+        } else {
+            info!("set_config: no effective changes; config file left untouched.");
+        }
+
+        let mut resp = ApiResponse::ok_action("set_config")
+            .with_extra("changed", Value::Object(changed))
+            .with_extra("reconfigure_required", reconfigure_required);
+
+        if apply && reconfigure_required {
+            // Writes the file first (above) so the chained reconfigure's
+            // scavenge check sees the new scheme on disk and purges old-scheme
+            // retained where needed. Same delivery path as the `reconfigure`
+            // command: this response is published before the restart completes.
+            self.do_reconfigure().await;
+            resp = resp.with_extra("reconfigure", "triggered");
+        }
+
+        Ok(resp)
+    }
+
     /// Re-applies a configuration change by clearing old-scheme retained
     /// messages and restarting the bridge.
     ///
@@ -2410,6 +2569,19 @@ impl BridgeContext {
     /// # Errors
     /// Currently always returns `Ok`; reserved for future failure modes.
     pub async fn reconfigure(&self) -> Result<ApiResponse, BridgeError> {
+        self.do_reconfigure().await;
+
+        // Bridge-level action (not an all-devices op like `clear`), so the
+        // response carries no device id and lands on the bridge response topic.
+        Ok(ApiResponse::ok_action("reconfigure"))
+    }
+
+    /// Performs the config-reapply work: clears old-scheme retained messages
+    /// (when the scavenge-relevant config changed) and trips the cancellation
+    /// token for a clean restart. Returns nothing so callers can shape their own
+    /// response — used by the `reconfigure` command and by `set_config`'s
+    /// `apply` path.
+    async fn do_reconfigure(&self) {
         let supervised = std::env::var_os("INVOCATION_ID").is_some()
             || std::env::var_os("JOURNAL_STREAM").is_some();
 
@@ -2455,10 +2627,6 @@ impl BridgeContext {
 
         info!("reconfigure: shutting down for restart.");
         self.cancel.cancel();
-
-        // Bridge-level action (not an all-devices op like `clear`), so the
-        // response carries no device id and lands on the bridge response topic.
-        Ok(ApiResponse::ok_action("reconfigure"))
     }
 
     /// Returns `true` when the scavenge-relevant config on disk (broker, root,
@@ -3954,6 +4122,134 @@ mod context_tests {
                 "probe must subscribe where status replies land, for {msg_tmpl:?}"
             );
         }
+    }
+
+    // ── set_config ──────────────────────────────────────────────────────
+
+    /// Builds a context whose `--config` points at a temp file seeded with
+    /// `file_json`. Broker is left `None` so a chained `do_reconfigure` skips the
+    /// (network-bound) retained purge and just trips the cancel token.
+    async fn make_ctx_with_config(file_json: &str) -> (Arc<BridgeContext>, TempDir, String) {
+        let tmp = TempDir::new().expect("create tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        tokio::fs::write(&cfg_path, file_json)
+            .await
+            .expect("write config");
+        let cfg_str = cfg_path.to_string_lossy().into_owned();
+        let cli = Cli {
+            config: Some(cfg_str.clone()),
+            state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
+            ..Cli::default()
+        };
+        let (ctx, _mqtt_rx, _save_rx, _refresh_rx) =
+            BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                .await
+                .expect("new context");
+        (ctx, tmp, cfg_str)
+    }
+
+    #[tokio::test]
+    async fn set_config_patches_file_and_reports_change() {
+        let (ctx, _tmp, cfg) =
+            make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/event/{type}/{id}"}"#).await;
+
+        let resp = ctx
+            .set_config(None, Some("{root}/ev/{id}".into()), None, None, None, None, false)
+            .await
+            .expect("set_config ok");
+
+        assert_eq!(resp.status, crate::types::Status::Ok);
+        assert_eq!(
+            resp.extra.get("reconfigure_required"),
+            Some(&Value::Bool(true))
+        );
+        let changed = resp
+            .extra
+            .get("changed")
+            .and_then(Value::as_object)
+            .expect("changed object");
+        assert!(changed.contains_key("mqtt_event_topic"));
+
+        // The new value is committed to disk.
+        let content = tokio::fs::read_to_string(&cfg).await.expect("read back");
+        let written: Cli = serde_json::from_str(&content).expect("parse back");
+        assert_eq!(written.mqtt_event_topic.as_deref(), Some("{root}/ev/{id}"));
+    }
+
+    #[tokio::test]
+    async fn set_config_noop_when_value_unchanged() {
+        let (ctx, _tmp, cfg) =
+            make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/ev/{id}"}"#).await;
+        let before = tokio::fs::read_to_string(&cfg).await.unwrap();
+
+        let resp = ctx
+            .set_config(None, Some("{root}/ev/{id}".into()), None, None, None, None, false)
+            .await
+            .expect("ok");
+
+        assert_eq!(
+            resp.extra.get("reconfigure_required"),
+            Some(&Value::Bool(false))
+        );
+        assert!(
+            resp.extra
+                .get("changed")
+                .and_then(Value::as_object)
+                .unwrap()
+                .is_empty()
+        );
+        // No effective change → file is left byte-for-byte untouched.
+        assert_eq!(before, tokio::fs::read_to_string(&cfg).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_config_rejects_wildcards() {
+        let (ctx, _tmp, _cfg) = make_ctx_with_config("{}").await;
+        let err = ctx
+            .set_config(Some("{root}/cmd/#".into()), None, None, None, None, None, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn set_config_requires_a_config_file() {
+        let tmp = TempDir::new().unwrap();
+        let cli = Cli {
+            config: None,
+            state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
+            ..Cli::default()
+        };
+        let (ctx, _m, _s, _r) =
+            BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+        let err = ctx
+            .set_config(None, Some("{root}/ev/{id}".into()), None, None, None, None, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn set_config_apply_triggers_reconfigure() {
+        let (ctx, _tmp, _cfg) =
+            make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/event/{type}/{id}"}"#).await;
+        assert!(!ctx.cancel.is_cancelled());
+
+        let resp = ctx
+            .set_config(None, Some("{root}/ev/{id}".into()), None, None, None, None, true)
+            .await
+            .expect("ok");
+
+        assert_eq!(
+            resp.extra.get("reconfigure"),
+            Some(&Value::String("triggered".into()))
+        );
+        assert!(
+            ctx.cancel.is_cancelled(),
+            "apply=true with a real change must trip reconfigure"
+        );
     }
 }
 }

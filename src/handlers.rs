@@ -165,6 +165,26 @@ async fn handle_request_inner(
                 .collect())
         }
         BridgeRequest::Clear => Ok(vec![ctx.clear_devices().await?]),
+        BridgeRequest::SetConfig {
+            mqtt_command_topic,
+            mqtt_event_topic,
+            mqtt_message_topic,
+            mqtt_scanner_topic,
+            mqtt_payload_template,
+            mqtt_retain,
+            apply,
+        } => Ok(vec![
+            ctx.set_config(
+                mqtt_command_topic,
+                mqtt_event_topic,
+                mqtt_message_topic,
+                mqtt_scanner_topic,
+                mqtt_payload_template,
+                mqtt_retain,
+                apply.unwrap_or(false),
+            )
+            .await?,
+        ]),
         BridgeRequest::Reconfigure => Ok(vec![ctx.reconfigure().await?]),
         BridgeRequest::Status { offset, limit } => {
             Ok(vec![ctx.get_bridge_status(offset, limit).await])

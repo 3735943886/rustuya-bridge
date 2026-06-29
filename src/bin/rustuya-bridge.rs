@@ -22,6 +22,17 @@ async fn main() -> Result<()> {
     }
     builder.init();
 
+    // The topic/template/retain settings are config-file/`set_config` only;
+    // warn (after logger init) about any now-ignored env so a migrating operator
+    // sees a loud no-op rather than a silent one.
+    for name in rustuyabridge::config::ignored_topic_env_overrides() {
+        log::warn!(
+            "Environment variable {name} is set but no longer honored \
+             (topic/template/retain settings are managed via the config file or \
+             the `set_config` command). Move it into the config file."
+        );
+    }
+
     // Start the server
     let mut server = BridgeServer::new(cli);
     server.setup().await?;
