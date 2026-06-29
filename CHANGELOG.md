@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.28] — 2026-06-29
+
+### Added
+- **`set_config` command (alias `configure`) to change topic/template/retain
+  settings over MQTT.** Patches any of `mqtt_command_topic`, `mqtt_event_topic`,
+  `mqtt_message_topic`, `mqtt_scanner_topic`, `mqtt_payload_template`, or
+  `mqtt_retain` into the config file (atomic write), returning a per-field
+  `{from, to}` diff and `reconfigure_required`. Changes apply on the next
+  `reconfigure`/restart (the bridge reads these only at startup); pass
+  `apply: true` to chain the `reconfigure` automatically. Requires `--config`;
+  empty or MQTT-wildcard (`+`/`#`) topics are rejected.
+
+### Changed
+- **BREAKING: the six topic/template/retain settings are now
+  config-file/`set_config` only — no CLI flag, no env var.**
+  `mqtt_command_topic`, `mqtt_event_topic`, `mqtt_message_topic`,
+  `mqtt_scanner_topic`, `mqtt_payload_template`, and `mqtt_retain` lost their
+  `--mqtt-*` flags and `MQTT_*` environment variables so the config file (and
+  `set_config`) is their single source of truth — a runtime `set_config` write
+  can no longer be silently overridden by an env var that wins on the next
+  restart. If one of these env vars is still set, the bridge ignores it and logs
+  a warning at startup. `mqtt_root_topic` and every other setting keep their
+  usual CLI/env path. Migrate any `MQTT_EVENT_TOPIC`/`MQTT_RETAIN`/etc. into the
+  config file (mount one in Docker).
+
 ## [0.3.0-rc.27] — 2026-06-29
 
 ### Changed

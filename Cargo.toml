@@ -11,7 +11,7 @@ default-members = ["."]
 # and the pyrustuyabridge wheel via `version.workspace = true`. The PyPI
 # package follows automatically (pyproject `dynamic = ["version"]` → maturin).
 [workspace.package]
-version = "0.3.0-rc.27"
+version = "0.3.0-rc.28"
 
 [package]
 name = "rustuyabridge"
