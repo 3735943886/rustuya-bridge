@@ -163,6 +163,8 @@ The bridge can be configured via command-line arguments or environment variables
 
 These six settings have **no CLI flag and no environment variable**. They are set only through the config file (their single source of truth) or the [`set_config`](#api-summary) command — so a runtime `set_config` write is always authoritative and can't be silently overridden by an env var that wins on the next restart. `mqtt_root_topic` and everything in the argument table above keep their usual CLI/env path.
 
+`set_config` manages **only these six settings** — it does not change the broker, credentials, root topic, state file, or any other setting. Those are deliberately not runtime-settable (a broker switch, for instance, is a disruptive change): set them via their CLI flag, env var, or the config file, then restart the bridge.
+
 | Config key | Default | Description |
 |------------|---------|-------------|
 | `mqtt_command_topic` | `{root}/command` | MQTT topic the bridge listens on for commands |
@@ -344,7 +346,7 @@ If `mqtt_command_topic` contains variables like `{id}`, the bridge will automati
 | `request` | `id` or `name`, `cmd`, `data`?, `cid`? | Send raw command. Supports lists `[...]`. |
 | `sub_discover` | `id` or `name` | Trigger sub-device discovery (Gateways). |
 | `scan` | - | Scan for local devices (UDP 6666/6667). |
-| `set_config` | any of `mqtt_command_topic`, `mqtt_event_topic`, `mqtt_message_topic`, `mqtt_scanner_topic`, `mqtt_payload_template`, `mqtt_retain`; `apply`? | Patch topic/template/retain settings in the config file. Only provided fields change; applied on the next `reconfigure`/restart. `apply: true` chains a `reconfigure`. Alias: `configure`. Requires `--config`. See [Topic / template settings](#topic--template-settings). |
+| `set_config` | any of `mqtt_command_topic`, `mqtt_event_topic`, `mqtt_message_topic`, `mqtt_scanner_topic`, `mqtt_payload_template`, `mqtt_retain`; `apply`? | Patch topic/template/retain settings in the config file. Only provided fields change; applied on the next `reconfigure`/restart. `apply: true` chains a `reconfigure`. Only these six settings — **not** broker/credentials/state-file (set those via CLI/env or the config file, then restart). Alias: `configure`. Requires `--config`. See [Topic / template settings](#topic--template-settings). |
 | `reconfigure` | - | Clear old-scheme retained messages and restart to apply config changes. See [Changing templates or retain](#changing-templates-or-retain). |
 
 ### Target Selection Rules
