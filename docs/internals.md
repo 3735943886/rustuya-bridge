@@ -395,17 +395,23 @@ rustuya/error/ebfde0000000000000bbbb  {"errorCode":0,"errorMsg":"Connection Succ
 ### 3.3 Active vs passive events
 
 [handle_device_event](../src/bridge.rs) decides `is_passive` by
-whether the payload had any `dps` field (root or nested under `data`).
+whether the payload carries the nested `data.dps` **wrapper** — *not* by
+the mere presence of a `dps` field. Concretely, `is_passive =
+data_dps.is_none()`.
 
-- **Active** events are deliberate device-driven pushes
+- **Active** events are deliberate device-initiated pushes
   (the device telling you "this just changed", e.g. button pressed,
-  switch toggled). Wire shape: root or nested `dps` field present.
-- **Passive** events are everything else that came over the wire with a
-  non-empty JSON payload but no `dps` field — typically `DP_QUERY`
-  responses (state read-back after `get`), periodic device-initiated
-  status reports with non-standard shape, or sub-device messages with
-  custom layouts. The bridge synthesizes a DPS dict from the raw
-  payload so downstream consumers see a uniform format.
+  switch toggled — cmd 8 / DP_STATUS and similar). Wire shape:
+  `{"data": {"dps": {...}}, ...}` — the `dps` is nested under a `data`
+  wrapper.
+- **Passive** events are everything else — typically `DP_QUERY`
+  responses (state read-back after `get`, cmd 16), periodic
+  device-initiated status reports, or sub-device messages with custom
+  layouts. Wire shape: a root-level `{"dps": {...}}` with **no** `data`
+  wrapper, or a payload with no `dps` field at all (synthesized from
+  `data`). A root `dps` is therefore passive, not active. The bridge
+  synthesizes a DPS dict from the raw payload so downstream consumers see
+  a uniform format.
 
 What the bridge does with these depends on `mqtt_retain` — see §4.
 
@@ -1487,7 +1493,7 @@ the device layer without an MQTT broker in the loop.
 ### 10.7 Don't put `{timestamp}` in command topics
 
 Command topics get compiled to a regex via `compile_topic_regex`. Only the
-keys in `TOPIC_WILDCARD_KEYS` are replaced with named captures; `{timestamp}`
+keys in `TOPIC_VARS` are replaced with named captures; `{timestamp}`
 isn't in that list, so it's escaped literally — the bridge will subscribe
 to `rustuya/command/{timestamp}` and the placeholder won't match anything
 sensible. `{timestamp}` is for publish-side templates only.
