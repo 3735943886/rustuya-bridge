@@ -838,6 +838,33 @@ normal path. The one failure both paths share — power loss with a co-located
 broker, where the will never fires — is what the startup liveness probe
 (§7.1) exists to recover from.
 
+> **⚠️ Never write to `{root}/bridge/config` from any other client.** This is a
+> *control* topic (the singleton coordination channel), not a user-writable one.
+> Only the bridge itself should ever publish to it. Two clobber failure modes,
+> both real (traced through the code):
+>
+> | External write | What happens |
+> | --- | --- |
+> | **Clear** (empty retained payload) | The running bridge ignores it and does **not** re-assert — it keeps running, but the sentinel is now gone from the broker. A *new* instance starting up sees no sentinel, so it **skips the liveness probe (§7.1) and starts clean** → two live instances on the same root (split brain). |
+> | **Overwrite with a different `session_id`** | The running bridge reads the foreign `session_id`, concludes another instance took over, and **shuts itself down**. Any client with PUBLISH access to this topic can kill the bridge this way. |
+>
+> **Recommended protection — broker ACL.** Restrict PUBLISH on
+> `{root}/bridge/config` to the bridge's own MQTT principal; give everyone else
+> read-only (SUBSCRIBE). ACLs live entirely on the broker (e.g. Mosquitto
+> `acl_file`) — no bridge code change; the bridge just needs its own
+> `--mqtt-user`/`--mqtt-password`. This neutralizes both failure modes at the
+> correct layer, and pairs naturally with the per-client-credential setup the
+> §4.9 redaction table already assumes. (An app-level takeover handshake is
+> *not* worth building once the ACL is in place — the startup probe already
+> means a live incumbent never legitimately sees a foreign `session_id`.)
+>
+> **Recovery if it gets clobbered by accident.** The sentinel is re-published,
+> fresh (new `session_id`), on any clean start — so invoke `reconfigure`
+> (§4.11) to trigger a supervised restart and re-assert it. (If the overwrite
+> already made the bridge self-terminate, the supervisor's restart does the
+> same thing; `reconfigure` is the fix for the *clear* case, where the bridge is
+> still running but the topic is empty.)
+
 ### 4.10 When the broker doesn't honor retain or LWT
 
 Several bridge features assume the broker treats `retain=true` and Last
