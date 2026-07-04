@@ -126,7 +126,7 @@ pub struct BridgeContext {
     pub save_tx: mpsc::Sender<()>,
     pub refresh_tx: mpsc::Sender<()>,
     pub scavenger_tx:
-        tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<crate::types::ScavengerTarget>>>>,
+        Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<crate::types::ScavengerTarget>>>>>,
     /// Count of MQTT messages dropped because the outbound channel stayed
     /// full past `try_send_mqtt`'s timeout. Exposed in `status` responses.
     pub mqtt_drop_count: AtomicU64,
@@ -264,7 +264,16 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let tmp_path = path.with_extension("tmp");
+    // Unique per-write temp name. Two saves can race at shutdown — the debounce
+    // task's cancel-branch save and close()'s own final save — and a shared temp
+    // path would let them interleave truncating writes, then rename a torn file
+    // over the real state (silently wiping the whole device registry on next
+    // boot, since load_state treats a parse failure as an empty map). A per-call
+    // suffix keeps each write self-contained; whichever renames last wins and
+    // both candidates are complete.
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
     {
         let mut f = tokio::fs::OpenOptions::new()
             .write(true)
@@ -481,7 +490,7 @@ impl BridgeContext {
             }),
             save_tx,
             refresh_tx,
-            scavenger_tx: tokio::sync::Mutex::new(None),
+            scavenger_tx: Arc::new(tokio::sync::Mutex::new(None)),
             mqtt_drop_count: AtomicU64::new(0),
             cancel,
             retain_suppressed: AtomicBool::new(false),
@@ -1890,13 +1899,25 @@ impl BridgeContext {
             subs.insert(tpl_to_wildcard(tpl, &root_topic));
         }
 
+        // The event topic is stored already `{root}`-substituted (from
+        // `cli.mqtt_topics()`), but the message topic is stored raw. Substitute
+        // `{root}` here too: `compile_topic_regex`/`match_topic` only recognize
+        // `TOPIC_VARS` (which excludes `root`), so a raw `{root}` would be
+        // escaped literally and the regex could never match a real message
+        // topic — leaving the precise topic-based match dead (it worked only via
+        // the payload id-injection fallback).
         let event_tpl = templates[0].clone();
-        let msg_tpl = templates[1].clone();
+        let msg_tpl = templates[1].replace("{root}", &root_topic);
         let event_re = compile_topic_regex(&event_tpl);
         let msg_re = compile_topic_regex(&msg_tpl);
         let scavenger_timeout_secs = self.cli.scavenger_timeout_secs();
 
         let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &root_topic);
+
+        // Shared with the sender side (the coalesce-or-spawn block above) so the
+        // task can atomically retire the coalescing channel when it stops — see
+        // the exit handling at the bottom of the loop.
+        let scav_tx = Arc::clone(&self.scavenger_tx);
 
         tokio::spawn(async move {
             let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 64);
@@ -2034,8 +2055,45 @@ impl BridgeContext {
                 // been cut short by an idle gap with more still retained, so it
                 // earns another sweep. Bail too if the target channel closed.
                 if to_clear.is_empty() || closed {
-                    break;
+                    // Retire the coalescing channel atomically against a racing
+                    // spawn_retain_scavenger. It sends under this same lock, so
+                    // there are only two orderings: it enqueued a late target
+                    // before we lock (we drain and sweep once more, keeping the
+                    // channel), or it locks after us and finds `None` (and spawns
+                    // a fresh scavenger). Without this, a target sent during the
+                    // final `disconnect().await` below would land in a channel
+                    // this task never reads again — orphaning that retained.
+                    let mut lock = scav_tx.lock().await;
+                    let mut late = Vec::new();
+                    while let Ok(t) = rx.try_recv() {
+                        late.extend(t);
+                    }
+                    if late.is_empty() || closed {
+                        *lock = None;
+                        break;
+                    }
+                    drop(lock);
+                    active_targets.extend(late);
+                    // Late arrivals: fall through to another pass to sweep them.
                 }
+            }
+            // Reached only when MAX_PASSES is exhausted with retained still
+            // matching (very large fleet / slow broker) — the dry-exit path above
+            // already cleared the tx under the lock. Clear it here too so future
+            // callers spawn a fresh scavenger, and warn if a late target will go
+            // unswept.
+            {
+                let mut lock = scav_tx.lock().await;
+                let mut leftover = 0usize;
+                while let Ok(t) = rx.try_recv() {
+                    leftover += t.len();
+                }
+                if leftover > 0 {
+                    warn!(
+                        "Scavenger stopped at MAX_PASSES with {leftover} late target(s) unswept; their retained may be orphaned"
+                    );
+                }
+                *lock = None;
             }
             let _ = client.disconnect().await;
         });

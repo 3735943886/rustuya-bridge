@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-02
+
+First stable release of the `0.3.0` line, promoting the `0.3.0-rc.1` …
+`0.3.0-rc.28` series (see the entries below for the full history). Alongside
+the promotion this release pins the stable upstream and fixes three latent
+correctness traps found in a pre-release audit.
+
+### Changed
+- **Depend on `rustuya` `0.3.0` (stable)**, up from the `0.3.0-rc.9`/`rc.10`
+  pre-release. No bridge API change — the bridge's `unified_listener`,
+  `Scanner::scan_stream()`, and `install_panic_logging()` entry points are
+  unchanged across the promotion, and the full test suite passes against the
+  stable crate.
+
+### Fixed
+- **State file could be truncated by a save-vs-save race at shutdown.**
+  `write_atomic` wrote to a single fixed temp path (`<state>.tmp`). At a busy
+  shutdown two saves can run concurrently — the debounce task's cancel-branch
+  save and `close()`'s own final save — and share that temp file, interleaving
+  truncating writes and then `rename`-ing a torn file over the real state.
+  `load_state` treats a parse failure as an empty map, so the next boot could
+  come up having silently lost the entire device registry. Each write now uses a
+  unique per-call temp name (`<state>.tmp.<pid>.<seq>`), so concurrent saves are
+  self-contained and whichever renames last is always a complete file.
+- **Retain scavenger's message-topic match was dead code.** The event topic is
+  stored `{root}`-substituted but the message topic was stored raw, so the
+  scavenger compiled its message-topic regex from a template still containing a
+  literal `{root}` (which `compile_topic_regex` escapes rather than expands) —
+  the precise topic match for the message/error topic could never fire. It
+  worked in practice only via the payload id-injection fallback; a message
+  template whose payload didn't embed the identifier would have orphaned its
+  retained. The scavenger now substitutes `{root}` before compiling, matching
+  the event-topic path.
+- **Retain scavenger could drop a target coalesced during its final teardown.**
+  A `remove`/`clear` arriving in the small window after the last (dry) pass but
+  before the task's `disconnect().await` was accepted into the coalescing
+  channel that the exiting task would never read again, orphaning that device's
+  retained. The task now retires the coalescing channel under the same lock the
+  sender uses: a late target is drained and swept in one more pass, or the
+  channel is cleared so the caller spawns a fresh scavenger — closing the race.
+
+### Documentation
+- **`docs/internals.md` §3.3 (active vs passive) corrected.** It described the
+  classification as "any `dps` field (root or nested under `data`)", which
+  contradicts the code (`is_passive = data_dps.is_none()`) and the README: the
+  discriminator is the nested `data.dps` **wrapper**, so a root-level `dps`
+  (a `DP_QUERY` response) is **passive**, not active.
+- §10.7 referenced a non-existent constant `TOPIC_WILDCARD_KEYS`; the actual
+  constant is `TOPIC_VARS`.
+
 ## [0.3.0-rc.28] — 2026-06-29
 
 ### Added

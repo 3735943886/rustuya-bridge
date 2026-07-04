@@ -395,17 +395,23 @@ rustuya/error/ebfde0000000000000bbbb  {"errorCode":0,"errorMsg":"Connection Succ
 ### 3.3 Active vs passive events
 
 [handle_device_event](../src/bridge.rs) decides `is_passive` by
-whether the payload had any `dps` field (root or nested under `data`).
+whether the payload carries the nested `data.dps` **wrapper** — *not* by
+the mere presence of a `dps` field. Concretely, `is_passive =
+data_dps.is_none()`.
 
-- **Active** events are deliberate device-driven pushes
+- **Active** events are deliberate device-initiated pushes
   (the device telling you "this just changed", e.g. button pressed,
-  switch toggled). Wire shape: root or nested `dps` field present.
-- **Passive** events are everything else that came over the wire with a
-  non-empty JSON payload but no `dps` field — typically `DP_QUERY`
-  responses (state read-back after `get`), periodic device-initiated
-  status reports with non-standard shape, or sub-device messages with
-  custom layouts. The bridge synthesizes a DPS dict from the raw
-  payload so downstream consumers see a uniform format.
+  switch toggled — cmd 8 / DP_STATUS and similar). Wire shape:
+  `{"data": {"dps": {...}}, ...}` — the `dps` is nested under a `data`
+  wrapper.
+- **Passive** events are everything else — typically `DP_QUERY`
+  responses (state read-back after `get`, cmd 16), periodic
+  device-initiated status reports, or sub-device messages with custom
+  layouts. Wire shape: a root-level `{"dps": {...}}` with **no** `data`
+  wrapper, or a payload with no `dps` field at all (synthesized from
+  `data`). A root `dps` is therefore passive, not active. The bridge
+  synthesizes a DPS dict from the raw payload so downstream consumers see
+  a uniform format.
 
 What the bridge does with these depends on `mqtt_retain` — see §4.
 
@@ -831,6 +837,33 @@ and waits for the PubAck before disconnecting
 normal path. The one failure both paths share — power loss with a co-located
 broker, where the will never fires — is what the startup liveness probe
 (§7.1) exists to recover from.
+
+> **⚠️ Never write to `{root}/bridge/config` from any other client.** This is a
+> *control* topic (the singleton coordination channel), not a user-writable one.
+> Only the bridge itself should ever publish to it. Two clobber failure modes,
+> both real (traced through the code):
+>
+> | External write | What happens |
+> | --- | --- |
+> | **Clear** (empty retained payload) | The running bridge ignores it and does **not** re-assert — it keeps running, but the sentinel is now gone from the broker. A *new* instance starting up sees no sentinel, so it **skips the liveness probe (§7.1) and starts clean** → two live instances on the same root (split brain). |
+> | **Overwrite with a different `session_id`** | The running bridge reads the foreign `session_id`, concludes another instance took over, and **shuts itself down**. Any client with PUBLISH access to this topic can kill the bridge this way. |
+>
+> **Recommended protection — broker ACL.** Restrict PUBLISH on
+> `{root}/bridge/config` to the bridge's own MQTT principal; give everyone else
+> read-only (SUBSCRIBE). ACLs live entirely on the broker (e.g. Mosquitto
+> `acl_file`) — no bridge code change; the bridge just needs its own
+> `--mqtt-user`/`--mqtt-password`. This neutralizes both failure modes at the
+> correct layer, and pairs naturally with the per-client-credential setup the
+> §4.9 redaction table already assumes. (An app-level takeover handshake is
+> *not* worth building once the ACL is in place — the startup probe already
+> means a live incumbent never legitimately sees a foreign `session_id`.)
+>
+> **Recovery if it gets clobbered by accident.** The sentinel is re-published,
+> fresh (new `session_id`), on any clean start — so invoke `reconfigure`
+> (§4.11) to trigger a supervised restart and re-assert it. (If the overwrite
+> already made the bridge self-terminate, the supervisor's restart does the
+> same thing; `reconfigure` is the fix for the *clear* case, where the bridge is
+> still running but the topic is empty.)
 
 ### 4.10 When the broker doesn't honor retain or LWT
 
@@ -1487,7 +1520,7 @@ the device layer without an MQTT broker in the loop.
 ### 10.7 Don't put `{timestamp}` in command topics
 
 Command topics get compiled to a regex via `compile_topic_regex`. Only the
-keys in `TOPIC_WILDCARD_KEYS` are replaced with named captures; `{timestamp}`
+keys in `TOPIC_VARS` are replaced with named captures; `{timestamp}`
 isn't in that list, so it's escaped literally — the bridge will subscribe
 to `rustuya/command/{timestamp}` and the placeholder won't match anything
 sensible. `{timestamp}` is for publish-side templates only.
