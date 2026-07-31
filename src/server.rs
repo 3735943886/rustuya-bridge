@@ -1,4 +1,4 @@
-use crate::bridge::BridgeContext;
+use crate::bridge::{BridgeContext, WarmState};
 use crate::config::Cli;
 use anyhow::Result;
 use log::info;
@@ -87,7 +87,7 @@ impl BridgeServer {
     /// directory is not writable, another bridge instance is already running, or
     /// the MQTT task fails to start.
     pub async fn setup(&mut self) -> Result<Arc<BridgeContext>> {
-        self.start_cycle(true).await
+        self.start_cycle(true, None).await
     }
 
     /// Brings one bridge cycle up: layers the config, builds a context, starts
@@ -99,7 +99,14 @@ impl BridgeServer {
     /// find is our own retained sentinel, and it would spend its full
     /// ghost-detection budget confirming that nobody answers before letting us
     /// continue.
-    async fn start_cycle(&mut self, first: bool) -> Result<Arc<BridgeContext>> {
+    ///
+    /// `warm` carries the previous cycle's live device connections, so applying
+    /// a config change costs no device a reconnect (see [`WarmState`]).
+    async fn start_cycle(
+        &mut self,
+        first: bool,
+        warm: Option<WarmState>,
+    ) -> Result<Arc<BridgeContext>> {
         // Report panics (including those on background device-task threads)
         // with their location before the default hook aborts. Under our release
         // build (`panic = "abort"` + `strip`) a worker panic would otherwise
@@ -132,7 +139,7 @@ impl BridgeServer {
         self.cli.session_id = Some(session_id);
 
         let (ctx, mqtt_tx_rx, save_rx, refresh_rx) =
-            BridgeContext::new(&self.cli, self.cycle.clone()).await?;
+            BridgeContext::new(&self.cli, self.cycle.clone(), warm).await?;
 
         if first {
             ctx.check_existing_instance().await?;
@@ -232,25 +239,21 @@ impl BridgeServer {
             .is_some_and(|ctx| ctx.restart_requested.load(Ordering::Relaxed))
             && !self.cancel.is_cancelled();
 
-        info!(
-            "{}",
-            if restarting {
-                "Restarting to apply the new configuration..."
-            } else {
-                "Shutting down..."
-            }
-        );
-        self.close().await?;
-
         if !restarting {
+            info!("Shutting down...");
+            self.close().await?;
             return Ok(false);
         }
 
+        info!("Restarting to apply the new configuration (devices stay connected)...");
+        let warm = self.close_warm().await?;
+
         // Fresh cycle token: the old one is spent, and every task that ran on it
-        // has been awaited by `close()`.
+        // has been awaited by the teardown.
         self.cycle = self.cancel.child_token();
-        self.start_cycle(false).await?;
-        info!("Restart complete; new configuration is live.");
+        let carried = warm.as_ref().map_or(0, |w| w.instances.len());
+        self.start_cycle(false, warm).await?;
+        info!("Restart complete; new configuration is live ({carried} device(s) kept connected).");
         Ok(true)
     }
 
@@ -278,7 +281,24 @@ impl BridgeServer {
         if let Some(ctx) = self.ctx.take() {
             ctx.close().await;
         }
+        self.join_cycle_tasks().await;
+        Ok(())
+    }
 
+    /// [`Self::close`]'s warm twin: tears the cycle down but moves the live
+    /// device connections out instead of dropping them, so the next cycle can
+    /// adopt them. `None` only if there was no context to close.
+    async fn close_warm(&mut self) -> Result<Option<WarmState>> {
+        let warm = match self.ctx.take() {
+            Some(ctx) => Some(ctx.close_for_restart().await),
+            None => None,
+        };
+        self.join_cycle_tasks().await;
+        Ok(warm)
+    }
+
+    /// Waits out this cycle's background tasks, then its MQTT task.
+    async fn join_cycle_tasks(&mut self) {
         // Wait for state_saver and device_listener to exit gracefully due to cancellation.
         // A task that doesn't observe the cancel within 2 seconds is aborted so a
         // restart can't stall behind it.
@@ -298,8 +318,6 @@ impl BridgeServer {
         if let Some(handle) = self.mqtt_handle.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(7), handle).await;
         }
-
-        Ok(())
     }
 }
 
@@ -389,6 +407,64 @@ mod tests {
         assert!(
             server.ctx.is_some(),
             "a restarted server must hold a live context"
+        );
+    }
+
+    /// The point of a warm restart: applying a config change must not cost the
+    /// fleet its connections.
+    ///
+    /// The probe is channel **identity**, not liveness. Each device's driver task
+    /// owns its own `watch_connected` channel, so comparing the receiver from
+    /// before the restart with the one after answers "is this literally the same
+    /// task" — synchronously and exactly. Checking liveness instead would be
+    /// vacuous: a dropped actor does not stop the instant its handles go, so an
+    /// immediate "still alive?" passes even for a cold rebuild (it did, when this
+    /// test was first written that way).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_keeps_the_fleet_connected() {
+        let tmp = TempDir::new().unwrap();
+        let mut server = BridgeServer::new(cli_with_config_file(&tmp, "before"));
+        let ctx = server.setup().await.expect("setup");
+
+        ctx.add_device(crate::config::DeviceConfig {
+            id: "dev-1".into(),
+            name: None,
+            ip: Some("10.0.0.1".into()),
+            key: Some("0123456789abcdef".into()),
+            version: None,
+            cid: None,
+            parent_id: None,
+            last_error_code: None,
+        })
+        .await
+        .expect("add");
+
+        let before = {
+            let state = ctx.state.read().await;
+            state.instances["dev-1"].watch_connected()
+        };
+
+        rewrite_config(&tmp, "after");
+        ctx.reconfigure().await.expect("reconfigure");
+        server.finish_cycle().await.expect("restart");
+
+        let new_ctx = server.ctx.as_ref().expect("restarted context");
+        let after = {
+            let state = new_ctx.state.read().await;
+            state
+                .instances
+                .get("dev-1")
+                .expect("the carried-over connection must be registered in the new context")
+                .watch_connected()
+        };
+        assert!(
+            before.same_channel(&after),
+            "the restart rebuilt the device instead of carrying its connection over"
+        );
+        assert_eq!(
+            server.config().mqtt_root_topic.as_deref(),
+            Some("after"),
+            "and the new config must actually be live"
         );
     }
 

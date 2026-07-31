@@ -62,6 +62,26 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 15;
 /// whether the id it already holds a subscription for is the same connection or
 /// a new one, and the old subscription does not end synchronously when the old
 /// actor is dropped.
+/// The live device machinery carried across an **in-place restart**, so applying
+/// a config change doesn't cost the fleet its connections.
+///
+/// A restart rebuilds the whole context — that is what makes it able to apply
+/// *every* setting, including the ones no amount of field-level patching could
+/// (the `mqtt_retain` mode flip reshapes the cache and the seed phase; a broker
+/// change means a new connection). But rebuilding the devices too would drop and
+/// re-establish every connection, which at fleet scale is exactly the connect
+/// storm the bridge works to avoid. So the connections come along.
+///
+/// The [`Fleet`] has to come with them: its `Discovery` is what each device's
+/// reconnect fast-path is registered against, and building a new one would leave
+/// every carried-over device pointing at a dead discovery actor. A consequence
+/// worth knowing: `connect_concurrency` therefore takes effect for devices built
+/// *after* the restart, not for ones that survived it.
+pub struct WarmState {
+    pub fleet: Fleet,
+    pub instances: HashMap<String, Device>,
+}
+
 #[derive(Debug)]
 pub enum DeviceUpdate {
     /// A device gained a connection, or had it rebuilt. Subscribing again under
@@ -385,6 +405,7 @@ impl BridgeContext {
     pub async fn new(
         cli: &Cli,
         cancel: tokio_util::sync::CancellationToken,
+        warm: Option<WarmState>,
     ) -> Result<(
         Arc<Self>,
         mpsc::Receiver<Option<MqttMessage>>,
@@ -402,7 +423,12 @@ impl BridgeContext {
         let (_, mqtt_event_topic) = cli.mqtt_topics();
         let initial_configs = load_state(cli.state_file()).await;
 
-        let fleet = Fleet::new(cli.connect_concurrency());
+        // A warm restart hands over the previous cycle's fleet and connections;
+        // a cold start builds them.
+        let (fleet, mut inherited) = match warm {
+            Some(w) => (w.fleet, w.instances),
+            None => (Fleet::new(cli.connect_concurrency()), HashMap::new()),
+        };
 
         let mut initial_instances = HashMap::new();
         let mut initial_name_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -414,16 +440,25 @@ impl BridgeContext {
             {
                 initial_cid_map.insert((parent_id.clone(), cid.clone()), id.clone());
             } else if cfg.key.is_some() {
-                // A device that fails to build is a *config* problem (bad key
-                // length, unknown version) that survived into the state file.
-                // Log it and carry on rather than refusing to start: the rest of
-                // the fleet is fine, and the operator can fix the entry with a
-                // fresh `add`.
-                match fleet.device_for(cfg) {
-                    Ok(dev) => {
-                        initial_instances.insert(id.clone(), dev);
+                // Reuse the connection this device already had, if it survived a
+                // restart. Device *configuration* is orthogonal to bridge
+                // configuration — a `reconfigure` changes topics, never keys or
+                // addresses — so a carried-over connection is by construction
+                // still the right one.
+                if let Some(dev) = inherited.remove(id) {
+                    initial_instances.insert(id.clone(), dev);
+                } else {
+                    // A device that fails to build is a *config* problem (bad key
+                    // length, unknown version) that survived into the state file.
+                    // Log it and carry on rather than refusing to start: the rest
+                    // of the fleet is fine, and the operator can fix the entry
+                    // with a fresh `add`.
+                    match fleet.device_for(cfg) {
+                        Ok(dev) => {
+                            initial_instances.insert(id.clone(), dev);
+                        }
+                        Err(e) => error!("Device {id} could not be connected: {e}"),
                     }
-                    Err(e) => error!("Device {id} could not be connected: {e}"),
                 }
             } else {
                 error!("Device {id} is invalid: missing key or parent info");
@@ -1175,20 +1210,41 @@ impl BridgeContext {
         }
     }
 
-    /// Fully closes the bridge context and cleans up resources
+    /// Fully closes the bridge context, dropping every device connection.
     pub async fn close(&self) {
         info!("Closing bridge context...");
+        drop(self.teardown(false).await);
+    }
 
-        // Drop all Device instances first so the rustuya library stops its
-        // internal background scanning/reconnection tasks before we proceed.
-        {
+    /// Closes the context but **keeps the fleet connected**, handing the live
+    /// device machinery to the next cycle. See [`WarmState`].
+    pub async fn close_for_restart(&self) -> WarmState {
+        info!("Closing bridge context, keeping device connections...");
+        self.teardown(true)
+            .await
+            .expect("teardown(true) always yields the warm state")
+    }
+
+    /// The shared teardown. `keep_devices` decides whether the device handles are
+    /// dropped here — which stops their driver tasks — or moved out to be
+    /// re-registered by the next context.
+    async fn teardown(&self, keep_devices: bool) -> Option<WarmState> {
+        // Take the instances out either way. Dropping the last handle is what
+        // stops a device's driver task, so a shutdown must do it *before*
+        // anything else waits on task completion.
+        let instances = {
             let mut state = self.state.write().await;
-            state.instances.clear();
-        }
+            std::mem::take(&mut state.instances)
+        };
+        let warm = keep_devices.then(|| WarmState {
+            fleet: self.fleet.clone(),
+            instances,
+        });
 
         self.cancel.cancel();
         self.shutdown_mqtt().await;
         let _ = self.save_state().await;
+        warm
     }
 
     async fn try_send_mqtt(&self, msg: Option<MqttMessage>) {
@@ -3119,7 +3175,7 @@ mod tests {
             };
             customize(&mut cli);
             let (ctx, mqtt_rx, save_rx, refresh_rx) =
-                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new(), None)
                     .await
                     .expect("new context");
             (ctx, tmp, mqtt_rx, save_rx, refresh_rx)
@@ -3163,6 +3219,69 @@ mod tests {
             if let Ok(update) = rx.try_recv() {
                 panic!("{why}: expected no delta, got {update:?}");
             }
+        }
+
+        /// `close_for_restart` hands the live connections on; `close` drops them.
+        /// That is the whole difference between the two teardowns, and the reason
+        /// a `reconfigure` no longer costs the fleet a reconnect.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn close_for_restart_hands_over_connections_and_close_drops_them() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+            ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
+                .await
+                .expect("add");
+
+            let warm = ctx.close_for_restart().await;
+            assert!(
+                warm.instances.contains_key("dev-1"),
+                "a warm close must hand the connection to the next cycle"
+            );
+            assert!(
+                ctx.state.read().await.instances.is_empty(),
+                "and move it out of the closed context, not copy it"
+            );
+
+            // The cold path takes the same instances out but drops them, which is
+            // what stops each device's driver task. `watch_connected`'s sender
+            // lives in that task, so the receiver reports Err once it is gone —
+            // and this test holds no `Device` clone, which would otherwise keep
+            // the task alive and make the check pass vacuously.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+            // Loopback, so the dial is refused immediately. An unreachable
+            // address would park the actor inside `TcpStream::connect` for the
+            // whole connect timeout before it could notice its handles are gone —
+            // real behaviour (a shutdown doesn't wait on device tasks, so it
+            // costs nothing), but it would make this check a timing race.
+            ctx.add_device(direct_device(
+                "dev-2",
+                "0123456789abcdef",
+                Some("127.0.0.1"),
+            ))
+            .await
+            .expect("add");
+            let watch = {
+                let state = ctx.state.read().await;
+                state.instances["dev-2"].watch_connected()
+            };
+            // Consume the pending delta the way the listener task does. An `Up`
+            // carries a `Device` clone, so one left sitting in the queue pins the
+            // very connection it announces — and no listener runs in this test.
+            while refresh_rx.try_recv().is_ok() {}
+            ctx.close().await;
+            assert!(
+                ctx.state.read().await.instances.is_empty(),
+                "a shutdown must release every connection"
+            );
+            // The task exits once its last handle is gone, which takes a
+            // scheduler turn — poll for it rather than assume it already happened.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while watch.has_changed().is_ok() && tokio::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                watch.has_changed().is_err(),
+                "a shutdown must stop the device's driver task"
+            );
         }
 
         // ── #10: add_device idempotency ───────────────────────────────────────
@@ -4401,7 +4520,7 @@ mod tests {
                 ..Cli::default()
             };
             let (ctx, _mqtt_rx, _save_rx, _refresh_rx) =
-                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new(), None)
                     .await
                     .expect("new context");
             (ctx, tmp, cfg_str)
@@ -4504,7 +4623,7 @@ mod tests {
                 ..Cli::default()
             };
             let (ctx, _m, _s, _r) =
-                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new(), None)
                     .await
                     .unwrap();
             let err = ctx
