@@ -24,8 +24,8 @@ The `add` action takes two completely different paths inside [add_device](../src
 | `id` + `cid` + `parent_id` + `key` (all four)| **Sub-device wins** — sub branch is checked first           | same as sub-device row; `key` is stored in config but unused      |
 | neither key nor (cid+parent_id)              | `BridgeError::InvalidRequest` — must have one or the other  | nothing                                                           |
 
-The split matters because **only direct devices appear in the unified listener
-stream** (see §2). Sub-devices are pure routing metadata — events arrive
+The split matters because **only direct devices appear in the device listener**
+(see §2). Sub-devices are pure routing metadata — events arrive
 addressed to the *parent's* device ID, and the bridge rewrites them using
 `cid_map`. If you accidentally provide `key` *and* `cid+parent_id`, the
 device registers as sub-only — the key won't open a connection.
@@ -122,18 +122,26 @@ spot it.
 load one from a buggy producer — `add_device` rejects `cid` without
 `parent_id`. If you see it, fix the config.
 
-Error codes shown for direct devices are inherited from
-[tinytuya](https://github.com/jasonacox/tinytuya) (rustuya keeps the
-same numbering for compatibility) and live in the `0` and `900..=914`
-range. The ones you'll most likely see in production:
+Error codes keep [tinytuya](https://github.com/jasonacox/tinytuya)'s numbering,
+which is also what rustuya 0.3 emitted — so consumers written against either are
+unaffected. The bridge publishes three of them, from
+[devices.rs](../src/devices.rs):
 
-| Code | Constant         | Meaning                                |
-| ---- | ---------------- | -------------------------------------- |
-| 901  | `ERR_CONNECT`    | Network error — couldn't reach device  |
-| 902  | `ERR_TIMEOUT`    | Device didn't respond within timeout   |
-| 905  | `ERR_OFFLINE`    | Device unreachable                     |
-| 906  | `ERR_STATE`      | Unknown state (e.g. listener lagged)   |
-| 914  | `ERR_KEY_OR_VER` | Wrong `key` or wrong protocol `version`|
+| Code | Meaning                                 | Published when                          |
+| ---- | --------------------------------------- | --------------------------------------- |
+| 0    | Connection Successful                   | the link comes up (**not** a fault)     |
+| 905  | Network Error: Device Unreachable       | the link goes down                      |
+| 914  | Check device key or version             | the device rejects our credentials      |
+
+The source changed in 0.4 and the values did not. 0.3 pushed these through the
+device event stream as synthetic frames; 0.4 keeps connection state off the frame
+stream entirely and exposes it as watches, so the bridge synthesises the same
+payloads from `Device::watch_connected()` / `watch_error()` (§2.1).
+
+`914` is new to the *event* path. In 0.3 it could only appear as the error return
+of a `request()` call, so a wrong local key stayed invisible until someone tried
+to command the device; now the misconfiguration is reported as soon as the device
+rejects us.
 
 `last_error_code` is **stored in memory only** — `#[serde(skip)]` in
 `DeviceConfig` ([config.rs](../src/config.rs), field `last_error_code`) means
@@ -142,135 +150,138 @@ it is not persisted to the state file. After a restart, every direct device look
 
 ---
 
-## 2. The unified listener: one stream, many devices
+## 2. The device listener: one loop, many devices
 
 ### 2.1 Architecture
 
 Tuya's local protocol gives each device its own long-lived TCP connection.
-Rustuya wraps each connection in an actor with its own background task
-(spawned eagerly inside `DeviceBuilder::build()` on rustuya's dedicated
-runtime), and exposes per-device events through a broadcast channel inside
-`DeviceInner`. The actor stays alive — performing reconnects, heartbeats,
-IP rediscovery — until *every* `Device` clone is dropped, at which point
-`DeviceInner::Drop` fires its `CancellationToken` and the task exits.
+rustuya 0.4 runs each one as an actor task over a pure state machine: the task
+owns only I/O (the socket, one timer, the RNG) and every protocol decision —
+handshake, backoff, heartbeat, idle-liveness — lives in the sans-I/O core. The
+task is spawned by `DeviceBuilder::connect()` and lives until its last `Device`
+handle is dropped.
 
-The bridge takes that per-device stream and multiplexes everything through
-a single `rustuya::device::unified_listener(Vec<Device>)`, which internally
-calls `device.listener()` on each device and merges via `select_all`:
+The bridge fans all of them into **one loop**, built from three keyed stream
+maps in [spawn_device_listener](../src/bridge.rs):
+
+| Map      | Carries                                    | Becomes                                    |
+| -------- | ------------------------------------------ | ------------------------------------------ |
+| `frames` | device pushes and command replies          | a device event (§3.3)                      |
+| `conns`  | connection state (`watch_connected`)       | a synthetic `errorCode` message (§1.4)     |
+| `auths`  | auth failures (`watch_error`)              | an `errorCode 914` message                 |
+
+The split is 0.4's doing and it is the right one: connection state is *state*,
+not an event, so it lives on a `watch` rather than in the frame stream. The
+bridge re-joins the two for MQTT, synthesising the same `errorCode` payloads 0.3
+published inline so nothing downstream had to change.
+
+Both watch maps subscribe with `WatchStream::from_changes`, which does **not**
+replay the value present at subscribe time. A device is never connected at the
+instant it is registered, so replaying would emit a spurious "offline" for every
+device at startup — a fleet-sized burst on the message topic.
+
+### 2.2 Deltas, not rebuilds
+
+0.3 tore the whole listener down and rebuilt it over the full fleet whenever any
+single device changed, because its `unified_listener` took a `Vec<Device>` by
+value with no way to add or remove one. 0.4 has no such constraint, so the
+bridge drives the listener with typed deltas instead:
 
 ```rust
-let mut stream = rustuya::device::unified_listener(instances.clone());
-loop {
-    tokio::select! {
-        () = cancel.cancelled() => return,
-        res = timeout(LISTENER_TIMEOUT_SECS, stream.next()) => { ... }
-        _ = refresh_rx.recv() => break,  // ← topology changed
-    }
+pub enum DeviceUpdate {
+    Up(String, Box<Device>),  // gained a connection, or had it rebuilt
+    Down(String),             // no longer has one
 }
 ```
 
-### 2.2 The refresh signal — why drop-and-rebuild?
+`add_device` / `remove_device` / `clear_devices` send these; the listener
+inserts or removes the three streams for that id and touches nothing else.
+A burst of adds costs one subscription each, not N full rebuilds.
 
-When devices are added or removed, [request_refresh](../src/bridge.rs)
-pokes a 1-capacity channel. The listener loop sees `refresh_rx.recv()`
-resolve, breaks the inner loop, drops the entire stream, re-reads
-`state.instances`, and starts a fresh `unified_listener`.
+**Why the delta carries the `Device` and not just the id.** Re-adding a device
+with a changed key, ip, or version builds a *new* connection under the *same*
+id. A reconcile-style listener (re-read `state.instances` and diff) would have
+to decide whether the id it already holds a subscription for is the same
+connection or a new one — and it cannot, because the old subscription does not
+end synchronously when the old actor is dropped. Carrying the handle removes the
+question: `StreamMap::insert` replaces, so the new streams simply take over.
 
-This is coarse because `unified_listener` is an immutable consumer — it
-takes the `Vec<Device>` by value and uses `select_all` internally with no
-public add/remove method. The only way to change the set is to drop the
-stream and build a new one.
+The channel is **unbounded**, deliberately. A dropped delta desynchronises the
+listener from the fleet — a device whose events are never published, or a dead
+subscription that never clears — and the traffic is bounded by operator actions,
+not by device chatter.
 
-**How does dropping the stream actually close TCP connections?** It's an
-Arc-refcount cascade:
+Corollary worth knowing: an `Up` sitting unconsumed in that queue holds a
+`Device` clone, and therefore pins the connection it announces. In practice the
+listener drains it immediately; it matters only if you write a test that builds a
+context without one.
 
-1. `Device` is `#[derive(Clone)]` and holds `inner: Arc<DeviceInner>`.
-   Every Device clone bumps the Arc.
-2. `device.listener()` captures *another* Device clone into the returned
-   `async_stream` future, so the stream itself holds one strong ref per
-   device.
-3. The bridge therefore has **two** strong refs per device while the
-   listener is alive: one in `state.instances`, one inside the listener
-   stream.
-4. On refresh: stream dropped → per-device async_stream futures dropped →
-   their captured Device clones dropped → -1 ref each.
-5. **But the TCP task survives** unless `state.instances` also lost its
-   reference. The bridge mutates `state.instances` in the calling action
-   (`add_device` insert/overwrite, `remove_device` remove) *before*
-   triggering refresh — so when refresh fires and the stream drops, the
-   final strong ref is gone, `DeviceInner::Drop` fires its
-   `cancel_token`, and the underlying TCP task exits cleanly.
+### 2.3 Lag is visible
 
-The rustuya library has an explicit regression test for this contract
-(`unified_listener_cycle_does_not_leak_inner_arcs`) that constructs and
-drops 100 `unified_listener`s in a row and asserts `Arc::strong_count`
-doesn't drift.
+0.4's per-device event bus is a bounded ring, so a slow consumer loses the oldest
+frames. That loss is **observable** — it arrives as `Event::Lagged(n)` rather
+than a silent skip — and the bridge logs it with the device id. At fleet scale
+it is the signal that the bridge is falling behind its devices, so treat it as a
+real alarm, not noise.
 
-Implication of the design — **a flood of distinct `add`/`remove` calls
-causes a flood of TCP reconnections**. Mitigations:
+### 2.4 The 300-second idle report
 
-- The 1-capacity `refresh_tx` channel coalesces bursts somewhat — if a
-  refresh is already queued, `try_send` is a no-op.
-- `add_device` skips the refresh entirely when re-adding a direct device
-  with identical `key`/`ip`/`version` (§1.2). Idempotent reapply is free.
-- `remove_device` skips the refresh when only sub-devices were removed —
-  subs aren't in `instances` so they don't appear in the listener.
-- Sub-device adds that don't change shape don't refresh either.
+[LISTENER_TIMEOUT_SECS](../src/bridge.rs) drives an interval that is **reset by
+any device traffic**, so the log line means "nothing at all arrived for five
+minutes", not "five minutes elapsed". It is a liveness *signal*, not a recovery
+mechanism: each device's own actor is already reconnecting underneath, and the
+bridge's loop is purely a consumer.
 
-So the worst case is scripted bulk *distinct* direct adds; everything
-else is cheap.
+### 2.5 Onboarding the fleet — the connect-storm cap
 
-### 2.3 The 300-second timeout
-
-[LISTENER_TIMEOUT_SECS](../src/bridge.rs) wraps `stream.next()` in a
-5-minute timeout. On expiry the bridge logs an `info!` and goes back to
-the `select!` — it does *not* rebuild the listener. So if all your
-devices fall silent for >5 minutes, you get a friendly log line, nothing
-else.
-
-Per-device reconnect, heartbeats, and IP rediscovery all live inside
-rustuya's `DeviceInner` actor — the bridge's listener loop is purely a
-consumer of the multiplexed broadcast. So the 300s timeout is a
-liveness *signal*, not a recovery mechanism: rustuya is already trying
-to reconnect underneath you regardless.
-
-### 2.4 Onboarding the fleet — the connect-storm cap
-
-Each `add` inserts a `Device` and pokes `request_refresh()` (a capacity-1
-channel, so a burst of adds coalesces into one rebuild). On refresh the
-listener rebuilds `unified_listener(instances)` over **all** devices —
-existing ones keep their live actor connection, only the new ones connect.
-So registering N devices at once fires up to N *simultaneous* connection
-establishments.
-
-That's a "connect storm": each handshake (TCP + crypto round-trips, plus
+Registering N devices at once fires up to N *simultaneous* connection
+establishments. That is a "connect storm": each handshake (TCP round trips, plus
 session-key negotiation on v3.4/3.5) is expensive, and a thousand at once
-saturate the runtime — meanwhile devices that connected early can miss
-their idle/heartbeat window and get dropped, feeding a reconnect storm
-that may never converge. The fix lives in rustuya: a global
-establishment-concurrency semaphore (permit acquired *before* connect,
-released the instant the handshake finishes — an idle connection is cheap
-and must not hold a permit, or fleets larger than the cap would deadlock).
+saturate the runtime — meanwhile devices that connected early miss their
+idle/heartbeat window and get dropped, feeding a reconnect storm that may never
+converge.
 
-The bridge opts in via `--connect-concurrency` (`CONNECT_CONCURRENCY`,
-default **128**; `0` = unbounded), wired once at startup with
-`rustuya::set_connect_concurrency`. The cap bounds only the *establishment*
-phase, so steady-state heartbeats for an already-connected fleet are
-unaffected. This caps the storm — it does not speed it up; a large slow
-fleet still onboards gradually, just without the thundering herd.
+The cap is a shared `ConnectLimiter` owned by [Fleet](../src/devices.rs) and
+handed to every device. A permit is taken before the dial and released the moment
+the device stops *establishing* — never held for the connection's lifetime, or a
+fleet larger than the cap would deadlock with the surplus devices never able to
+connect.
+
+Set it with `--connect-concurrency` (`CONNECT_CONCURRENCY`, default **128**;
+`0` = unbounded). It bounds only the establishment phase, so steady-state
+heartbeats for an already-connected fleet are unaffected, and it caps the storm
+rather than speeding it up — a large slow fleet still onboards gradually, just
+without the thundering herd.
+
+> One wrinkle from the warm restart (§4.11): devices that survive a restart keep
+> the limiter they were built with, so a changed `connect_concurrency` applies to
+> devices built *after* the restart.
 
 Fleet-scale is validated end to end at **1000 devices** (mock fleet): the whole
 fleet onboards and a single mass `clear` scavenges every retained snapshot with
 zero orphans, exercised in CI (`Python Test` →
 `python/tests/test_scavenger_scale.py`).
 
-### 2.5 Empty-instance idle
+### 2.6 Devices without an address
 
-If `state.instances` is empty (you only have sub-devices, or you cleared
-everything), the listener doesn't try to construct a stream at all (the
-empty-Vec early-return in `spawn_device_listener`) — it parks on `refresh_rx`
-and waits for someone to add a direct device. This is also the state right
-after `clear`.
+0.3 resolved an addressless device through a hidden process-global scanner behind
+the magic address `"Auto"`. 0.4 dropped that on purpose: there is no global
+scanner, and the only blocking alternative would stall registration for the
+length of a discovery timeout.
+
+So the bridge points an unlocated device at **192.0.2.1** — TEST-NET-1
+(RFC 5737), reserved for documentation and guaranteed never to be a real host —
+and links it to the shared `Discovery`. The dial fails, which makes the driver
+ask discovery for an active probe, and the device's answering announcement
+rewakes the actor with its real address.
+
+The placeholder is the *mechanism*, not a hack: it is the same path that
+self-corrects a device whose IP later changes, so "never located" and "moved" are
+one code path, and neither blocks an `add` from returning.
+
+Every device is linked to discovery, not just unlocated ones — a re-announcement
+also cancels a pending reconnect backoff, so a rebooted device comes back
+immediately instead of waiting out a backoff that may have grown to a minute.
 
 ---
 
@@ -859,11 +870,11 @@ broker, where the will never fires — is what the startup liveness probe
 > means a live incumbent never legitimately sees a foreign `session_id`.)
 >
 > **Recovery if it gets clobbered by accident.** The sentinel is re-published,
-> fresh (new `session_id`), on any clean start — so invoke `reconfigure`
-> (§4.11) to trigger a supervised restart and re-assert it. (If the overwrite
-> already made the bridge self-terminate, the supervisor's restart does the
-> same thing; `reconfigure` is the fix for the *clear* case, where the bridge is
-> still running but the topic is empty.)
+> fresh (new `session_id`), at the start of every cycle — so invoke `reconfigure`
+> (§4.11) to restart in place and re-assert it, at no cost to the fleet's
+> connections. (If the overwrite already made the bridge self-terminate, you need
+> a process restart instead; `reconfigure` is the fix for the *clear* case, where
+> the bridge is still running but the topic is empty.)
 
 ### 4.10 When the broker doesn't honor retain or LWT
 
@@ -884,13 +895,28 @@ scavenging — it can't detect a broker that drops retain. If you have
 broker after running for a while, your broker is probably stripping
 retain.
 
-### 4.11 `reconfigure` — applying template/retain changes without re-registering
+### 4.11 `reconfigure` — applying config changes on a running bridge
 
-The bridge reads its config only at startup, so changing the topic/payload
-templates or `mqtt_retain` requires a restart. A naive restart orphans the
-old-scheme retained snapshots on the broker (see §4.8 for the same hazard via
-the state file). [reconfigure](../src/bridge.rs) (action `reconfigure`) is the
-clean path:
+The bridge reads its config when a context is built, so changing the
+topic/payload templates or `mqtt_retain` means building a new one. A naive
+restart orphans the old-scheme retained snapshots on the broker (see §4.8 for the
+same hazard via the state file). [reconfigure](../src/bridge.rs) (action
+`reconfigure`) is the clean path.
+
+**It restarts in this process.** No `exec`, no supervisor. That is not a
+preference — the bridge also ships as a PyO3 extension, where re-executing the
+binary would take the host interpreter down with it. 0.3 could only exit and
+warn you if it couldn't find a supervisor to bring it back.
+
+**And the fleet stays connected.** The teardown moves the live device handles out
+instead of dropping them ([WarmState](../src/bridge.rs)), and the new context
+adopts them by id. Device configuration is orthogonal to bridge configuration —
+a `reconfigure` changes topics, never keys or addresses — so a carried-over
+connection is by construction still the right one. Without this, applying a
+topic change to a thousand-device fleet would cost a thousand reconnects, i.e.
+exactly the connect storm §2.5 exists to prevent.
+
+The sequence:
 
 0. **Skip-when-unchanged guard** — [scavenge_config_unchanged](../src/bridge.rs)
    re-reads the `--config` file and compares the *scavenge-relevant* fields
@@ -899,14 +925,13 @@ clean path:
    in-memory config. The broker counts because switching brokers orphans the
    old broker's retained; the purge runs against the old (in-memory) broker
    before the restart, so a broker change must not be skipped. If they match,
-   the retained topics won't move on restart,
-   so the purge (steps 1–2) is skipped entirely and `reconfigure` is a plain
-   clean restart — a casual `reconfigure` on an unchanged scheme won't blank
-   valid state. The guard errs toward purging: no config file, an
-   unreadable/unparseable file, a differing field, or a CLI/env override (which
-   makes the file value diverge from in-memory) all fall through to the purge.
-   This is the safe direction — a wrongly-skipped purge would orphan retained
-   permanently, whereas a needless purge just re-syncs after restart.
+   the retained topics won't move, so the purge (steps 1–2) is skipped entirely
+   and `reconfigure` is a plain restart — a casual `reconfigure` on an unchanged
+   scheme won't blank valid state. The guard errs toward purging: no config file,
+   an unreadable/unparseable file, a differing field, or a CLI/env override
+   (which makes the file value diverge from in-memory) all fall through to the
+   purge. This is the safe direction — a wrongly-skipped purge would orphan
+   retained permanently, whereas a needless purge just re-syncs.
 1. **Latch retain off** — sets `retain_suppressed` (an `AtomicBool` on
    `BridgeContext`). The outbound publish loop in `spawn_mqtt_task` ANDs every
    message's `retain` with `!retain_suppressed`, so from this instant no new
@@ -922,33 +947,45 @@ clean path:
    echoed back (empty payload). Unconditional — no per-device target matching,
    since a template migration clears everything anyway. Returns the count
    cleared (logged).
-3. **Exit** — fires `self.cancel.cancel()`, which the server `run()` loop selects
-   on and runs the normal graceful shutdown (`close()` → save state with
-   **device configs intact** → clear `bridge/config` → disconnect). A process
-   supervisor restarts the bridge into the edited config.
+3. **Restart** — sets `restart_requested`, then fires `self.cancel.cancel()`.
+   That token is the *cycle* token, a child of the process-lifetime shutdown
+   token, so it ends the cycle without stopping the process. `run()` tears the
+   cycle down (save state with **device configs intact** → clear `bridge/config`
+   → disconnect), re-layers the config, and brings a new context up with the
+   fleet's connections carried over.
 
 Key properties:
 
-- **Uses in-memory (old) templates**, never re-reads the config file — so editing
-  the config file *before* invoking is correct and necessary (the file change
-  only takes effect on the supervisor's restart). Triggering before editing
-  reloads the unchanged config.
-- **Always restarts.** No broker → warns, skips the purge, still exits. Retain
+- **Uses in-memory (old) templates for the purge**, then re-reads the file for
+  the new cycle — so editing the config file *before* invoking is correct and
+  necessary. Triggering before editing reloads the unchanged config.
+- **CLI/env still wins over the config file.** The restart replays the same
+  layering startup used, against the pristine CLI/env layer the server keeps for
+  exactly this purpose. A file edit cannot quietly override an explicit flag or
+  environment variable.
+- **Always restarts.** No broker → warns, skips the purge, still restarts. Retain
   off → warns (nothing the bridge published to clear), still purges any stale
-  retained and exits. This keeps "edit config → reconfigure" a single uniform
+  retained and restarts. This keeps "edit config → reconfigure" a single uniform
   habit rather than a conditional one.
-- **Supervisor-dependent.** `cancel` makes the process exit; a supervisor
-  (systemd `Restart=always`, Docker policy) must bring it back. `reconfigure`
-  logs whether one was detected via `INVOCATION_ID` / `JOURNAL_STREAM`.
+- **The duplicate-instance probe is skipped** on a restart (§7). It is the one
+  case where the retained sentinel found would be our own, and probing would
+  burn the full ghost-detection budget confirming nobody answers.
+- **Shutdown outranks restart.** An external `stop()` racing a `reconfigure`
+  shuts the bridge down rather than bringing it back.
 - **No new magic numbers** — the purge idle window reuses the existing
   `scavenger_timeout_secs` knob; bump it for large fleets on slow brokers.
-- `retain_suppressed` is never cleared — the process exits shortly after it's
-  set, and a fresh `BridgeContext` starts with it `false`.
-- **Transient gap in retained state.** Between latching retain off and the
-  restart re-seeding the cache (§4.5), the broker briefly holds no fresh
-  snapshot. Live deltas keep flowing throughout, and the seed phase rebuilds
-  the cache from whatever survived; to refresh immediately rather than wait for
-  the next device push, send `get` to your devices after the restart.
+- `retain_suppressed` is never cleared, and doesn't need to be: the restart
+  builds a fresh context whose own latch starts `false`.
+- **Transient gap in retained state.** Between latching retain off and the new
+  cycle re-seeding the cache (§4.5), the broker briefly holds no fresh snapshot.
+  Live deltas keep flowing throughout, and the seed phase rebuilds the cache from
+  whatever survived; to refresh immediately rather than wait for the next device
+  push, send `get` to your devices afterwards.
+- **What still needs a full restart:** nothing in the config — a warm restart
+  rebuilds the context, so the broker, client id, state file, and the
+  `mqtt_retain` mode flip are all applied. The only thing that survives it by
+  design is the device connections themselves, and with them the
+  `connect_concurrency` cap they were built under (§2.5).
 
 ---
 
@@ -960,7 +997,7 @@ payload. The bridge bridges this by maintaining a `cid_map`.
 
 ### 5.1 Inbound: event with CID
 
-When the unified listener emits an event for a registered direct device,
+When the device listener emits an event for a registered direct device,
 [resolve_event_target](../src/bridge.rs) looks for `cid` in two
 places:
 

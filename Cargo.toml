@@ -11,7 +11,11 @@ default-members = ["."]
 # and the pyrustuyabridge wheel via `version.workspace = true`. The PyPI
 # package follows automatically (pyproject `dynamic = ["version"]` → maturin).
 [workspace.package]
-version = "0.3.0"
+# `-dev` while the 0.4 line is unreleasable: it depends on `rustuya-tokio` from
+# git (the 0.4 crates aren't published yet), so there is nothing to tag. Mirrors
+# the upstream `0.4.0-dev`. Drop the suffix once the dependency is a crates.io
+# version or a pinned `rev`.
+version = "0.4.0-dev"
 
 [package]
 name = "rustuyabridge"

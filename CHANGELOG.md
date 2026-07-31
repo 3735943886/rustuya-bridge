@@ -5,7 +5,98 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — 0.4.0-dev
+
+The 0.4 line. Two themes: the device layer moves to rustuya 0.4 (the sans-I/O
+`rustuya-core` FSM plus the `rustuya-tokio` driver), and a config change stops
+requiring an operator to restart the process.
+
+> **Not releasable yet.** `rustuya-tokio` is taken from git — the 0.4 crates are
+> unpublished — and `Cargo.lock` is gitignored here, so the dependency should
+> become a pinned `rev` (or a crates.io version) before this is tagged.
+
+### Added
+- **In-place restart.** `reconfigure` restarts the bridge *inside its own
+  process* instead of exiting and hoping something restarts it. `run()` is now a
+  loop over cycles, each owning a context on a per-cycle token that is a child of
+  the process-lifetime shutdown token — so a config change ends a cycle without
+  touching the token an embedder holds, while an external `stop()` still
+  propagates down. When both happen at once, shutdown wins. This has to be
+  in-process rather than an `exec`: the bridge also ships as a PyO3 extension,
+  where re-executing the binary would take the host interpreter with it.
+- **A config change no longer disconnects the fleet.** The restart hands the live
+  device connections to the next cycle rather than rebuilding them, so applying a
+  topic or retain change to a thousand devices costs zero reconnects. Device
+  configuration is orthogonal to bridge configuration — a `reconfigure` changes
+  topics, never keys or addresses — so a carried-over connection is by
+  construction still the right one. This covers strictly more than per-field hot
+  reloading could: the `mqtt_retain` mode flip reshapes the cache and re-runs the
+  seed phase, and a broker change opens a new connection.
+- **`--scan-window-secs` / `SCAN_WINDOW_SECS`** (default 18) bounds how long a
+  `scan` collects results. rustuya 0.4 deliberately has no library-side scan
+  cadence, so the choice is the bridge's; the default is tinytuya's `SCANTIME`,
+  the reference scanner users compare against.
+- **`errorCode 914` (wrong key or version) is now reported proactively.** In 0.3
+  it could only surface as the error return of a `request()` call, so a
+  misconfigured device stayed silent until someone tried to command it.
+- **Bus lag is logged.** rustuya 0.4 surfaces a slow-consumer gap as an
+  observable event rather than a silent drop; at fleet scale it is the signal
+  that the bridge is falling behind its devices.
+
+### Changed
+- **BREAKING (MQTT): `set`/`get`/`request` are fire-and-forget.** The Tuya LAN
+  protocol carries no request/response token, so nothing can correlate a reply to
+  a request; 0.3 treated the next frame as "the" reply and 0.4 drops the
+  pretence. An `ok` now means *accepted* — the command reached a connected device
+  — not *applied*. The resulting state change arrives on the event topic as it
+  always did, and an `error` still means the device was not reachable.
+- **The device listener is delta-driven.** 0.3 tore down and rebuilt a
+  `unified_listener` over the whole fleet whenever any single device changed;
+  now three keyed stream maps are updated by typed `DeviceUpdate` deltas. The
+  delta carries the `Device` handle rather than an id to look back up, which is
+  what makes instance replacement race-free.
+- **Connection state is synthesised from watches, not read off the frame
+  stream.** 0.4 treats it as state rather than an event. The published payloads
+  are unchanged (`0` connected / `905` offline), so MQTT consumers are
+  unaffected. Registering a fleet no longer emits a fleet-sized burst of
+  spurious "offline" — the watches subscribe with `from_changes`.
+- **`scan` is a window on the bridge's shared discovery** rather than a scanner
+  spun up per request, so devices already known passively are reported
+  immediately.
+- **Devices without an `ip` no longer block registration.** They dial TEST-NET-1
+  (RFC 5737, never a real host) with discovery linked; the failed dial elicits an
+  active probe and the answering announcement rewakes the actor with the real
+  address. That is the same path that self-corrects a device whose IP later
+  changes, so "never located" and "moved" are one mechanism.
+- **The connect-storm cap is an object, not a global.** 0.3's
+  `set_connect_concurrency` became a shared `ConnectLimiter`. Same
+  `--connect-concurrency` knob and default (128); it now applies to devices built
+  after a restart rather than to ones that survived it.
+- **`install_panic_logging` / `maximize_fd_limit` moved into the bridge.** They
+  were rustuya functions; setting a process's panic hook and rlimits is the
+  application's call, not a library's.
+- **`BridgeServer` takes the CLI/env layer and applies the config file itself**,
+  once per cycle. A restart has to replay the layering to pick up a file edit —
+  merging a file into an already-merged config cannot work, since `merge` fills
+  only `None` fields. This also settles the precedence question a restart raises:
+  CLI/env keeps winning over the file, exactly as at startup.
+- **The duplicate-instance probe runs on startup only.** A restart is the one
+  case where the retained sentinel found is guaranteed to be our own.
+
+### Fixed
+- **Upstream: a device linked to `Discovery` never died.** The route registry
+  that makes the reconnect fast-path O(1) held a *strong* sender to each device's
+  actor, which kept the actor's receiver open forever — so dropping every
+  `Device` handle never stopped the driver task, and since the route is only
+  pruned when the channel closes, nothing ever removed it either. A `clear` of a
+  thousand-device fleet left a thousand actors reconnecting to devices the
+  operator had just deregistered. Fixed upstream by storing a `WeakSender`.
+
+### Removed
+- **The supervisor requirement for applying config.** `reconfigure` no longer
+  exits, so the `INVOCATION_ID`/`JOURNAL_STREAM` supervisor detection and its
+  warning are gone. A supervisor is still worth running for boot and crash
+  recovery — just not to change a topic.
 
 ## [0.3.0] — 2026-07-02
 

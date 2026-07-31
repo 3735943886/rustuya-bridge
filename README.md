@@ -52,7 +52,9 @@ tar -xzf rustuya-bridge-<target>.tar.gz
 
 For long-running deployments, run the binary under a process supervisor such
 as **systemd** (Linux), **launchd** (macOS), or **supervisord** so that the
-bridge restarts automatically on crash and starts at boot.
+bridge starts at boot and comes back after a crash. Applying a config change
+does *not* need one — `reconfigure` restarts the bridge inside its own process
+(see below).
 
 #### One-line install (Linux + systemd)
 [`scripts/bridgectl.sh`](scripts/bridgectl.sh) installs the latest release,
@@ -155,6 +157,7 @@ The bridge can be configured via command-line arguments or environment variables
 | `--save-debounce-secs`| `SAVE_DEBOUNCE_SECS` | `30` | Seconds to wait before saving state file (debounce) |
 | `--scavenger-timeout-secs`| `SCAVENGER_TIMEOUT_SECS` | `1` | Seconds the retain scavenger waits for retained MQTT messages before exiting after `remove`/`clear`. Raise on slow brokers. |
 | `--connect-concurrency`| `CONNECT_CONCURRENCY` | `128` | Max devices establishing a connection concurrently (handshake cap). Bounds the onboarding "connect storm" when a large fleet is added at once — once connected a device is cheap, so only the establishment phase is capped. `0` disables the cap (unbounded). |
+| `--scan-window-secs`| `SCAN_WINDOW_SECS` | `18` | Seconds a `scan` collects discovered devices before publishing its end-of-scan marker. Devices already known from passive announcements are reported immediately, so this only bounds the wait for ones that have to answer the active probe. The default matches tinytuya's `SCANTIME`. |
 | `--log-level`, `-l` | `LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 
 > Six topic / template / retain settings have **no CLI flag or env var** — they are config-file-only. See [Topic / template settings](#topic--template-settings) below.
@@ -413,17 +416,19 @@ mosquitto_pub -h localhost -t "rustuya/command" \
 ```
 
 It stops retaining new publishes (live events keep flowing), clears the
-old-scheme retained messages, then exits; a process supervisor (systemd
-`Restart=always`, Docker restart policy) restarts it into the edited config
-with device registrations preserved. More generally, *edit config →
-reconfigure* is the uniform "apply a config change" path. The full mechanics —
-the skip-when-unchanged guard, broker-change handling, and retain-off behavior
-— are in
-[internals §4.11](docs/internals.md#411-reconfigure--applying-templateretain-changes-without-re-registering).
+old-scheme retained messages, and **restarts itself in place** into the edited
+config — no process exit and no supervisor involved. Device registrations are
+preserved, and so are the devices' live connections: applying a config change to
+a large fleet costs no reconnects. More generally, *edit config → reconfigure* is
+the uniform "apply a config change" path, and it now covers every setting,
+including the broker and the `mqtt_retain` mode. The full mechanics — the
+skip-when-unchanged guard, broker-change handling, and retain-off behavior — are
+in
+[internals §4.11](docs/internals.md#411-reconfigure--applying-config-changes-on-a-running-bridge).
 
 ## Further Reading
 
 [`docs/internals.md`](docs/internals.md) — deep dive on internals: device
-lifecycle, unified listener, template engine, retain scavenger, sub-device
+lifecycle, device listener, template engine, retain scavenger, sub-device
 routing, MQTT reconnection, state persistence, and operator tips. For
 advanced users only; not needed to use the bridge.
