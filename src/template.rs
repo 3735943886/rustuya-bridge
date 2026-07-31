@@ -16,9 +16,7 @@ use std::collections::HashMap;
 /// under [`compile_topic_regex`]). The set is shared with
 /// [`crate::payload`] which extends it with payload-only vars (`value`,
 /// `dps`, `timestamp`, `root`) for its reverse-parse regex.
-pub const TOPIC_VARS: &[&str] = &[
-    "id", "name", "dp", "action", "cid", "type", "level",
-];
+pub const TOPIC_VARS: &[&str] = &["id", "name", "dp", "action", "cid", "type", "level"];
 
 /// Renders a `{key}` template by calling `substitute(key, out)` for each
 /// placeholder. The closure should either push a value onto `out` and

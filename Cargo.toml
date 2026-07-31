@@ -29,10 +29,20 @@ clap = { version = "4.5", features = ["derive", "env"] }
 env_logger = "0.11"
 futures-util = "0.3"
 log = "0.4"
-rustuya = { version = "0.3.0" }
+# 0.4 is the sans-I/O redesign: a `rustuya-core` FSM plus the `rustuya-tokio`
+# driver, living on the `0.4-sansio` branch. Neither crate is published yet, so
+# the dependency is taken straight from git; Cargo.lock pins the exact rev, and
+# this should become a `rev = "..."` (or a crates.io version) before release.
+rustuya-tokio = { git = "https://github.com/3735943886/rustuya", branch = "feat/bridge-driver-hooks" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
+# StreamMap/WatchStream: the device listener fans every device's frame stream and
+# connection-state watch into one loop with no task per device.
+tokio-stream = { version = "0.1", features = ["sync"] }
+# Raises the process fd limit (one socket per device). 0.3 did this inside the
+# library; setting a process rlimit is the application's call, so it lives here now.
+rlimit = "0.10"
 rumqttc = { version = "0.25", features = ["use-rustls"] }
 bytes = "1.0"
 regex = "1.11"

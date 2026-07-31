@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use log::{debug, error, info, trace, warn};
 use regex::Regex;
-use rustuya::{Device, DeviceBuilder};
+use rustuya_tokio::{CoreError, Device, Event, Listener};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -11,15 +11,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
+use tokio_stream::StreamMap;
+use tokio_stream::wrappers::WatchStream;
 
 use crate::config::{Cli, DeviceConfig, load_state};
+use crate::devices::{Fleet, code, connection_event};
 use crate::dps_cache::DpsCache;
 use crate::error::BridgeError;
 use crate::template::{compile_topic_regex, match_topic, render_template, tpl_to_wildcard};
 use crate::types::{ApiResponse, BridgeRequest};
 use std::collections::BTreeSet;
-use std::sync::atomic::AtomicBool;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
 
 // Sized to absorb a whole-fleet operation burst without shedding. A
 // name-addressed `set` (or cascade) to N devices makes every one of them ack
@@ -49,6 +52,25 @@ pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
 pub const LISTENER_TIMEOUT_SECS: u64 = 300;
 pub const REQUEST_TIMEOUT_SECS: u64 = 15;
+
+/// A change to the set of live device connections, handed to the listener task.
+///
+/// The listener is **delta-driven**, not reconcile-driven: `Up` carries the
+/// `Device` handle itself rather than an id to look back up. That is what makes
+/// an instance *replacement* (a key, ip, or version change rebuilds the
+/// connection under the same id) race-free — a reconcile would have to decide
+/// whether the id it already holds a subscription for is the same connection or
+/// a new one, and the old subscription does not end synchronously when the old
+/// actor is dropped.
+#[derive(Debug)]
+pub enum DeviceUpdate {
+    /// A device gained a connection, or had it rebuilt. Subscribing again under
+    /// the same id replaces the previous subscription.
+    Up(String, Box<Device>),
+    /// A device no longer has a connection — removed, or converted into a
+    /// sub-device (which is pure routing metadata and never holds one).
+    Down(String),
+}
 
 fn unix_millis() -> u128 {
     std::time::SystemTime::now()
@@ -124,7 +146,15 @@ pub struct BridgeContext {
     pub save_debounce_secs: u64,
     pub state: RwLock<BridgeState>,
     pub save_tx: mpsc::Sender<()>,
-    pub refresh_tx: mpsc::Sender<()>,
+    /// Device connection deltas to the listener task. Unbounded on purpose: a
+    /// dropped delta would silently desynchronise the listener from the fleet
+    /// (a device whose events never get published, or a dead subscription that
+    /// never clears), and the traffic is bounded by operator actions, not by
+    /// device chatter.
+    pub refresh_tx: mpsc::UnboundedSender<DeviceUpdate>,
+    /// Shared device machinery: the LAN discovery every device re-locates
+    /// through, and the connect-storm cap.
+    pub fleet: Fleet,
     pub scavenger_tx:
         Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<crate::types::ScavengerTarget>>>>>,
     /// Count of MQTT messages dropped because the outbound channel stayed
@@ -319,6 +349,23 @@ fn validate_topic_template(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Subscribes one device's three streams into the listener's maps.
+///
+/// `StreamMap::insert` replaces any existing entry, so re-subscribing an id whose
+/// connection was rebuilt swaps in the new streams and drops the old ones — the
+/// single place instance replacement is handled.
+fn subscribe(
+    frames: &mut StreamMap<String, Listener>,
+    conns: &mut StreamMap<String, WatchStream<bool>>,
+    auths: &mut StreamMap<String, WatchStream<Option<CoreError>>>,
+    id: String,
+    dev: &Device,
+) {
+    frames.insert(id.clone(), dev.listener());
+    conns.insert(id.clone(), WatchStream::from_changes(dev.watch_connected()));
+    auths.insert(id, WatchStream::from_changes(dev.watch_error()));
+}
+
 impl BridgeContext {
     /// Constructs a new bridge context. Verifies write permission to the state
     /// file, then loads existing device configs and prepares background channels.
@@ -337,7 +384,7 @@ impl BridgeContext {
         Arc<Self>,
         mpsc::Receiver<Option<MqttMessage>>,
         mpsc::Receiver<()>,
-        mpsc::Receiver<()>,
+        mpsc::UnboundedReceiver<DeviceUpdate>,
     )> {
         verify_write_permission(cli.state_file()).await?;
 
@@ -350,6 +397,8 @@ impl BridgeContext {
         let (_, mqtt_event_topic) = cli.mqtt_topics();
         let initial_configs = load_state(cli.state_file()).await;
 
+        let fleet = Fleet::new(cli.connect_concurrency());
+
         let mut initial_instances = HashMap::new();
         let mut initial_name_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut initial_cid_map = HashMap::new();
@@ -359,18 +408,18 @@ impl BridgeContext {
                 && let Some(parent_id) = &cfg.parent_id
             {
                 initial_cid_map.insert((parent_id.clone(), cid.clone()), id.clone());
-            } else if let Some(key) = &cfg.key {
-                let dev = DeviceBuilder::new(id, key.as_bytes().to_vec())
-                    .address(cfg.ip.as_deref().unwrap_or("Auto"))
-                    .version(
-                        cfg.version
-                            .as_deref()
-                            .and_then(|s| s.parse::<rustuya::Version>().ok())
-                            .unwrap_or_default(),
-                    )
-                    .nowait(true)
-                    .build();
-                initial_instances.insert(id.clone(), dev);
+            } else if cfg.key.is_some() {
+                // A device that fails to build is a *config* problem (bad key
+                // length, unknown version) that survived into the state file.
+                // Log it and carry on rather than refusing to start: the rest of
+                // the fleet is fine, and the operator can fix the entry with a
+                // fresh `add`.
+                match fleet.device_for(cfg) {
+                    Ok(dev) => {
+                        initial_instances.insert(id.clone(), dev);
+                    }
+                    Err(e) => error!("Device {id} could not be connected: {e}"),
+                }
             } else {
                 error!("Device {id} is invalid: missing key or parent info");
             }
@@ -385,7 +434,7 @@ impl BridgeContext {
 
         let (mqtt_tx_sender, mqtt_tx_receiver) = mpsc::channel(MQTT_CHANNEL_CAPACITY);
         let (save_tx, save_rx) = mpsc::channel(1);
-        let (refresh_tx, refresh_rx) = mpsc::channel(1);
+        let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
 
         let payload_tpl = cli
             .mqtt_payload_template
@@ -490,6 +539,7 @@ impl BridgeContext {
             }),
             save_tx,
             refresh_tx,
+            fleet,
             scavenger_tx: Arc::new(tokio::sync::Mutex::new(None)),
             mqtt_drop_count: AtomicU64::new(0),
             cancel,
@@ -537,54 +587,122 @@ impl BridgeContext {
         })
     }
 
-    /// Starts device event listener task
+    /// Starts the device event listener: one task fanning **every** device's
+    /// frame stream and connection state into a single loop.
+    ///
+    /// Three keyed stream maps, all driven by [`DeviceUpdate`] deltas rather than
+    /// rebuilt on change (0.3 tore down and re-created a `unified_listener` over
+    /// the whole fleet whenever any one device changed):
+    ///
+    /// * `frames` — device pushes and command replies, the actual device data.
+    /// * `conns` — connection state. rustuya 0.4 keeps this **off** the frame
+    ///   stream (it is state, not an event), so the bridge synthesises the
+    ///   `errorCode` messages 0.3 published inline. See [`connection_event`].
+    /// * `auths` — authentication failures, i.e. a wrong local key or version.
+    ///
+    /// Both watch maps use [`WatchStream::from_changes`], which does *not*
+    /// replay the value present at subscribe time. That matters: a device is
+    /// never connected at the instant it is registered, so replaying would emit
+    /// a spurious "offline" for every device at startup — a fleet-sized burst on
+    /// the message topic that 0.3 never produced.
     pub fn spawn_device_listener(
         self: Arc<Self>,
-        mut refresh_rx: mpsc::Receiver<()>,
+        mut refresh_rx: mpsc::UnboundedReceiver<DeviceUpdate>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let mut frames: StreamMap<String, Listener> = StreamMap::new();
+            let mut conns: StreamMap<String, WatchStream<bool>> = StreamMap::new();
+            let mut auths: StreamMap<String, WatchStream<Option<CoreError>>> = StreamMap::new();
+
+            // Seed from the devices built at startup; every later change arrives
+            // as a delta. Safe to do once here — the listener starts before the
+            // MQTT task, so no command can register a device in between.
+            for (id, dev) in {
+                let state = self.state.read().await;
+                state
+                    .instances
+                    .iter()
+                    .map(|(id, dev)| (id.clone(), dev.clone()))
+                    .collect::<Vec<_>>()
+            } {
+                subscribe(&mut frames, &mut conns, &mut auths, id, &dev);
+            }
+            debug!("Device listener watching {} device(s)", frames.len());
+
+            let mut idle = tokio::time::interval(Duration::from_secs(LISTENER_TIMEOUT_SECS));
+            idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            idle.tick().await; // the first tick is immediate; skip it
+
             loop {
-                let instances = {
-                    let state = self.state.read().await;
-                    state.instances.values().cloned().collect::<Vec<_>>()
-                };
+                tokio::select! {
+                    () = cancel.cancelled() => return,
 
-                if instances.is_empty() {
-                    tokio::select! {
-                        () = cancel.cancelled() => return,
-                        res = refresh_rx.recv() => {
-                            if res.is_none() { return; }
-                            continue;
+                    update = refresh_rx.recv() => match update {
+                        Some(DeviceUpdate::Up(id, dev)) => {
+                            subscribe(&mut frames, &mut conns, &mut auths, id, &dev);
                         }
-                    }
-                }
+                        Some(DeviceUpdate::Down(id)) => {
+                            frames.remove(&id);
+                            conns.remove(&id);
+                            auths.remove(&id);
+                        }
+                        // Every sender dropped: the context is going away.
+                        None => return,
+                    },
 
-                let mut stream = rustuya::device::unified_listener(instances.clone());
-                debug!("Started unified listener for {} devices", instances.len());
-                loop {
-                    tokio::select! {
-                        () = cancel.cancelled() => return,
-                        res = tokio::time::timeout(Duration::from_secs(LISTENER_TIMEOUT_SECS), stream.next()) => {
-                            match res {
-                                Ok(Some(Ok(event))) => {
-                                    let Some(payload_str) = event.message.payload_as_string() else {
-                                        warn!("Non-UTF8 payload from {}", event.device_id);
-                                        continue;
-                                    };
-                                    self.handle_device_event(&event.device_id, payload_str).await;
-                                }
-                                Ok(Some(Err(_))) => {}
-                                Ok(None) => {
-                                    warn!("Device listener stream ended");
-                                    break;
-                                }
-                                Err(_) => {
-                                    info!("Device listener timeout after {LISTENER_TIMEOUT_SECS}s (no events received)");
-                                }
+                    // Guarded because an empty `StreamMap` completes immediately
+                    // rather than parking — an unguarded arm would spin the loop
+                    // whenever no devices are registered.
+                    Some((id, event)) = frames.next(), if !frames.is_empty() => {
+                        // Any device traffic pushes the idle report out — the
+                        // tick below is a "nothing at all is arriving" alarm,
+                        // not a periodic heartbeat.
+                        idle.reset();
+                        match event {
+                        Event::Frame(msg) => {
+                            // Bare acks carry no payload and say nothing a
+                            // consumer can act on; forwarding them would publish
+                            // empty events.
+                            if msg.payload.is_empty() {
+                                continue;
+                            }
+                            match String::from_utf8(msg.payload) {
+                                Ok(payload) => self.handle_device_event(&id, payload).await,
+                                Err(_) => warn!("Non-UTF8 payload from {id}"),
                             }
                         }
-                        _ = refresh_rx.recv() => break, // Refresh listener on device changes
+                        // The device's event bus is bounded; a slow consumer
+                        // loses the oldest frames. 0.4 makes that observable
+                        // instead of silent, so say so — at fleet scale it is
+                        // the signal that the bridge is falling behind.
+                        Event::Lagged(n) => {
+                            warn!("Device listener fell behind: dropped {n} frame(s) from {id}");
+                        }
+                    }},
+
+                    Some((id, connected)) = conns.next(), if !conns.is_empty() => {
+                        idle.reset();
+                        let code = if connected { code::SUCCESS } else { code::OFFLINE };
+                        self.handle_device_event(&id, connection_event(code).to_string()).await;
+                    }
+
+                    Some((id, err)) = auths.next(), if !auths.is_empty() => {
+                        if let Some(e) = err {
+                            warn!("Device {id} rejected our credentials ({e})");
+                            self.handle_device_event(
+                                &id,
+                                connection_event(code::KEY_OR_VER).to_string(),
+                            )
+                            .await;
+                        }
+                    }
+
+                    _ = idle.tick() => {
+                        info!(
+                            "Device listener idle for {LISTENER_TIMEOUT_SECS}s ({} device(s) watched)",
+                            frames.len()
+                        );
                     }
                 }
             }
@@ -599,13 +717,11 @@ impl BridgeContext {
         trace!("Raw event from {device_id}: {payload_str}");
         let payload: Value = serde_json::from_str(&payload_str)
             .unwrap_or_else(|_| Value::String(payload_str.clone()));
-        let (target_id, name, cid, exists) =
-            self.resolve_event_target(device_id, &payload).await;
+        let (target_id, name, cid, exists) = self.resolve_event_target(device_id, &payload).await;
         let payload_obj = payload.as_object();
 
         // Error path: log, persist last_error_code, publish as message.
-        if payload_obj.is_some_and(|o| o.contains_key("errorCode") || o.contains_key("errorMsg"))
-        {
+        if payload_obj.is_some_and(|o| o.contains_key("errorCode") || o.contains_key("errorMsg")) {
             if let Some(n) = name.as_ref() {
                 info!("Device {target_id} ({n}) reported error: {payload}");
             } else {
@@ -1320,9 +1436,16 @@ impl BridgeContext {
         let _ = self.save_tx.try_send(());
     }
 
-    /// Triggers a refresh of the device listener
-    pub fn request_refresh(&self) {
-        let _ = self.refresh_tx.try_send(());
+    /// Tells the listener a device gained (or rebuilt) its connection.
+    pub fn device_up(&self, id: &str, dev: &Device) {
+        let _ = self
+            .refresh_tx
+            .send(DeviceUpdate::Up(id.to_string(), Box::new(dev.clone())));
+    }
+
+    /// Tells the listener a device no longer has a connection.
+    pub fn device_down(&self, id: &str) {
+        let _ = self.refresh_tx.send(DeviceUpdate::Down(id.to_string()));
     }
 
     /// Finds device IDs by ID or Name (ID has priority)
@@ -1516,7 +1639,9 @@ impl BridgeContext {
 
         // cache-mode cache route: merge then publish snapshot (gated by seed_done).
         let Some(cache) = &self.cache else { return };
-        let Some(dps_obj) = dps.as_object() else { return };
+        let Some(dps_obj) = dps.as_object() else {
+            return;
+        };
         let changed = cache.merge(&id, dps_obj);
         if changed.is_empty() {
             return;
@@ -1599,7 +1724,9 @@ impl BridgeContext {
         only_keys: Option<&[String]>,
     ) {
         let Some(cache) = &self.cache else { return };
-        let Some(full_snap) = cache.snapshot(id) else { return };
+        let Some(full_snap) = cache.snapshot(id) else {
+            return;
+        };
 
         let event_tpl = &self.mqtt_event_topic;
         let is_single_dp = event_tpl.contains("{dp}") || event_tpl.contains("{value}");
@@ -1661,10 +1788,7 @@ impl BridgeContext {
             // `IdentifierSet` retain gate (unlike `event_topic`, which is
             // gated in `publish_device_event`).
             if !payload.is_object() {
-                let inner = std::mem::replace(
-                    &mut payload,
-                    Value::Object(serde_json::Map::new()),
-                );
+                let inner = std::mem::replace(&mut payload, Value::Object(serde_json::Map::new()));
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("payload".to_string(), inner);
                 }
@@ -1843,7 +1967,10 @@ impl BridgeContext {
                 Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)))) => acked += 1,
                 Ok(Ok(_)) => {}
                 other => {
-                    debug!("clear_and_flush stop after {acked}/{} acked: {other:?}", topics.len());
+                    debug!(
+                        "clear_and_flush stop after {acked}/{} acked: {other:?}",
+                        topics.len()
+                    );
                     break; // connection error or stall
                 }
             }
@@ -2027,8 +2154,14 @@ impl BridgeContext {
                         let payload = String::from_utf8_lossy(payload);
                         matched = active_targets.iter().any(|t| {
                             let id_match = payload.contains(&format!("\"{}\"", t.id));
-                            let cid_match = t.cid.as_ref().is_some_and(|cid| payload.contains(&format!("\"{cid}\"")));
-                            let name_match = t.name.as_ref().is_some_and(|name| payload.contains(&format!("\"{name}\"")));
+                            let cid_match = t
+                                .cid
+                                .as_ref()
+                                .is_some_and(|cid| payload.contains(&format!("\"{cid}\"")));
+                            let name_match = t
+                                .name
+                                .as_ref()
+                                .is_some_and(|name| payload.contains(&format!("\"{name}\"")));
                             id_match || cid_match || name_match
                         });
                     }
@@ -2145,10 +2278,10 @@ impl BridgeContext {
         let id = cfg.id.clone();
         let name = cfg.name.clone();
 
-        // Tracks whether the listener needs to be rebuilt. Direct-device
-        // additions/removals/key changes flip it; pure metadata changes
-        // (name, sub-device cid_map) do not.
-        let mut listener_changed = false;
+        // The delta to hand the listener, if this add changes the set of live
+        // connections. A pure metadata change (a rename, a sub-device's cid_map
+        // entry) produces none.
+        let mut update: Option<DeviceUpdate> = None;
 
         {
             let mut state = self.state.write().await;
@@ -2164,6 +2297,35 @@ impl BridgeContext {
                     c.version.clone(),
                 )
             });
+
+            // Resolve what this add produces *before* mutating anything, so a
+            // rejected config — no key, a key that isn't 16 bytes, an unknown
+            // protocol version — leaves the registry exactly as it was. The
+            // connection is spawned here too, and only here: `device_for` is
+            // fallible and starts an actor, so it must run exactly once and
+            // before the first mutation.
+            let is_sub = cfg.cid.is_some() && cfg.parent_id.is_some();
+            // `None` for a direct device means "keep the connection you have".
+            let mut fresh: Option<Device> = None;
+            if !is_sub {
+                let Some(key) = cfg.key.as_deref() else {
+                    return Err(BridgeError::InvalidRequest(
+                        "Device must have either (cid & parent_id) for sub-device or (key) for direct device"
+                            .to_string(),
+                    ));
+                };
+                let unchanged = matches!(
+                    &old_direct,
+                    Some((false, Some(old_key), old_ip, old_ver))
+                        if old_key == key
+                            && old_ip == &cfg.ip
+                            && old_ver == &cfg.version
+                            && state.instances.contains_key(&id)
+                );
+                if !unchanged {
+                    fresh = Some(self.fleet.device_for(&cfg)?);
+                }
+            }
 
             // Clean up old mappings if device already exists
             let old_mapping = state
@@ -2190,46 +2352,21 @@ impl BridgeContext {
             if let Some(cid) = &cfg.cid
                 && let Some(parent_id) = &cfg.parent_id
             {
-                // Register as sub-device. If the old shape was a direct device,
-                // the listener loses an instance and must refresh.
+                // Register as sub-device: routing metadata only, no connection.
+                // If it *was* a direct device, the listener loses that stream.
                 if old_direct.as_ref().is_some_and(|(was_sub, ..)| !was_sub) {
-                    listener_changed = true;
+                    update = Some(DeviceUpdate::Down(id.clone()));
                 }
                 state
                     .cid_map
                     .insert((parent_id.clone(), cid.clone()), id.clone());
                 state.instances.remove(&id);
-            } else if let Some(key) = &cfg.key {
-                // Register as direct device. Rebuild the Device only when key,
-                // ip, version, or shape changed; otherwise keep the existing
-                // connection and avoid the listener refresh.
-                let unchanged = matches!(
-                    &old_direct,
-                    Some((false, Some(old_key), old_ip, old_ver))
-                        if old_key == key
-                            && old_ip == &cfg.ip
-                            && old_ver == &cfg.version
-                            && state.instances.contains_key(&id)
-                );
-                if !unchanged {
-                    let dev = DeviceBuilder::new(&id, key.as_bytes().to_vec())
-                        .address(cfg.ip.as_deref().unwrap_or("Auto"))
-                        .version(
-                            cfg.version
-                                .as_deref()
-                                .and_then(|s| s.parse::<rustuya::Version>().ok())
-                                .unwrap_or_default(),
-                        )
-                        .nowait(true)
-                        .build();
-                    state.instances.insert(id.clone(), dev);
-                    listener_changed = true;
-                }
-            } else {
-                return Err(BridgeError::InvalidRequest(
-                    "Device must have either (cid & parent_id) for sub-device or (key) for direct device"
-                        .to_string(),
-                ));
+            } else if let Some(dev) = fresh {
+                // Register as direct device. Inserting under an existing id drops
+                // the previous handle, which shuts its actor down; the listener
+                // swaps the subscription when it sees this `Up`.
+                update = Some(DeviceUpdate::Up(id.clone(), Box::new(dev.clone())));
+                state.instances.insert(id.clone(), dev);
             }
 
             state.configs.insert(id.clone(), cfg);
@@ -2240,8 +2377,8 @@ impl BridgeContext {
 
         info!("Device registered/updated: {id}");
         self.request_save();
-        if listener_changed {
-            self.request_refresh();
+        if let Some(update) = update {
+            let _ = self.refresh_tx.send(update);
         }
         Ok(ApiResponse::ok("add", id))
     }
@@ -2275,10 +2412,9 @@ impl BridgeContext {
         targets.sort();
         targets.dedup();
 
-        // Track whether the unified listener needs to rebuild. Removing a
-        // sub-device doesn't affect the listener (subs aren't in `instances`),
-        // so only direct-device removals flip this flag.
-        let mut listener_changed = false;
+        // Direct devices whose connection went away. A sub-device removal
+        // produces none — subs never had one (they aren't in `instances`).
+        let mut unsubscribed = Vec::new();
         let mut scavenger_targets = Vec::new();
         {
             let mut state = self.state.write().await;
@@ -2312,15 +2448,13 @@ impl BridgeContext {
                     });
                 }
                 if state.instances.remove(target_id).is_some() {
-                    listener_changed = true;
+                    unsubscribed.push(target_id.clone());
                 }
             }
         }
 
-        // Only refresh when a direct device was actually evicted — sub-device
-        // removals don't appear in the listener stream.
-        if listener_changed {
-            self.request_refresh();
+        for target_id in unsubscribed {
+            self.device_down(&target_id);
         }
 
         // Drop any cached DPS snapshot for removed devices (cache mode only —
@@ -2348,7 +2482,7 @@ impl BridgeContext {
     /// # Errors
     /// Currently always returns `Ok`; reserved for future failure modes.
     pub async fn clear_devices(&self) -> Result<ApiResponse, BridgeError> {
-        let scavenger_targets: Vec<crate::types::ScavengerTarget> = {
+        let (scavenger_targets, unsubscribed): (Vec<crate::types::ScavengerTarget>, Vec<String>) = {
             let mut state = self.state.write().await;
 
             let targets = state
@@ -2360,13 +2494,18 @@ impl BridgeContext {
                     cid: cfg.cid.clone(),
                 })
                 .collect();
+            let unsubscribed = state.instances.keys().cloned().collect();
 
             state.configs.clear();
             state.instances.clear();
             state.cid_map.clear();
             state.name_map.clear();
-            targets
+            (targets, unsubscribed)
         };
+
+        for id in unsubscribed {
+            self.device_down(&id);
+        }
 
         // Drop the full cache-mode cache alongside config wipe.
         if let Some(cache) = &self.cache {
@@ -2376,9 +2515,6 @@ impl BridgeContext {
         }
 
         info!("All devices cleared");
-
-        // Send refresh signal to kill the listener stream and drop physical connections
-        self.request_refresh();
 
         // Scavenge all retained messages
         self.spawn_retain_scavenger(scavenger_targets).await;
@@ -2401,14 +2537,14 @@ impl BridgeContext {
             return 0;
         };
         let client_id = format!("{}_purge_{}", self.cli.mqtt_client_id(), unix_millis());
-        let mqtt_options =
-            match self.create_mqtt_options(&broker_url, &client_id, &self.cli, false) {
-                Ok(opts) => opts,
-                Err(e) => {
-                    error!("Failed to create MQTT options for purge: {e}");
-                    return 0;
-                }
-            };
+        let mqtt_options = match self.create_mqtt_options(&broker_url, &client_id, &self.cli, false)
+        {
+            Ok(opts) => opts,
+            Err(e) => {
+                error!("Failed to create MQTT options for purge: {e}");
+                return 0;
+            }
+        };
 
         let root_topic = self.mqtt_root_topic.clone();
         let mut subs = HashSet::new();
@@ -2469,7 +2605,10 @@ impl BridgeContext {
         let topics: Vec<String> = topics.into_iter().collect();
         debug!("Purge topics={topics:?}");
         let acked = Self::clear_and_flush(&client, &mut eventloop, &topics).await;
-        info!("Purge: collected {} retained, cleared {acked}", topics.len());
+        info!(
+            "Purge: collected {} retained, cleared {acked}",
+            topics.len()
+        );
         let _ = client.disconnect().await;
         acked
     }
@@ -2523,9 +2662,8 @@ impl BridgeContext {
                     "mqtt_payload_template must not be empty".into(),
                 ));
             }
-            crate::payload::validate_payload_template(tpl).map_err(|e| {
-                BridgeError::InvalidRequest(format!("mqtt_payload_template: {e}"))
-            })?;
+            crate::payload::validate_payload_template(tpl)
+                .map_err(|e| BridgeError::InvalidRequest(format!("mqtt_payload_template: {e}")))?;
         }
 
         // Read the current file (source of truth). Diff is computed against the
@@ -2573,8 +2711,8 @@ impl BridgeContext {
 
         let reconfigure_required = !changed.is_empty();
         if reconfigure_required {
-            let json = serde_json::to_string_pretty(&file_cli)
-                .map_err(BridgeError::SerializationError)?;
+            let json =
+                serde_json::to_string_pretty(&file_cli).map_err(BridgeError::SerializationError)?;
             write_atomic(Path::new(&config_path), json.as_bytes())
                 .await
                 .map_err(|e| {
@@ -2912,14 +3050,20 @@ mod tests {
 
     #[test]
     fn identifier_set_satisfied_by_id_always() {
-        let s = IdentifierSet { id: true, ..Default::default() };
+        let s = IdentifierSet {
+            id: true,
+            ..Default::default()
+        };
         assert!(s.satisfied_by(None, None));
         assert!(s.satisfied_by(Some(""), None));
     }
 
     #[test]
     fn identifier_set_satisfied_by_name_requires_nonempty() {
-        let s = IdentifierSet { name: true, ..Default::default() };
+        let s = IdentifierSet {
+            name: true,
+            ..Default::default()
+        };
         assert!(!s.satisfied_by(None, None));
         assert!(!s.satisfied_by(Some(""), None));
         assert!(s.satisfied_by(Some("kitchen"), None));
@@ -2927,7 +3071,10 @@ mod tests {
 
     #[test]
     fn identifier_set_satisfied_by_cid_requires_nonempty() {
-        let s = IdentifierSet { cid: true, ..Default::default() };
+        let s = IdentifierSet {
+            cid: true,
+            ..Default::default()
+        };
         assert!(!s.satisfied_by(None, None));
         assert!(s.satisfied_by(None, Some("sub-1")));
     }
@@ -2935,1379 +3082,1469 @@ mod tests {
     // template / payload pure-function tests moved alongside their subjects
     // in `crate::template::tests` and `crate::payload::tests`.
 
-// ── Async / context-bound behavior tests ─────────────────────────────────
-// Tests below construct a full BridgeContext over a tempdir so they exercise
-// add_device, publish_device_event, etc. end-to-end with a captured MQTT
-// receiver. Kept in a separate module so the heavy setup helper doesn't
-// leak into the pure-function test module above.
-#[cfg(test)]
-mod context_tests {
-    use super::*;
-    use serde_json::json;
-    use tempfile::TempDir;
+    // ── Async / context-bound behavior tests ─────────────────────────────────
+    // Tests below construct a full BridgeContext over a tempdir so they exercise
+    // add_device, publish_device_event, etc. end-to-end with a captured MQTT
+    // receiver. Kept in a separate module so the heavy setup helper doesn't
+    // leak into the pure-function test module above.
+    #[cfg(test)]
+    mod context_tests {
+        use super::*;
+        use serde_json::json;
+        use tempfile::TempDir;
 
-    /// Constructs a BridgeContext writing state to a fresh tempdir, with the
-    /// MQTT channel wired (so `publish_*` actually sends) but no real broker.
-    /// `customize` can override Cli fields like event_topic / payload_template.
-    async fn make_ctx(
-        customize: impl FnOnce(&mut Cli),
-    ) -> (
-        Arc<BridgeContext>,
-        TempDir,
-        mpsc::Receiver<Option<MqttMessage>>,
-        mpsc::Receiver<()>,
-        mpsc::Receiver<()>,
-    ) {
-        let tmp = TempDir::new().expect("create tempdir");
-        let state_path = tmp.path().join("state.json");
-        // `mqtt_tx` is wired iff mqtt_broker is Some — value never dialed.
-        let mut cli = Cli {
-            mqtt_broker: Some("mqtt://noop.invalid:1883".to_string()),
-            state_file: Some(state_path.to_string_lossy().into_owned()),
-            ..Cli::default()
-        };
-        customize(&mut cli);
-        let (ctx, mqtt_rx, save_rx, refresh_rx) =
-            BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
-                .await
-                .expect("new context");
-        (ctx, tmp, mqtt_rx, save_rx, refresh_rx)
-    }
-
-    fn direct_device(id: &str, key: &str, ip: Option<&str>) -> DeviceConfig {
-        DeviceConfig {
-            id: id.into(),
-            name: None,
-            ip: ip.map(str::to_string),
-            key: Some(key.into()),
-            version: None,
-            cid: None,
-            parent_id: None,
-            last_error_code: None,
-        }
-    }
-
-    // ── #10: add_device idempotency ───────────────────────────────────────
-
-    #[tokio::test]
-    async fn add_device_skips_refresh_when_re_added_identically() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
-
-        ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
-            .await
-            .expect("first add");
-        assert_eq!(
-            refresh_rx.try_recv(),
-            Ok(()),
-            "first add must trigger refresh"
-        );
-
-        ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
-            .await
-            .expect("idempotent re-add");
-        assert!(
-            refresh_rx.try_recv().is_err(),
-            "identical re-add must not trigger refresh"
-        );
-    }
-
-    #[tokio::test]
-    async fn add_device_refreshes_when_key_changes() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
-
-        ctx.add_device(direct_device("dev-1", "aaaaaaaaaaaaaaaa", None))
-            .await
-            .unwrap();
-        let _ = refresh_rx.try_recv();
-
-        ctx.add_device(direct_device("dev-1", "bbbbbbbbbbbbbbbb", None))
-            .await
-            .unwrap();
-        assert_eq!(
-            refresh_rx.try_recv(),
-            Ok(()),
-            "key change must trigger refresh"
-        );
-    }
-
-    #[tokio::test]
-    async fn add_device_refreshes_when_ip_changes() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
-
-        ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
-            .await
-            .unwrap();
-        let _ = refresh_rx.try_recv();
-
-        ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.2")))
-            .await
-            .unwrap();
-        assert_eq!(
-            refresh_rx.try_recv(),
-            Ok(()),
-            "ip change must trigger refresh"
-        );
-    }
-
-    #[tokio::test]
-    async fn add_device_refreshes_when_shape_changes_direct_to_sub() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
-
-        ctx.add_device(direct_device("dev-1", "0123456789abcdef", None))
-            .await
-            .unwrap();
-        let _ = refresh_rx.try_recv();
-
-        // Re-add as sub-device — direct instance must drop, listener must refresh.
-        ctx.add_device(DeviceConfig {
-            id: "dev-1".into(),
-            name: None,
-            ip: None,
-            key: None,
-            version: None,
-            cid: Some("sub-1".into()),
-            parent_id: Some("gateway-A".into()),
-            last_error_code: None,
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            refresh_rx.try_recv(),
-            Ok(()),
-            "direct→sub conversion must trigger refresh"
-        );
-    }
-
-    // ── #2: optional template vars fall back to empty string ──────────────
-
-    /// Collects all `MqttMessage`s sent within a short window from the captured
-    /// receiver — `publish_device_event` returns immediately after queuing, so
-    /// a tiny yield is enough.
-    async fn drain_mqtt(rx: &mut mpsc::Receiver<Option<MqttMessage>>) -> Vec<MqttMessage> {
-        // Yield once so any pending sends land in the channel.
-        tokio::task::yield_now().await;
-        let mut out = Vec::new();
-        while let Ok(Some(msg)) = rx.try_recv() {
-            out.push(msg);
-        }
-        out
-    }
-
-    #[tokio::test]
-    async fn publish_event_multi_dp_renders_missing_dp_as_empty() {
-        // Multi-DP mode (event_topic has no {dp}/{value}) + a payload template
-        // that references {dp} → {dp} must render as empty string, not the
-        // literal `{dp}` placeholder.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_event_topic = Some("{root}/event/{id}".to_string());
-            cli.mqtt_payload_template = Some(r#"{"dp":"{dp}","val":{value}}"#.to_string());
-        })
-        .await;
-
-        ctx.publish_device_event(
-            "dev-1".to_string(),
-            None,
-            None,
-            json!({"1": true, "2": 50}),
-            false,
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(msgs.len(), 1, "multi-DP mode emits one message");
-        assert_eq!(msgs[0].topic, "rustuya/event/dev-1");
-        assert!(
-            !msgs[0].payload.contains("{dp}"),
-            "literal {{dp}} must not leak into payload, got: {}",
-            msgs[0].payload
-        );
-        // Concrete shape: `{"dp":"","val":{"1":true,"2":50}}` (key order
-        // depends on serde_json::Map's preservation, so check fragments).
-        assert!(msgs[0].payload.contains(r#""dp":"""#));
-    }
-
-    #[tokio::test]
-    async fn publish_event_single_dp_renders_dp_and_value_per_dp() {
-        // Sanity: with {dp} in event_topic, single-DP mode fires and emits one
-        // message per dp with both {dp} and {value} resolved.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_event_topic = Some("{root}/event/{id}/{dp}".to_string());
-            cli.mqtt_payload_template = Some(r#"{"v":{value}}"#.to_string());
-        })
-        .await;
-
-        ctx.publish_device_event(
-            "dev-1".to_string(),
-            None,
-            None,
-            json!({"1": true, "2": 50}),
-            false,
-            true,
-        )
-        .await;
-
-        let mut msgs = drain_mqtt(&mut mqtt_rx).await;
-        msgs.sort_by(|a, b| a.topic.cmp(&b.topic));
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].topic, "rustuya/event/dev-1/1");
-        assert_eq!(msgs[0].payload, r#"{"v":true}"#);
-        assert_eq!(msgs[1].topic, "rustuya/event/dev-1/2");
-        assert_eq!(msgs[1].payload, r#"{"v":50}"#);
-    }
-
-    #[tokio::test]
-    async fn publish_event_empty_string_for_missing_name_in_topic() {
-        // {name} in event_topic with a device that has no name → must render
-        // as empty (not the literal `{name}`), producing `rustuya/event//1`.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_event_topic = Some("{root}/event/{name}/{dp}".to_string());
-            cli.mqtt_payload_template = Some("{value}".to_string());
-        })
-        .await;
-
-        ctx.publish_device_event(
-            "dev-1".to_string(),
-            None,
-            None,
-            json!({"1": true}),
-            false,
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].topic, "rustuya/event//1");
-    }
-
-    // ── #6: publish_device_message wraps non-object payloads ──────────────
-
-    #[tokio::test]
-    async fn publish_message_wraps_non_object_payload_and_injects_id() {
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
-
-        // Pass a plain JSON string — exercises the wrap+inject path.
-        ctx.publish_device_message(
-            "dev-1",
-            None,
-            None,
-            "error",
-            Value::String("kaboom".to_string()),
-            false,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(msgs.len(), 1);
-        let parsed: serde_json::Value = serde_json::from_str(&msgs[0].payload).unwrap();
-        let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("dev-1"));
-        // Original payload is preserved under the `payload` field.
-        assert_eq!(
-            obj.get("payload").and_then(|v| v.as_str()),
-            Some("kaboom")
-        );
-    }
-
-    // ── #7: mqtt_drop_count is exposed in status response ─────────────────
-
-    // ── B1/B2: remove_device removed-id reporting + selective refresh ──────
-
-    fn sub_device(id: &str, parent_id: &str, cid: &str) -> DeviceConfig {
-        DeviceConfig {
-            id: id.into(),
-            name: None,
-            ip: None,
-            key: None,
-            version: None,
-            cid: Some(cid.into()),
-            parent_id: Some(parent_id.into()),
-            last_error_code: None,
-        }
-    }
-
-    fn named_direct(id: &str, name: &str) -> DeviceConfig {
-        DeviceConfig {
-            id: id.into(),
-            name: Some(name.into()),
-            ip: None,
-            key: Some("0123456789abcdef".into()),
-            version: None,
-            cid: None,
-            parent_id: None,
-            last_error_code: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn remove_by_name_with_cascade_returns_all_removed_ids() {
-        // Removing a single gateway by name that cascades to sub-devices must
-        // return every removed id (gateway + 3 subs) so the handler can answer
-        // one per-id `remove` response each.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
-
-        ctx.add_device(named_direct("gw-1", "kitchen-gateway"))
-            .await
-            .unwrap();
-        for cid in ["s1", "s2", "s3"] {
-            ctx.add_device(sub_device(&format!("sub-{cid}"), "gw-1", cid))
-                .await
-                .unwrap();
+        /// Constructs a BridgeContext writing state to a fresh tempdir, with the
+        /// MQTT channel wired (so `publish_*` actually sends) but no real broker.
+        /// `customize` can override Cli fields like event_topic / payload_template.
+        async fn make_ctx(
+            customize: impl FnOnce(&mut Cli),
+        ) -> (
+            Arc<BridgeContext>,
+            TempDir,
+            mpsc::Receiver<Option<MqttMessage>>,
+            mpsc::Receiver<()>,
+            mpsc::UnboundedReceiver<DeviceUpdate>,
+        ) {
+            let tmp = TempDir::new().expect("create tempdir");
+            let state_path = tmp.path().join("state.json");
+            // `mqtt_tx` is wired iff mqtt_broker is Some — value never dialed.
+            let mut cli = Cli {
+                mqtt_broker: Some("mqtt://noop.invalid:1883".to_string()),
+                state_file: Some(state_path.to_string_lossy().into_owned()),
+                ..Cli::default()
+            };
+            customize(&mut cli);
+            let (ctx, mqtt_rx, save_rx, refresh_rx) =
+                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                    .await
+                    .expect("new context");
+            (ctx, tmp, mqtt_rx, save_rx, refresh_rx)
         }
 
-        let removed = ctx
-            .remove_device(None, Some(vec!["kitchen-gateway".into()]))
-            .await
-            .expect("remove by name");
-
-        assert_eq!(removed.len(), 4, "cascade should remove gateway + 3 subs");
-        assert!(removed.contains(&"gw-1".to_string()));
-        assert!(removed.contains(&"sub-s2".to_string()));
-    }
-
-    #[tokio::test]
-    async fn remove_by_name_with_real_fanout_returns_each_matched_id() {
-        // Two devices share a name → name lookup fans out to both. Each is a
-        // direct device (no subs); both ids are returned individually.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
-
-        ctx.add_device(named_direct("dev-a", "kitchen")).await.unwrap();
-        ctx.add_device(named_direct("dev-b", "kitchen")).await.unwrap();
-
-        let mut removed = ctx
-            .remove_device(None, Some(vec!["kitchen".into()]))
-            .await
-            .unwrap();
-        removed.sort();
-
-        assert_eq!(removed, vec!["dev-a".to_string(), "dev-b".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn remove_sub_device_only_skips_listener_refresh() {
-        // Removing a sub-device alone must NOT trigger refresh — subs aren't
-        // in the listener stream, so killing the parent's TCP connection is
-        // gratuitous churn.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
-
-        ctx.add_device(named_direct("gw-1", "gw")).await.unwrap();
-        ctx.add_device(sub_device("sub-A", "gw-1", "cid-A"))
-            .await
-            .unwrap();
-        // Drain refresh signals from the adds.
-        while refresh_rx.try_recv().is_ok() {}
-
-        ctx.remove_device(Some(vec!["sub-A".into()]), None)
-            .await
-            .unwrap();
-
-        assert!(
-            refresh_rx.try_recv().is_err(),
-            "removing a sub-device only must not refresh the listener"
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_direct_device_triggers_listener_refresh() {
-        // Sanity-check the inverse — direct-device removal MUST refresh so
-        // the unified listener stops trying to read from a dropped Device.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
-
-        ctx.add_device(named_direct("gw-1", "gw")).await.unwrap();
-        while refresh_rx.try_recv().is_ok() {}
-
-        ctx.remove_device(Some(vec!["gw-1".into()]), None)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            refresh_rx.try_recv(),
-            Ok(()),
-            "direct-device removal must refresh"
-        );
-    }
-
-    #[tokio::test]
-    async fn status_response_includes_mqtt_drop_count() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
-        // Simulate a drop having happened.
-        ctx.mqtt_drop_count.store(3, Ordering::Relaxed);
-
-        let res = ctx.get_bridge_status(None, None).await;
-        let v = serde_json::to_value(&res).unwrap();
-        assert_eq!(
-            v.get("mqtt_drop_count").and_then(|n| n.as_u64()),
-            Some(3),
-            "status must surface the cumulative MQTT drop count"
-        );
-    }
-
-    #[tokio::test]
-    async fn status_paginates_large_fleet() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
-        {
-            let mut state = ctx.state.write().await;
-            for i in 0..60 {
-                let id = format!("dev{i:03}");
-                state.configs.insert(
-                    id.clone(),
-                    serde_json::from_value(serde_json::json!({"id": id, "key": "k"})).unwrap(),
-                );
+        fn direct_device(id: &str, key: &str, ip: Option<&str>) -> DeviceConfig {
+            DeviceConfig {
+                id: id.into(),
+                name: None,
+                ip: ip.map(str::to_string),
+                key: Some(key.into()),
+                version: None,
+                cid: None,
+                parent_id: None,
+                last_error_code: None,
             }
         }
 
-        // Default: one capped page, but the full count is always reported.
-        let v = serde_json::to_value(ctx.get_bridge_status(None, None).await).unwrap();
-        assert_eq!(v["device_count"], 60);
-        assert_eq!(v["returned"], STATUS_DEFAULT_PAGE);
-        assert_eq!(v["devices"].as_object().unwrap().len(), STATUS_DEFAULT_PAGE);
-        assert_eq!(v["has_more"], true);
-
-        // Second page drains the remainder.
-        let v2 = serde_json::to_value(ctx.get_bridge_status(Some(50), None).await).unwrap();
-        assert_eq!(v2["returned"], 10);
-        assert_eq!(v2["has_more"], false);
-
-        // An over-large limit is capped, never honored verbatim.
-        let v3 = serde_json::to_value(ctx.get_bridge_status(Some(0), Some(100_000)).await).unwrap();
-        assert_eq!(v3["limit"], STATUS_MAX_PAGE as u64);
-    }
-
-    // ── cache mode bring-up ────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn passthrough_mode_skips_cache_when_retain_off() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(false);
-        })
-        .await;
-        assert!(!ctx.mqtt_retain);
-        assert!(ctx.cache.is_none(), "pass-through mode must not allocate a cache");
-    }
-
-    #[tokio::test]
-    async fn cache_mode_allocates_cache_with_type_in_topic() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            // Default event topic contains {type}, so cache mode stays enabled.
-        })
-        .await;
-        assert!(ctx.mqtt_retain);
-        assert!(ctx.cache.is_some(), "cache mode must allocate a cache");
-    }
-
-    #[tokio::test]
-    async fn cache_mode_stays_active_when_type_missing_from_both() {
-        // No-{type} setup is opt-in for users whose fleet has no event
-        // automations — state recovery via retained snapshot still works
-        // (no-retain active never overwrites the retained passive). Bridge
-        // logs a WARN about potential live double-fire but honors the
-        // explicit mqtt_retain=true.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_event_topic = Some("{root}/event/{id}".into());
-            cli.mqtt_payload_template = Some("{value}".into());
-        })
-        .await;
-        assert!(ctx.mqtt_retain, "mqtt_retain=true must stay honored");
-        assert!(ctx.cache.is_some());
-    }
-
-    #[tokio::test]
-    async fn cache_mode_stays_active_when_type_in_payload_only() {
-        // {type} in payload template suffices — subscribers can filter on
-        // `value_json.type` even if topic doesn't separate active/passive.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_event_topic = Some("{root}/event/{id}/{dp}".into());
-            cli.mqtt_payload_template =
-                Some("{\"type\":\"{type}\",\"value\":{value}}".into());
-        })
-        .await;
-        assert!(
-            ctx.mqtt_retain,
-            "{{type}} in payload template alone must keep cache mode active"
-        );
-        assert!(ctx.cache.is_some());
-    }
-
-    // ── cache-mode publish routing ──────────────────────────────────────────────────
-
-    async fn add_named_direct(ctx: &Arc<BridgeContext>, id: &str) {
-        ctx.add_device(DeviceConfig {
-            id: id.into(),
-            name: Some(format!("name-{id}")),
-            ip: Some("10.0.0.1".into()),
-            key: Some("0123456789abcdef".into()),
-            version: None,
-            cid: None,
-            parent_id: None,
-            last_error_code: None,
-        })
-        .await
-        .expect("add device");
-    }
-
-    #[tokio::test]
-    async fn cache_mode_active_publishes_delta_then_snapshot_after_seed() {
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await; // any add-time publishes
-
-        // Pretend the seed phase finished so snapshots aren't deferred.
-        ctx.seed_done.store(true, Ordering::Release);
-
-        let dps = serde_json::json!({"1": true});
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            dps,
-            /* is_passive */ false,
-            /* exists */ true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(
-            msgs.len(),
-            2,
-            "active in cache mode must produce a delta + a snapshot publish"
-        );
-        let active = msgs.iter().find(|m| !m.retain).expect("active no-retain");
-        let snapshot = msgs.iter().find(|m| m.retain).expect("snapshot retained");
-        assert!(active.topic.contains("/active/"));
-        assert!(snapshot.topic.contains("/state/"));
-    }
-
-    #[tokio::test]
-    async fn cache_mode_passive_publishes_delta_then_snapshot_after_seed() {
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        // Passive arrives as a raw JSON object (no `dps` key). The synthesised
-        // dps becomes this object, which goes straight into the cache.
-        let payload = serde_json::json!({"battery": 80});
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            payload,
-            /* is_passive */ true,
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(
-            msgs.len(),
-            2,
-            "passive in cache mode produces a no-retain delta + a retained snapshot"
-        );
-        let delta = msgs.iter().find(|m| !m.retain).expect("passive delta no-retain");
-        let snapshot = msgs.iter().find(|m| m.retain).expect("snapshot retained");
-        assert!(delta.topic.contains("/passive/"), "delta on {{type}}=passive");
-        assert!(snapshot.topic.contains("/state/"), "snapshot on {{type}}=state");
-    }
-
-    #[tokio::test]
-    async fn cache_mode_partial_passive_preserves_other_cached_keys() {
-        // The bug this whole redesign fixes: a battery-only passive update
-        // must not wipe the previously-known state DPs from the retained
-        // snapshot. The cache merges, so the snapshot we publish still has
-        // both keys.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            serde_json::json!({"1": true, "2": 50}),
-            true, // passive periodic status report
-            true,
-        )
-        .await;
-        drain_mqtt(&mut mqtt_rx).await;
-
-        // Battery-only partial follow-up
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            serde_json::json!({"battery": 80}),
-            true,
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        // Battery-only passive → a no-retain delta (battery only) + the merged
-        // retained snapshot. The snapshot is what must still carry DPs 1 and 2.
-        let snapshot = msgs.iter().find(|m| m.retain).expect("merged snapshot retained");
-        let payload: serde_json::Value = serde_json::from_str(&snapshot.payload).unwrap();
-        assert_eq!(payload.get("1"), Some(&serde_json::json!(true)));
-        assert_eq!(payload.get("2"), Some(&serde_json::json!(50)));
-        assert_eq!(payload.get("battery"), Some(&serde_json::json!(80)));
-    }
-
-    #[tokio::test]
-    async fn cache_mode_snapshot_publish_deferred_during_seed() {
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        // seed_done stays false — simulating the seed window.
-
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            serde_json::json!({"1": true}),
-            false, // active
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        // Active delta still fires (HA event automations); snapshot is deferred.
-        assert_eq!(msgs.len(), 1, "only active delta during seed");
-        assert!(!msgs[0].retain);
-        assert!(msgs[0].topic.contains("/active/"));
-
-        assert!(
-            ctx.seed_pending.lock().unwrap().contains("dev-1"),
-            "device should be queued for the seed-end flush"
-        );
-    }
-
-    #[tokio::test]
-    async fn cache_mode_dedupes_unchanged_snapshot_but_always_emits_delta() {
-        // The retained `state` snapshot dedupes on unchanged values, but the
-        // no-retain delta always fires so a repeated `get`/status readback is
-        // still observable (the whole reason passive gets a live delta).
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            serde_json::json!({"1": true}),
-            true,
-            true,
-        )
-        .await;
-        let first = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(first.len(), 2, "first passive: delta + snapshot");
-        assert_eq!(first.iter().filter(|m| m.retain).count(), 1, "one retained snapshot");
-
-        // Same value again — cache.merge returns no changed keys → no snapshot,
-        // but the no-retain delta still publishes.
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            serde_json::json!({"1": true}),
-            true,
-            true,
-        )
-        .await;
-        let second = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(second.len(), 1, "same-value passive still emits the delta");
-        assert!(!second[0].retain, "no retained snapshot on unchanged value");
-        assert!(second[0].topic.contains("/passive/"));
-    }
-
-    #[tokio::test]
-    async fn passthrough_mode_publishes_single_message() {
-        // Sanity: pass-through mode retains the historical one-publish-per-event shape.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(false);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            serde_json::json!({"1": true}),
-            false,
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(msgs.len(), 1, "pass-through must publish exactly one message");
-        assert!(!msgs[0].retain, "pass-through never retains");
-        assert!(msgs[0].topic.contains("/active/"));
-    }
-
-    // ── cache-mode seed phase ───────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn cache_mode_default_template_arms_seed_wildcard() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        assert!(
-            ctx.seed_state_wildcard.is_some(),
-            "default template + cache mode must produce a seed wildcard"
-        );
-        assert!(ctx.seed_state_regex.is_some());
-        assert!(
-            !ctx.seed_done.load(Ordering::Acquire),
-            "seed_done starts false to gate snapshots"
-        );
-    }
-
-    // (The historical "custom template disables seed" assertion was retired
-    // — JSON-shaped templates are now seed-parseable. The retained-shape
-    // gate lives in `payload::validate_payload_template`; coverage
-    // for both the supported and unsupported cases is in two new tests
-    // below, near the other ☆ seed setup.)
-
-    #[tokio::test]
-    async fn match_seed_topic_extracts_id_in_multi_dp_mode() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_event_topic = Some("{root}/event/{type}/{id}".into());
-        })
-        .await;
-        let (id, dp) = ctx
-            .match_seed_topic("rustuya/event/state/dev-1")
-            .expect("topic should match");
-        assert_eq!(id, "dev-1");
-        assert!(dp.is_none(), "multi-DP mode has no {{dp}}");
-    }
-
-    #[tokio::test]
-    async fn match_seed_topic_extracts_id_and_dp_in_single_dp_mode() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
-        })
-        .await;
-        let (id, dp) = ctx
-            .match_seed_topic("rustuya/event/state/dev-1/42")
-            .expect("topic should match");
-        assert_eq!(id, "dev-1");
-        assert_eq!(dp.as_deref(), Some("42"));
-    }
-
-    // parse_seed_payload-equivalent unit tests live in
-    // `crate::payload::tests` (default + custom-template scenarios).
-
-    #[tokio::test]
-    async fn cache_mode_custom_template_with_parseable_shape_enables_seed() {
-        // A JSON-shaped custom template is now seed-parseable — the
-        // historical "default template only" restriction is gone.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_payload_template =
-                Some(r#"{"type":"{type}","value":{value}}"#.into());
-        })
-        .await;
-        assert!(
-            ctx.seed_state_wildcard.is_some(),
-            "JSON-shaped template must arm the seed wildcard"
-        );
-        assert!(
-            !ctx.seed_done.load(Ordering::Acquire),
-            "seed_done must start false so the seed phase runs"
-        );
-    }
-
-    #[tokio::test]
-    async fn cache_mode_unparseable_template_skips_seed() {
-        // Text-style template (e.g. `key=val` style) can't be sentinelled
-        // into valid JSON → seed disabled, seed_done pre-flipped.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_payload_template = Some("v={value};ts={timestamp}".into());
-        })
-        .await;
-        assert!(ctx.seed_state_wildcard.is_none());
-        assert!(ctx.seed_done.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn on_seed_complete_flips_flag_and_flushes_pending() {
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-
-        // Simulate an active arriving during the seed window — snapshot
-        // publish is deferred, device gets queued in seed_pending.
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            json!({"1": true}),
-            false,
-            true,
-        )
-        .await;
-        let pre = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(pre.len(), 1, "only active delta during seed");
-        assert!(ctx.seed_pending.lock().unwrap().contains("dev-1"));
-
-        // Seed completes: flag flips, pending drains, snapshot publishes.
-        ctx.on_seed_complete().await;
-        assert!(ctx.seed_done.load(Ordering::Acquire));
-        assert!(ctx.seed_pending.lock().unwrap().is_empty());
-
-        let post = drain_mqtt(&mut mqtt_rx).await;
-        assert_eq!(post.len(), 1, "flush publishes one snapshot");
-        assert!(post[0].retain, "flush snapshot is retained");
-        assert!(post[0].topic.contains("/state/"));
-    }
-
-    #[tokio::test]
-    async fn on_seed_complete_is_idempotent() {
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        ctx.on_seed_complete().await;
-        // Second call must be a no-op — seed_done already true.
-        ctx.on_seed_complete().await;
-        assert!(ctx.seed_done.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn cache_mode_runtime_added_device_publishes_immediately_after_seed() {
-        // Devices added after seed_done flips should not be silently queued
-        // for an already-finished flush — their first cache change must
-        // publish right away.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        add_named_direct(&ctx, "late-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-
-        ctx.publish_device_event(
-            "late-1".into(),
-            Some("name-late-1".into()),
-            None,
-            json!({"1": true}),
-            true,
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        // passive → no-retain delta + retained snapshot.
-        let snaps: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
-        assert_eq!(
-            snaps.len(),
-            1,
-            "runtime-added device must publish snapshot on first cache change"
-        );
-        assert!(snaps[0].topic.contains("/state/"));
-        assert!(
-            ctx.seed_pending.lock().unwrap().is_empty(),
-            "must not queue when seed already done"
-        );
-    }
-
-    #[tokio::test]
-    async fn cache_mode_single_dp_mode_publishes_snapshot_per_dp() {
-        // Single-DP topic template → each DP gets its own snapshot message.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            json!({"1": true, "2": 50}),
-            true,
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        let snapshots: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
-        assert_eq!(
-            snapshots.len(),
-            2,
-            "single-DP snapshot publishes one retained message per DP"
-        );
-        let topics: Vec<&str> = snapshots.iter().map(|m| m.topic.as_str()).collect();
-        assert!(topics.iter().any(|t| t.ends_with("/1")));
-        assert!(topics.iter().any(|t| t.ends_with("/2")));
-    }
-
-    #[tokio::test]
-    async fn cache_mode_single_dp_publishes_only_changed_dps() {
-        // Regression for a user-reported bug: after the cache is populated
-        // with multiple DPs, an event changing one DP should NOT also
-        // republish snapshots for unchanged DPs in single-DP topic mode.
-        // Each per-DP topic already has the correct retained from prior
-        // snapshots — re-emitting them on {type}=state on every unrelated
-        // event spuriously surfaces "events" for DPs that didn't change.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-            cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        // Seed cache with two DPs, drain the resulting publishes.
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            json!({"1": true, "2": 50}),
-            true,
-            true,
-        )
-        .await;
-        drain_mqtt(&mut mqtt_rx).await;
-
-        // Now change only DP 1.
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            json!({"1": false}),
-            false,
-            true,
-        )
-        .await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        let snapshots: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
-        assert_eq!(
-            snapshots.len(),
-            1,
-            "single-DP mode must only republish the DP that changed, not all cached DPs"
-        );
-        assert!(
-            snapshots[0].topic.ends_with("/1"),
-            "snapshot must be for the changed DP only (got '{}')",
-            snapshots[0].topic
-        );
-    }
-
-    // ── active/passive detection ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn handle_event_classifies_data_dps_wrapper_as_active() {
-        // User-confirmed wire shape: device-initiated DP_STATUS (cmd 8)
-        // wraps the dps under `data`. Bridge must classify as active and
-        // publish to {type}=active.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        let payload = r#"{"data":{"dps":{"1":false,"2":false}},"protocol":4,"t":1780376055}"#;
-        ctx.handle_device_event("dev-1", payload.into()).await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert!(
-            msgs.iter().any(|m| m.topic.contains("/active/")),
-            "data.dps wrapper must produce an active publish (got topics: {:?})",
-            msgs.iter().map(|m| &m.topic).collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_event_classifies_root_dps_as_passive() {
-        // User-confirmed wire shape: DP_QUERY response (cmd 16) puts dps
-        // at the root with no `data` wrapper. Classified as passive: a
-        // no-retain passive delta plus a retained state snapshot — never active.
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        let payload = r#"{"dps":{"1":false,"14":"off","2":false,"7":0,"8":0}}"#;
-        ctx.handle_device_event("dev-1", payload.into()).await;
-
-        let msgs = drain_mqtt(&mut mqtt_rx).await;
-        assert!(
-            !msgs.iter().any(|m| m.topic.contains("/active/")),
-            "root dps without data wrapper must NOT produce active publish"
-        );
-        assert!(
-            msgs.iter().any(|m| m.topic.contains("/passive/") && !m.retain),
-            "passive must produce a no-retain delta"
-        );
-        assert!(
-            msgs.iter().any(|m| m.topic.contains("/state/") && m.retain),
-            "passive must also produce a retained state snapshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn cache_mode_remove_drops_cached_snapshot() {
-        let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
-        add_named_direct(&ctx, "dev-1").await;
-        drain_mqtt(&mut mqtt_rx).await;
-        ctx.seed_done.store(true, Ordering::Release);
-
-        ctx.publish_device_event(
-            "dev-1".into(),
-            Some("name-dev-1".into()),
-            None,
-            serde_json::json!({"1": true}),
-            true,
-            true,
-        )
-        .await;
-        let cache = ctx.cache.as_ref().expect("cache exists");
-        assert!(cache.snapshot("dev-1").is_some());
-
-        ctx.remove_device(Some(vec!["dev-1".into()]), None)
+        /// Asserts the next listener delta is `Up(id)`. Stronger than the old
+        /// "a refresh happened" check: the delta is typed, so a test can name the
+        /// device whose connection was (re)built and catch a bridge that refreshed
+        /// the wrong one.
+        fn expect_up(rx: &mut mpsc::UnboundedReceiver<DeviceUpdate>, id: &str, why: &str) {
+            match rx.try_recv() {
+                Ok(DeviceUpdate::Up(got, _)) => assert_eq!(got, id, "{why}"),
+                other => panic!("{why}: expected Up({id}), got {other:?}"),
+            }
+        }
+
+        /// Asserts the next listener delta is `Down(id)`.
+        fn expect_down(rx: &mut mpsc::UnboundedReceiver<DeviceUpdate>, id: &str, why: &str) {
+            match rx.try_recv() {
+                Ok(DeviceUpdate::Down(got)) => assert_eq!(got, id, "{why}"),
+                other => panic!("{why}: expected Down({id}), got {other:?}"),
+            }
+        }
+
+        /// Asserts no listener delta is pending — the set of live connections did
+        /// not change.
+        fn expect_no_delta(rx: &mut mpsc::UnboundedReceiver<DeviceUpdate>, why: &str) {
+            if let Ok(update) = rx.try_recv() {
+                panic!("{why}: expected no delta, got {update:?}");
+            }
+        }
+
+        // ── #10: add_device idempotency ───────────────────────────────────────
+
+        #[tokio::test]
+        async fn add_device_keeps_connection_when_re_added_identically() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+            ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
+                .await
+                .expect("first add");
+            expect_up(
+                &mut refresh_rx,
+                "dev-1",
+                "first add must subscribe the device",
+            );
+
+            ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
+                .await
+                .expect("idempotent re-add");
+            expect_no_delta(
+                &mut refresh_rx,
+                "an identical re-add must keep the existing connection",
+            );
+        }
+
+        #[tokio::test]
+        async fn add_device_rebuilds_connection_when_key_changes() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+            ctx.add_device(direct_device("dev-1", "aaaaaaaaaaaaaaaa", None))
+                .await
+                .unwrap();
+            let _ = refresh_rx.try_recv();
+
+            ctx.add_device(direct_device("dev-1", "bbbbbbbbbbbbbbbb", None))
+                .await
+                .unwrap();
+            expect_up(
+                &mut refresh_rx,
+                "dev-1",
+                "a key change must rebuild the connection and resubscribe",
+            );
+        }
+
+        #[tokio::test]
+        async fn add_device_rebuilds_connection_when_ip_changes() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+            ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.1")))
+                .await
+                .unwrap();
+            let _ = refresh_rx.try_recv();
+
+            ctx.add_device(direct_device("dev-1", "0123456789abcdef", Some("10.0.0.2")))
+                .await
+                .unwrap();
+            expect_up(
+                &mut refresh_rx,
+                "dev-1",
+                "an ip change must rebuild the connection and resubscribe",
+            );
+        }
+
+        #[tokio::test]
+        async fn add_device_drops_connection_when_shape_changes_direct_to_sub() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+            ctx.add_device(direct_device("dev-1", "0123456789abcdef", None))
+                .await
+                .unwrap();
+            let _ = refresh_rx.try_recv();
+
+            // Re-add as sub-device — direct instance must drop, listener must refresh.
+            ctx.add_device(DeviceConfig {
+                id: "dev-1".into(),
+                name: None,
+                ip: None,
+                key: None,
+                version: None,
+                cid: Some("sub-1".into()),
+                parent_id: Some("gateway-A".into()),
+                last_error_code: None,
+            })
             .await
             .unwrap();
-        assert!(
-            cache.snapshot("dev-1").is_none(),
-            "cache must drop on removal"
-        );
-    }
+            expect_down(
+                &mut refresh_rx,
+                "dev-1",
+                "converting a direct device to a sub-device must drop its connection",
+            );
+        }
 
-    // ── reconfigure ─────────────────────────────────────────────────────────
+        // ── #2: optional template vars fall back to empty string ──────────────
 
-    #[test]
-    fn reconfigure_action_deserializes() {
-        let req: BridgeRequest =
-            serde_json::from_value(json!({ "action": "reconfigure" })).expect("parse reconfigure");
-        assert!(matches!(req, BridgeRequest::Reconfigure));
-        assert_eq!(req.action_name(), "reconfigure");
-    }
+        /// Collects all `MqttMessage`s sent within a short window from the captured
+        /// receiver — `publish_device_event` returns immediately after queuing, so
+        /// a tiny yield is enough.
+        async fn drain_mqtt(rx: &mut mpsc::Receiver<Option<MqttMessage>>) -> Vec<MqttMessage> {
+            // Yield once so any pending sends land in the channel.
+            tokio::task::yield_now().await;
+            let mut out = Vec::new();
+            while let Ok(Some(msg)) = rx.try_recv() {
+                out.push(msg);
+            }
+            out
+        }
 
-    #[tokio::test]
-    async fn reconfigure_without_broker_still_restarts() {
-        // No broker → purge is skipped (nothing to clear), but reconfigure must
-        // still always trigger shutdown ("edit config → reconfigure" is a
-        // uniform habit, broker or not).
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) =
-            make_ctx(|cli| cli.mqtt_broker = None).await;
+        #[tokio::test]
+        async fn publish_event_multi_dp_renders_missing_dp_as_empty() {
+            // Multi-DP mode (event_topic has no {dp}/{value}) + a payload template
+            // that references {dp} → {dp} must render as empty string, not the
+            // literal `{dp}` placeholder.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_event_topic = Some("{root}/event/{id}".to_string());
+                cli.mqtt_payload_template = Some(r#"{"dp":"{dp}","val":{value}}"#.to_string());
+            })
+            .await;
 
-        assert!(!ctx.cancel.is_cancelled());
+            ctx.publish_device_event(
+                "dev-1".to_string(),
+                None,
+                None,
+                json!({"1": true, "2": 50}),
+                false,
+                true,
+            )
+            .await;
 
-        let res = ctx.reconfigure().await.expect("reconfigure ok");
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(msgs.len(), 1, "multi-DP mode emits one message");
+            assert_eq!(msgs[0].topic, "rustuya/event/dev-1");
+            assert!(
+                !msgs[0].payload.contains("{dp}"),
+                "literal {{dp}} must not leak into payload, got: {}",
+                msgs[0].payload
+            );
+            // Concrete shape: `{"dp":"","val":{"1":true,"2":50}}` (key order
+            // depends on serde_json::Map's preservation, so check fragments).
+            assert!(msgs[0].payload.contains(r#""dp":"""#));
+        }
 
-        assert_eq!(res.action.as_deref(), Some("reconfigure"));
-        assert!(
-            res.id.is_none(),
-            "reconfigure is a bridge-level action — no device id (lands on the bridge topic), not \"all\""
-        );
-        assert!(
-            ctx.cancel.is_cancelled(),
-            "reconfigure must always trigger shutdown, even with no broker"
-        );
-    }
+        #[tokio::test]
+        async fn publish_event_single_dp_renders_dp_and_value_per_dp() {
+            // Sanity: with {dp} in event_topic, single-DP mode fires and emits one
+            // message per dp with both {dp} and {value} resolved.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_event_topic = Some("{root}/event/{id}/{dp}".to_string());
+                cli.mqtt_payload_template = Some(r#"{"v":{value}}"#.to_string());
+            })
+            .await;
 
-    #[tokio::test]
-    async fn scavenge_config_unchanged_false_without_config_file() {
-        // No --config path → can't prove the scheme is unchanged → purge.
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
-        assert!(!ctx.scavenge_config_unchanged().await);
-    }
+            ctx.publish_device_event(
+                "dev-1".to_string(),
+                None,
+                None,
+                json!({"1": true, "2": 50}),
+                false,
+                true,
+            )
+            .await;
 
-    #[tokio::test]
-    async fn scavenge_config_unchanged_detects_match_and_change() {
-        let cfg_dir = TempDir::new().expect("cfg tempdir");
-        let cfg_path = cfg_dir.path().join("config.json");
-        let broker = "mqtt://noop.invalid:1883";
-        let matching = format!(
-            r#"{{"mqtt_broker":"{broker}","mqtt_event_topic":"{{root}}/ev/{{id}}","mqtt_retain":true}}"#
-        );
-        tokio::fs::write(&cfg_path, &matching)
+            let mut msgs = drain_mqtt(&mut mqtt_rx).await;
+            msgs.sort_by(|a, b| a.topic.cmp(&b.topic));
+            assert_eq!(msgs.len(), 2);
+            assert_eq!(msgs[0].topic, "rustuya/event/dev-1/1");
+            assert_eq!(msgs[0].payload, r#"{"v":true}"#);
+            assert_eq!(msgs[1].topic, "rustuya/event/dev-1/2");
+            assert_eq!(msgs[1].payload, r#"{"v":50}"#);
+        }
+
+        #[tokio::test]
+        async fn publish_event_empty_string_for_missing_name_in_topic() {
+            // {name} in event_topic with a device that has no name → must render
+            // as empty (not the literal `{name}`), producing `rustuya/event//1`.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_event_topic = Some("{root}/event/{name}/{dp}".to_string());
+                cli.mqtt_payload_template = Some("{value}".to_string());
+            })
+            .await;
+
+            ctx.publish_device_event(
+                "dev-1".to_string(),
+                None,
+                None,
+                json!({"1": true}),
+                false,
+                true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].topic, "rustuya/event//1");
+        }
+
+        // ── #6: publish_device_message wraps non-object payloads ──────────────
+
+        #[tokio::test]
+        async fn publish_message_wraps_non_object_payload_and_injects_id() {
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+
+            // Pass a plain JSON string — exercises the wrap+inject path.
+            ctx.publish_device_message(
+                "dev-1",
+                None,
+                None,
+                "error",
+                Value::String("kaboom".to_string()),
+                false,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(msgs.len(), 1);
+            let parsed: serde_json::Value = serde_json::from_str(&msgs[0].payload).unwrap();
+            let obj = parsed.as_object().unwrap();
+            assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("dev-1"));
+            // Original payload is preserved under the `payload` field.
+            assert_eq!(obj.get("payload").and_then(|v| v.as_str()), Some("kaboom"));
+        }
+
+        // ── #7: mqtt_drop_count is exposed in status response ─────────────────
+
+        // ── B1/B2: remove_device removed-id reporting + selective refresh ──────
+
+        fn sub_device(id: &str, parent_id: &str, cid: &str) -> DeviceConfig {
+            DeviceConfig {
+                id: id.into(),
+                name: None,
+                ip: None,
+                key: None,
+                version: None,
+                cid: Some(cid.into()),
+                parent_id: Some(parent_id.into()),
+                last_error_code: None,
+            }
+        }
+
+        fn named_direct(id: &str, name: &str) -> DeviceConfig {
+            DeviceConfig {
+                id: id.into(),
+                name: Some(name.into()),
+                ip: None,
+                key: Some("0123456789abcdef".into()),
+                version: None,
+                cid: None,
+                parent_id: None,
+                last_error_code: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn remove_by_name_with_cascade_returns_all_removed_ids() {
+            // Removing a single gateway by name that cascades to sub-devices must
+            // return every removed id (gateway + 3 subs) so the handler can answer
+            // one per-id `remove` response each.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+
+            ctx.add_device(named_direct("gw-1", "kitchen-gateway"))
+                .await
+                .unwrap();
+            for cid in ["s1", "s2", "s3"] {
+                ctx.add_device(sub_device(&format!("sub-{cid}"), "gw-1", cid))
+                    .await
+                    .unwrap();
+            }
+
+            let removed = ctx
+                .remove_device(None, Some(vec!["kitchen-gateway".into()]))
+                .await
+                .expect("remove by name");
+
+            assert_eq!(removed.len(), 4, "cascade should remove gateway + 3 subs");
+            assert!(removed.contains(&"gw-1".to_string()));
+            assert!(removed.contains(&"sub-s2".to_string()));
+        }
+
+        #[tokio::test]
+        async fn remove_by_name_with_real_fanout_returns_each_matched_id() {
+            // Two devices share a name → name lookup fans out to both. Each is a
+            // direct device (no subs); both ids are returned individually.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+
+            ctx.add_device(named_direct("dev-a", "kitchen"))
+                .await
+                .unwrap();
+            ctx.add_device(named_direct("dev-b", "kitchen"))
+                .await
+                .unwrap();
+
+            let mut removed = ctx
+                .remove_device(None, Some(vec!["kitchen".into()]))
+                .await
+                .unwrap();
+            removed.sort();
+
+            assert_eq!(removed, vec!["dev-a".to_string(), "dev-b".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn remove_sub_device_only_leaves_the_parent_subscribed() {
+            // Removing a sub-device alone must produce no delta — subs never had a
+            // connection, so tearing down the parent's would be gratuitous churn.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+            ctx.add_device(named_direct("gw-1", "gw")).await.unwrap();
+            ctx.add_device(sub_device("sub-A", "gw-1", "cid-A"))
+                .await
+                .unwrap();
+            // Drain the deltas from the adds.
+            while refresh_rx.try_recv().is_ok() {}
+
+            ctx.remove_device(Some(vec!["sub-A".into()]), None)
+                .await
+                .unwrap();
+
+            expect_no_delta(
+                &mut refresh_rx,
+                "removing only a sub-device must not disturb the parent's connection",
+            );
+        }
+
+        #[tokio::test]
+        async fn remove_direct_device_unsubscribes_it() {
+            // The inverse: a direct-device removal must unsubscribe it, so the
+            // listener stops holding streams for a device that no longer exists.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+
+            ctx.add_device(named_direct("gw-1", "gw")).await.unwrap();
+            while refresh_rx.try_recv().is_ok() {}
+
+            ctx.remove_device(Some(vec!["gw-1".into()]), None)
+                .await
+                .unwrap();
+
+            expect_down(
+                &mut refresh_rx,
+                "gw-1",
+                "removing a direct device must drop its connection",
+            );
+        }
+
+        #[tokio::test]
+        async fn status_response_includes_mqtt_drop_count() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+            // Simulate a drop having happened.
+            ctx.mqtt_drop_count.store(3, Ordering::Relaxed);
+
+            let res = ctx.get_bridge_status(None, None).await;
+            let v = serde_json::to_value(&res).unwrap();
+            assert_eq!(
+                v.get("mqtt_drop_count").and_then(|n| n.as_u64()),
+                Some(3),
+                "status must surface the cumulative MQTT drop count"
+            );
+        }
+
+        #[tokio::test]
+        async fn status_paginates_large_fleet() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+            {
+                let mut state = ctx.state.write().await;
+                for i in 0..60 {
+                    let id = format!("dev{i:03}");
+                    state.configs.insert(
+                        id.clone(),
+                        serde_json::from_value(serde_json::json!({"id": id, "key": "k"})).unwrap(),
+                    );
+                }
+            }
+
+            // Default: one capped page, but the full count is always reported.
+            let v = serde_json::to_value(ctx.get_bridge_status(None, None).await).unwrap();
+            assert_eq!(v["device_count"], 60);
+            assert_eq!(v["returned"], STATUS_DEFAULT_PAGE);
+            assert_eq!(v["devices"].as_object().unwrap().len(), STATUS_DEFAULT_PAGE);
+            assert_eq!(v["has_more"], true);
+
+            // Second page drains the remainder.
+            let v2 = serde_json::to_value(ctx.get_bridge_status(Some(50), None).await).unwrap();
+            assert_eq!(v2["returned"], 10);
+            assert_eq!(v2["has_more"], false);
+
+            // An over-large limit is capped, never honored verbatim.
+            let v3 =
+                serde_json::to_value(ctx.get_bridge_status(Some(0), Some(100_000)).await).unwrap();
+            assert_eq!(v3["limit"], STATUS_MAX_PAGE as u64);
+        }
+
+        // ── cache mode bring-up ────────────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn passthrough_mode_skips_cache_when_retain_off() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(false);
+            })
+            .await;
+            assert!(!ctx.mqtt_retain);
+            assert!(
+                ctx.cache.is_none(),
+                "pass-through mode must not allocate a cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn cache_mode_allocates_cache_with_type_in_topic() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                // Default event topic contains {type}, so cache mode stays enabled.
+            })
+            .await;
+            assert!(ctx.mqtt_retain);
+            assert!(ctx.cache.is_some(), "cache mode must allocate a cache");
+        }
+
+        #[tokio::test]
+        async fn cache_mode_stays_active_when_type_missing_from_both() {
+            // No-{type} setup is opt-in for users whose fleet has no event
+            // automations — state recovery via retained snapshot still works
+            // (no-retain active never overwrites the retained passive). Bridge
+            // logs a WARN about potential live double-fire but honors the
+            // explicit mqtt_retain=true.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                cli.mqtt_event_topic = Some("{root}/event/{id}".into());
+                cli.mqtt_payload_template = Some("{value}".into());
+            })
+            .await;
+            assert!(ctx.mqtt_retain, "mqtt_retain=true must stay honored");
+            assert!(ctx.cache.is_some());
+        }
+
+        #[tokio::test]
+        async fn cache_mode_stays_active_when_type_in_payload_only() {
+            // {type} in payload template suffices — subscribers can filter on
+            // `value_json.type` even if topic doesn't separate active/passive.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                cli.mqtt_event_topic = Some("{root}/event/{id}/{dp}".into());
+                cli.mqtt_payload_template = Some("{\"type\":\"{type}\",\"value\":{value}}".into());
+            })
+            .await;
+            assert!(
+                ctx.mqtt_retain,
+                "{{type}} in payload template alone must keep cache mode active"
+            );
+            assert!(ctx.cache.is_some());
+        }
+
+        // ── cache-mode publish routing ──────────────────────────────────────────────────
+
+        async fn add_named_direct(ctx: &Arc<BridgeContext>, id: &str) {
+            ctx.add_device(DeviceConfig {
+                id: id.into(),
+                name: Some(format!("name-{id}")),
+                ip: Some("10.0.0.1".into()),
+                key: Some("0123456789abcdef".into()),
+                version: None,
+                cid: None,
+                parent_id: None,
+                last_error_code: None,
+            })
             .await
-            .expect("write config");
-        let cfg_str = cfg_path.to_string_lossy().into_owned();
+            .expect("add device");
+        }
 
-        let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
-            cli.config = Some(cfg_str.clone());
-            cli.mqtt_broker = Some(broker.into());
-            cli.mqtt_event_topic = Some("{root}/ev/{id}".into());
-            cli.mqtt_retain = Some(true);
-        })
-        .await;
+        #[tokio::test]
+        async fn cache_mode_active_publishes_delta_then_snapshot_after_seed() {
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await; // any add-time publishes
 
-        // File matches in-memory (broker + root/event/message topic + retain) → skip purge.
-        assert!(
-            ctx.scavenge_config_unchanged().await,
-            "matching config must read as unchanged"
-        );
+            // Pretend the seed phase finished so snapshots aren't deferred.
+            ctx.seed_done.store(true, Ordering::Release);
 
-        // Relocate the event topic on disk → a restart would orphan retained → purge.
-        tokio::fs::write(
+            let dps = serde_json::json!({"1": true});
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                dps,
+                /* is_passive */ false,
+                /* exists */ true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(
+                msgs.len(),
+                2,
+                "active in cache mode must produce a delta + a snapshot publish"
+            );
+            let active = msgs.iter().find(|m| !m.retain).expect("active no-retain");
+            let snapshot = msgs.iter().find(|m| m.retain).expect("snapshot retained");
+            assert!(active.topic.contains("/active/"));
+            assert!(snapshot.topic.contains("/state/"));
+        }
+
+        #[tokio::test]
+        async fn cache_mode_passive_publishes_delta_then_snapshot_after_seed() {
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            // Passive arrives as a raw JSON object (no `dps` key). The synthesised
+            // dps becomes this object, which goes straight into the cache.
+            let payload = serde_json::json!({"battery": 80});
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                payload,
+                /* is_passive */ true,
+                true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(
+                msgs.len(),
+                2,
+                "passive in cache mode produces a no-retain delta + a retained snapshot"
+            );
+            let delta = msgs
+                .iter()
+                .find(|m| !m.retain)
+                .expect("passive delta no-retain");
+            let snapshot = msgs.iter().find(|m| m.retain).expect("snapshot retained");
+            assert!(
+                delta.topic.contains("/passive/"),
+                "delta on {{type}}=passive"
+            );
+            assert!(
+                snapshot.topic.contains("/state/"),
+                "snapshot on {{type}}=state"
+            );
+        }
+
+        #[tokio::test]
+        async fn cache_mode_partial_passive_preserves_other_cached_keys() {
+            // The bug this whole redesign fixes: a battery-only passive update
+            // must not wipe the previously-known state DPs from the retained
+            // snapshot. The cache merges, so the snapshot we publish still has
+            // both keys.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                serde_json::json!({"1": true, "2": 50}),
+                true, // passive periodic status report
+                true,
+            )
+            .await;
+            drain_mqtt(&mut mqtt_rx).await;
+
+            // Battery-only partial follow-up
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                serde_json::json!({"battery": 80}),
+                true,
+                true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            // Battery-only passive → a no-retain delta (battery only) + the merged
+            // retained snapshot. The snapshot is what must still carry DPs 1 and 2.
+            let snapshot = msgs
+                .iter()
+                .find(|m| m.retain)
+                .expect("merged snapshot retained");
+            let payload: serde_json::Value = serde_json::from_str(&snapshot.payload).unwrap();
+            assert_eq!(payload.get("1"), Some(&serde_json::json!(true)));
+            assert_eq!(payload.get("2"), Some(&serde_json::json!(50)));
+            assert_eq!(payload.get("battery"), Some(&serde_json::json!(80)));
+        }
+
+        #[tokio::test]
+        async fn cache_mode_snapshot_publish_deferred_during_seed() {
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            // seed_done stays false — simulating the seed window.
+
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                serde_json::json!({"1": true}),
+                false, // active
+                true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            // Active delta still fires (HA event automations); snapshot is deferred.
+            assert_eq!(msgs.len(), 1, "only active delta during seed");
+            assert!(!msgs[0].retain);
+            assert!(msgs[0].topic.contains("/active/"));
+
+            assert!(
+                ctx.seed_pending.lock().unwrap().contains("dev-1"),
+                "device should be queued for the seed-end flush"
+            );
+        }
+
+        #[tokio::test]
+        async fn cache_mode_dedupes_unchanged_snapshot_but_always_emits_delta() {
+            // The retained `state` snapshot dedupes on unchanged values, but the
+            // no-retain delta always fires so a repeated `get`/status readback is
+            // still observable (the whole reason passive gets a live delta).
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                serde_json::json!({"1": true}),
+                true,
+                true,
+            )
+            .await;
+            let first = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(first.len(), 2, "first passive: delta + snapshot");
+            assert_eq!(
+                first.iter().filter(|m| m.retain).count(),
+                1,
+                "one retained snapshot"
+            );
+
+            // Same value again — cache.merge returns no changed keys → no snapshot,
+            // but the no-retain delta still publishes.
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                serde_json::json!({"1": true}),
+                true,
+                true,
+            )
+            .await;
+            let second = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(second.len(), 1, "same-value passive still emits the delta");
+            assert!(!second[0].retain, "no retained snapshot on unchanged value");
+            assert!(second[0].topic.contains("/passive/"));
+        }
+
+        #[tokio::test]
+        async fn passthrough_mode_publishes_single_message() {
+            // Sanity: pass-through mode retains the historical one-publish-per-event shape.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(false);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                serde_json::json!({"1": true}),
+                false,
+                true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(
+                msgs.len(),
+                1,
+                "pass-through must publish exactly one message"
+            );
+            assert!(!msgs[0].retain, "pass-through never retains");
+            assert!(msgs[0].topic.contains("/active/"));
+        }
+
+        // ── cache-mode seed phase ───────────────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn cache_mode_default_template_arms_seed_wildcard() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            assert!(
+                ctx.seed_state_wildcard.is_some(),
+                "default template + cache mode must produce a seed wildcard"
+            );
+            assert!(ctx.seed_state_regex.is_some());
+            assert!(
+                !ctx.seed_done.load(Ordering::Acquire),
+                "seed_done starts false to gate snapshots"
+            );
+        }
+
+        // (The historical "custom template disables seed" assertion was retired
+        // — JSON-shaped templates are now seed-parseable. The retained-shape
+        // gate lives in `payload::validate_payload_template`; coverage
+        // for both the supported and unsupported cases is in two new tests
+        // below, near the other ☆ seed setup.)
+
+        #[tokio::test]
+        async fn match_seed_topic_extracts_id_in_multi_dp_mode() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                cli.mqtt_event_topic = Some("{root}/event/{type}/{id}".into());
+            })
+            .await;
+            let (id, dp) = ctx
+                .match_seed_topic("rustuya/event/state/dev-1")
+                .expect("topic should match");
+            assert_eq!(id, "dev-1");
+            assert!(dp.is_none(), "multi-DP mode has no {{dp}}");
+        }
+
+        #[tokio::test]
+        async fn match_seed_topic_extracts_id_and_dp_in_single_dp_mode() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
+            })
+            .await;
+            let (id, dp) = ctx
+                .match_seed_topic("rustuya/event/state/dev-1/42")
+                .expect("topic should match");
+            assert_eq!(id, "dev-1");
+            assert_eq!(dp.as_deref(), Some("42"));
+        }
+
+        // parse_seed_payload-equivalent unit tests live in
+        // `crate::payload::tests` (default + custom-template scenarios).
+
+        #[tokio::test]
+        async fn cache_mode_custom_template_with_parseable_shape_enables_seed() {
+            // A JSON-shaped custom template is now seed-parseable — the
+            // historical "default template only" restriction is gone.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                cli.mqtt_payload_template = Some(r#"{"type":"{type}","value":{value}}"#.into());
+            })
+            .await;
+            assert!(
+                ctx.seed_state_wildcard.is_some(),
+                "JSON-shaped template must arm the seed wildcard"
+            );
+            assert!(
+                !ctx.seed_done.load(Ordering::Acquire),
+                "seed_done must start false so the seed phase runs"
+            );
+        }
+
+        #[tokio::test]
+        async fn cache_mode_unparseable_template_skips_seed() {
+            // Text-style template (e.g. `key=val` style) can't be sentinelled
+            // into valid JSON → seed disabled, seed_done pre-flipped.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                cli.mqtt_payload_template = Some("v={value};ts={timestamp}".into());
+            })
+            .await;
+            assert!(ctx.seed_state_wildcard.is_none());
+            assert!(ctx.seed_done.load(Ordering::Acquire));
+        }
+
+        #[tokio::test]
+        async fn on_seed_complete_flips_flag_and_flushes_pending() {
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+
+            // Simulate an active arriving during the seed window — snapshot
+            // publish is deferred, device gets queued in seed_pending.
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                json!({"1": true}),
+                false,
+                true,
+            )
+            .await;
+            let pre = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(pre.len(), 1, "only active delta during seed");
+            assert!(ctx.seed_pending.lock().unwrap().contains("dev-1"));
+
+            // Seed completes: flag flips, pending drains, snapshot publishes.
+            ctx.on_seed_complete().await;
+            assert!(ctx.seed_done.load(Ordering::Acquire));
+            assert!(ctx.seed_pending.lock().unwrap().is_empty());
+
+            let post = drain_mqtt(&mut mqtt_rx).await;
+            assert_eq!(post.len(), 1, "flush publishes one snapshot");
+            assert!(post[0].retain, "flush snapshot is retained");
+            assert!(post[0].topic.contains("/state/"));
+        }
+
+        #[tokio::test]
+        async fn on_seed_complete_is_idempotent() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            ctx.on_seed_complete().await;
+            // Second call must be a no-op — seed_done already true.
+            ctx.on_seed_complete().await;
+            assert!(ctx.seed_done.load(Ordering::Acquire));
+        }
+
+        #[tokio::test]
+        async fn cache_mode_runtime_added_device_publishes_immediately_after_seed() {
+            // Devices added after seed_done flips should not be silently queued
+            // for an already-finished flush — their first cache change must
+            // publish right away.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            add_named_direct(&ctx, "late-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+
+            ctx.publish_device_event(
+                "late-1".into(),
+                Some("name-late-1".into()),
+                None,
+                json!({"1": true}),
+                true,
+                true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            // passive → no-retain delta + retained snapshot.
+            let snaps: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
+            assert_eq!(
+                snaps.len(),
+                1,
+                "runtime-added device must publish snapshot on first cache change"
+            );
+            assert!(snaps[0].topic.contains("/state/"));
+            assert!(
+                ctx.seed_pending.lock().unwrap().is_empty(),
+                "must not queue when seed already done"
+            );
+        }
+
+        #[tokio::test]
+        async fn cache_mode_single_dp_mode_publishes_snapshot_per_dp() {
+            // Single-DP topic template → each DP gets its own snapshot message.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                json!({"1": true, "2": 50}),
+                true,
+                true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            let snapshots: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
+            assert_eq!(
+                snapshots.len(),
+                2,
+                "single-DP snapshot publishes one retained message per DP"
+            );
+            let topics: Vec<&str> = snapshots.iter().map(|m| m.topic.as_str()).collect();
+            assert!(topics.iter().any(|t| t.ends_with("/1")));
+            assert!(topics.iter().any(|t| t.ends_with("/2")));
+        }
+
+        #[tokio::test]
+        async fn cache_mode_single_dp_publishes_only_changed_dps() {
+            // Regression for a user-reported bug: after the cache is populated
+            // with multiple DPs, an event changing one DP should NOT also
+            // republish snapshots for unchanged DPs in single-DP topic mode.
+            // Each per-DP topic already has the correct retained from prior
+            // snapshots — re-emitting them on {type}=state on every unrelated
+            // event spuriously surfaces "events" for DPs that didn't change.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+                cli.mqtt_event_topic = Some("{root}/event/{type}/{id}/{dp}".into());
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            // Seed cache with two DPs, drain the resulting publishes.
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                json!({"1": true, "2": 50}),
+                true,
+                true,
+            )
+            .await;
+            drain_mqtt(&mut mqtt_rx).await;
+
+            // Now change only DP 1.
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                json!({"1": false}),
+                false,
+                true,
+            )
+            .await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            let snapshots: Vec<_> = msgs.iter().filter(|m| m.retain).collect();
+            assert_eq!(
+                snapshots.len(),
+                1,
+                "single-DP mode must only republish the DP that changed, not all cached DPs"
+            );
+            assert!(
+                snapshots[0].topic.ends_with("/1"),
+                "snapshot must be for the changed DP only (got '{}')",
+                snapshots[0].topic
+            );
+        }
+
+        // ── active/passive detection ───────────────────────────────────────────
+
+        #[tokio::test]
+        async fn handle_event_classifies_data_dps_wrapper_as_active() {
+            // User-confirmed wire shape: device-initiated DP_STATUS (cmd 8)
+            // wraps the dps under `data`. Bridge must classify as active and
+            // publish to {type}=active.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            let payload = r#"{"data":{"dps":{"1":false,"2":false}},"protocol":4,"t":1780376055}"#;
+            ctx.handle_device_event("dev-1", payload.into()).await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            assert!(
+                msgs.iter().any(|m| m.topic.contains("/active/")),
+                "data.dps wrapper must produce an active publish (got topics: {:?})",
+                msgs.iter().map(|m| &m.topic).collect::<Vec<_>>()
+            );
+        }
+
+        #[tokio::test]
+        async fn handle_event_classifies_root_dps_as_passive() {
+            // User-confirmed wire shape: DP_QUERY response (cmd 16) puts dps
+            // at the root with no `data` wrapper. Classified as passive: a
+            // no-retain passive delta plus a retained state snapshot — never active.
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            let payload = r#"{"dps":{"1":false,"14":"off","2":false,"7":0,"8":0}}"#;
+            ctx.handle_device_event("dev-1", payload.into()).await;
+
+            let msgs = drain_mqtt(&mut mqtt_rx).await;
+            assert!(
+                !msgs.iter().any(|m| m.topic.contains("/active/")),
+                "root dps without data wrapper must NOT produce active publish"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m.topic.contains("/passive/") && !m.retain),
+                "passive must produce a no-retain delta"
+            );
+            assert!(
+                msgs.iter().any(|m| m.topic.contains("/state/") && m.retain),
+                "passive must also produce a retained state snapshot"
+            );
+        }
+
+        #[tokio::test]
+        async fn cache_mode_remove_drops_cached_snapshot() {
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+            add_named_direct(&ctx, "dev-1").await;
+            drain_mqtt(&mut mqtt_rx).await;
+            ctx.seed_done.store(true, Ordering::Release);
+
+            ctx.publish_device_event(
+                "dev-1".into(),
+                Some("name-dev-1".into()),
+                None,
+                serde_json::json!({"1": true}),
+                true,
+                true,
+            )
+            .await;
+            let cache = ctx.cache.as_ref().expect("cache exists");
+            assert!(cache.snapshot("dev-1").is_some());
+
+            ctx.remove_device(Some(vec!["dev-1".into()]), None)
+                .await
+                .unwrap();
+            assert!(
+                cache.snapshot("dev-1").is_none(),
+                "cache must drop on removal"
+            );
+        }
+
+        // ── reconfigure ─────────────────────────────────────────────────────────
+
+        #[test]
+        fn reconfigure_action_deserializes() {
+            let req: BridgeRequest = serde_json::from_value(json!({ "action": "reconfigure" }))
+                .expect("parse reconfigure");
+            assert!(matches!(req, BridgeRequest::Reconfigure));
+            assert_eq!(req.action_name(), "reconfigure");
+        }
+
+        #[tokio::test]
+        async fn reconfigure_without_broker_still_restarts() {
+            // No broker → purge is skipped (nothing to clear), but reconfigure must
+            // still always trigger shutdown ("edit config → reconfigure" is a
+            // uniform habit, broker or not).
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) =
+                make_ctx(|cli| cli.mqtt_broker = None).await;
+
+            assert!(!ctx.cancel.is_cancelled());
+
+            let res = ctx.reconfigure().await.expect("reconfigure ok");
+
+            assert_eq!(res.action.as_deref(), Some("reconfigure"));
+            assert!(
+                res.id.is_none(),
+                "reconfigure is a bridge-level action — no device id (lands on the bridge topic), not \"all\""
+            );
+            assert!(
+                ctx.cancel.is_cancelled(),
+                "reconfigure must always trigger shutdown, even with no broker"
+            );
+        }
+
+        #[tokio::test]
+        async fn scavenge_config_unchanged_false_without_config_file() {
+            // No --config path → can't prove the scheme is unchanged → purge.
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+            assert!(!ctx.scavenge_config_unchanged().await);
+        }
+
+        #[tokio::test]
+        async fn scavenge_config_unchanged_detects_match_and_change() {
+            let cfg_dir = TempDir::new().expect("cfg tempdir");
+            let cfg_path = cfg_dir.path().join("config.json");
+            let broker = "mqtt://noop.invalid:1883";
+            let matching = format!(
+                r#"{{"mqtt_broker":"{broker}","mqtt_event_topic":"{{root}}/ev/{{id}}","mqtt_retain":true}}"#
+            );
+            tokio::fs::write(&cfg_path, &matching)
+                .await
+                .expect("write config");
+            let cfg_str = cfg_path.to_string_lossy().into_owned();
+
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.config = Some(cfg_str.clone());
+                cli.mqtt_broker = Some(broker.into());
+                cli.mqtt_event_topic = Some("{root}/ev/{id}".into());
+                cli.mqtt_retain = Some(true);
+            })
+            .await;
+
+            // File matches in-memory (broker + root/event/message topic + retain) → skip purge.
+            assert!(
+                ctx.scavenge_config_unchanged().await,
+                "matching config must read as unchanged"
+            );
+
+            // Relocate the event topic on disk → a restart would orphan retained → purge.
+            tokio::fs::write(
             &cfg_path,
             r#"{"mqtt_broker":"mqtt://noop.invalid:1883","mqtt_event_topic":"{root}/NEW/{id}","mqtt_retain":true}"#,
         )
         .await
         .expect("rewrite config");
-        assert!(
-            !ctx.scavenge_config_unchanged().await,
-            "an event-topic change must be detected"
-        );
+            assert!(
+                !ctx.scavenge_config_unchanged().await,
+                "an event-topic change must be detected"
+            );
 
-        // Point at a different broker → the old broker's retained would orphan → purge.
-        tokio::fs::write(
+            // Point at a different broker → the old broker's retained would orphan → purge.
+            tokio::fs::write(
             &cfg_path,
             r#"{"mqtt_broker":"mqtt://other.invalid:1883","mqtt_event_topic":"{root}/ev/{id}","mqtt_retain":true}"#,
         )
         .await
         .expect("rewrite config");
-        assert!(
-            !ctx.scavenge_config_unchanged().await,
-            "a broker change must be detected"
-        );
-    }
-
-    /// The liveness probe's `status` ping must survive any command-topic
-    /// template: the rendered topic has to (a) match what the incumbent
-    /// subscribes to and (b) parse back to a `Status` request — including
-    /// templates that carry the action in the topic (`{action}`) or that would
-    /// otherwise render an empty segment. Guards the two regressions found
-    /// while building the probe.
-    #[tokio::test]
-    async fn liveness_probe_command_topic_round_trips_across_templates() {
-        let templates = [
-            "{root}/command",
-            "{root}/command/{action}",
-            "{root}/command/{id}",
-            "{root}/command/{cid}",
-            "{root}/command/{action}/{id}/{dp}",
-        ];
-        for tmpl in templates {
-            let (ctx, _tmp, _m, _s, _r) =
-                make_ctx(|cli| cli.mqtt_command_topic = Some((*tmpl).to_string())).await;
-
-            // Incumbent side, exactly as `spawn_mqtt_task` builds it: the
-            // root-substituted template drives both the regex and the match.
-            let (cmd_tmpl, _) = ctx.cli.mqtt_topics();
-            let re = compile_topic_regex(&cmd_tmpl);
-
-            let probe_topic = ctx.probe_command_topic();
-
-            // No empty levels — the command regex captures `[^/]+` per level.
             assert!(
-                !probe_topic.split('/').any(str::is_empty),
-                "probe topic {probe_topic:?} has an empty segment for {tmpl:?}"
-            );
-
-            let vars = match_topic(&probe_topic, &cmd_tmpl, re.as_ref()).unwrap_or_else(|| {
-                panic!("probe topic {probe_topic:?} must match the subscription for {tmpl:?}")
-            });
-
-            let req_val = crate::payload::parse_mqtt_payload(r#"{"action":"status"}"#, &vars);
-            let req: BridgeRequest = serde_json::from_value(req_val)
-                .unwrap_or_else(|e| panic!("must parse to a request for {tmpl:?}: {e}"));
-            assert!(
-                matches!(req, BridgeRequest::Status { .. }),
-                "probe must parse to Status for {tmpl:?}, got {:?}",
-                req.action_name()
+                !ctx.scavenge_config_unchanged().await,
+                "a broker change must be detected"
             );
         }
-    }
 
-    /// The probe listens on the exact topic the incumbent publishes its
-    /// `status` reply to. Drives the real publish path (`get_bridge_status` →
-    /// `publish_api_response`) and asserts the captured topic equals what the
-    /// probe subscribes to — so the two halves can't silently drift apart.
-    #[tokio::test]
-    async fn liveness_probe_response_topic_matches_status_publish() {
-        for msg_tmpl in ["{root}/{level}/{id}", "{root}/{level}/{id}/{name}"] {
-            let (ctx, _tmp, mut mqtt_rx, _s, _r) =
-                make_ctx(|cli| cli.mqtt_message_topic = Some((*msg_tmpl).to_string())).await;
+        /// The liveness probe's `status` ping must survive any command-topic
+        /// template: the rendered topic has to (a) match what the incumbent
+        /// subscribes to and (b) parse back to a `Status` request — including
+        /// templates that carry the action in the topic (`{action}`) or that would
+        /// otherwise render an empty segment. Guards the two regressions found
+        /// while building the probe.
+        #[tokio::test]
+        async fn liveness_probe_command_topic_round_trips_across_templates() {
+            let templates = [
+                "{root}/command",
+                "{root}/command/{action}",
+                "{root}/command/{id}",
+                "{root}/command/{cid}",
+                "{root}/command/{action}/{id}/{dp}",
+            ];
+            for tmpl in templates {
+                let (ctx, _tmp, _m, _s, _r) =
+                    make_ctx(|cli| cli.mqtt_command_topic = Some((*tmpl).to_string())).await;
 
-            let resp = ctx.get_bridge_status(None, None).await;
-            ctx.publish_api_response(resp).await;
+                // Incumbent side, exactly as `spawn_mqtt_task` builds it: the
+                // root-substituted template drives both the regex and the match.
+                let (cmd_tmpl, _) = ctx.cli.mqtt_topics();
+                let re = compile_topic_regex(&cmd_tmpl);
 
-            let published = mqtt_rx
-                .recv()
+                let probe_topic = ctx.probe_command_topic();
+
+                // No empty levels — the command regex captures `[^/]+` per level.
+                assert!(
+                    !probe_topic.split('/').any(str::is_empty),
+                    "probe topic {probe_topic:?} has an empty segment for {tmpl:?}"
+                );
+
+                let vars = match_topic(&probe_topic, &cmd_tmpl, re.as_ref()).unwrap_or_else(|| {
+                    panic!("probe topic {probe_topic:?} must match the subscription for {tmpl:?}")
+                });
+
+                let req_val = crate::payload::parse_mqtt_payload(r#"{"action":"status"}"#, &vars);
+                let req: BridgeRequest = serde_json::from_value(req_val)
+                    .unwrap_or_else(|e| panic!("must parse to a request for {tmpl:?}: {e}"));
+                assert!(
+                    matches!(req, BridgeRequest::Status { .. }),
+                    "probe must parse to Status for {tmpl:?}, got {:?}",
+                    req.action_name()
+                );
+            }
+        }
+
+        /// The probe listens on the exact topic the incumbent publishes its
+        /// `status` reply to. Drives the real publish path (`get_bridge_status` →
+        /// `publish_api_response`) and asserts the captured topic equals what the
+        /// probe subscribes to — so the two halves can't silently drift apart.
+        #[tokio::test]
+        async fn liveness_probe_response_topic_matches_status_publish() {
+            for msg_tmpl in ["{root}/{level}/{id}", "{root}/{level}/{id}/{name}"] {
+                let (ctx, _tmp, mut mqtt_rx, _s, _r) =
+                    make_ctx(|cli| cli.mqtt_message_topic = Some((*msg_tmpl).to_string())).await;
+
+                let resp = ctx.get_bridge_status(None, None).await;
+                ctx.publish_api_response(resp).await;
+
+                let published = mqtt_rx
+                    .recv()
+                    .await
+                    .expect("channel open")
+                    .expect("a publish, not a shutdown signal");
+                assert_eq!(
+                    ctx.probe_response_topic(),
+                    published.topic,
+                    "probe must subscribe where status replies land, for {msg_tmpl:?}"
+                );
+            }
+        }
+
+        // ── set_config ──────────────────────────────────────────────────────
+
+        /// Builds a context whose `--config` points at a temp file seeded with
+        /// `file_json`. Broker is left `None` so a chained `do_reconfigure` skips the
+        /// (network-bound) retained purge and just trips the cancel token.
+        async fn make_ctx_with_config(file_json: &str) -> (Arc<BridgeContext>, TempDir, String) {
+            let tmp = TempDir::new().expect("create tempdir");
+            let cfg_path = tmp.path().join("config.json");
+            tokio::fs::write(&cfg_path, file_json)
                 .await
-                .expect("channel open")
-                .expect("a publish, not a shutdown signal");
+                .expect("write config");
+            let cfg_str = cfg_path.to_string_lossy().into_owned();
+            let cli = Cli {
+                config: Some(cfg_str.clone()),
+                state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
+                ..Cli::default()
+            };
+            let (ctx, _mqtt_rx, _save_rx, _refresh_rx) =
+                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                    .await
+                    .expect("new context");
+            (ctx, tmp, cfg_str)
+        }
+
+        #[tokio::test]
+        async fn set_config_patches_file_and_reports_change() {
+            let (ctx, _tmp, cfg) =
+                make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/event/{type}/{id}"}"#).await;
+
+            let resp = ctx
+                .set_config(
+                    None,
+                    Some("{root}/ev/{id}".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("set_config ok");
+
+            assert_eq!(resp.status, crate::types::Status::Ok);
             assert_eq!(
-                ctx.probe_response_topic(),
-                published.topic,
-                "probe must subscribe where status replies land, for {msg_tmpl:?}"
+                resp.extra.get("reconfigure_required"),
+                Some(&Value::Bool(true))
             );
-        }
-    }
-
-    // ── set_config ──────────────────────────────────────────────────────
-
-    /// Builds a context whose `--config` points at a temp file seeded with
-    /// `file_json`. Broker is left `None` so a chained `do_reconfigure` skips the
-    /// (network-bound) retained purge and just trips the cancel token.
-    async fn make_ctx_with_config(file_json: &str) -> (Arc<BridgeContext>, TempDir, String) {
-        let tmp = TempDir::new().expect("create tempdir");
-        let cfg_path = tmp.path().join("config.json");
-        tokio::fs::write(&cfg_path, file_json)
-            .await
-            .expect("write config");
-        let cfg_str = cfg_path.to_string_lossy().into_owned();
-        let cli = Cli {
-            config: Some(cfg_str.clone()),
-            state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
-            ..Cli::default()
-        };
-        let (ctx, _mqtt_rx, _save_rx, _refresh_rx) =
-            BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
-                .await
-                .expect("new context");
-        (ctx, tmp, cfg_str)
-    }
-
-    #[tokio::test]
-    async fn set_config_patches_file_and_reports_change() {
-        let (ctx, _tmp, cfg) =
-            make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/event/{type}/{id}"}"#).await;
-
-        let resp = ctx
-            .set_config(None, Some("{root}/ev/{id}".into()), None, None, None, None, false)
-            .await
-            .expect("set_config ok");
-
-        assert_eq!(resp.status, crate::types::Status::Ok);
-        assert_eq!(
-            resp.extra.get("reconfigure_required"),
-            Some(&Value::Bool(true))
-        );
-        let changed = resp
-            .extra
-            .get("changed")
-            .and_then(Value::as_object)
-            .expect("changed object");
-        assert!(changed.contains_key("mqtt_event_topic"));
-
-        // The new value is committed to disk.
-        let content = tokio::fs::read_to_string(&cfg).await.expect("read back");
-        let written: Cli = serde_json::from_str(&content).expect("parse back");
-        assert_eq!(written.mqtt_event_topic.as_deref(), Some("{root}/ev/{id}"));
-    }
-
-    #[tokio::test]
-    async fn set_config_noop_when_value_unchanged() {
-        let (ctx, _tmp, cfg) =
-            make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/ev/{id}"}"#).await;
-        let before = tokio::fs::read_to_string(&cfg).await.unwrap();
-
-        let resp = ctx
-            .set_config(None, Some("{root}/ev/{id}".into()), None, None, None, None, false)
-            .await
-            .expect("ok");
-
-        assert_eq!(
-            resp.extra.get("reconfigure_required"),
-            Some(&Value::Bool(false))
-        );
-        assert!(
-            resp.extra
+            let changed = resp
+                .extra
                 .get("changed")
                 .and_then(Value::as_object)
-                .unwrap()
-                .is_empty()
-        );
-        // No effective change → file is left byte-for-byte untouched.
-        assert_eq!(before, tokio::fs::read_to_string(&cfg).await.unwrap());
-    }
+                .expect("changed object");
+            assert!(changed.contains_key("mqtt_event_topic"));
 
-    #[tokio::test]
-    async fn set_config_rejects_wildcards() {
-        let (ctx, _tmp, _cfg) = make_ctx_with_config("{}").await;
-        let err = ctx
-            .set_config(Some("{root}/cmd/#".into()), None, None, None, None, None, false)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidRequest(_)));
-    }
+            // The new value is committed to disk.
+            let content = tokio::fs::read_to_string(&cfg).await.expect("read back");
+            let written: Cli = serde_json::from_str(&content).expect("parse back");
+            assert_eq!(written.mqtt_event_topic.as_deref(), Some("{root}/ev/{id}"));
+        }
 
-    #[tokio::test]
-    async fn set_config_requires_a_config_file() {
-        let tmp = TempDir::new().unwrap();
-        let cli = Cli {
-            config: None,
-            state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
-            ..Cli::default()
-        };
-        let (ctx, _m, _s, _r) =
-            BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+        #[tokio::test]
+        async fn set_config_noop_when_value_unchanged() {
+            let (ctx, _tmp, cfg) =
+                make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/ev/{id}"}"#).await;
+            let before = tokio::fs::read_to_string(&cfg).await.unwrap();
+
+            let resp = ctx
+                .set_config(
+                    None,
+                    Some("{root}/ev/{id}".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
                 .await
-                .unwrap();
-        let err = ctx
-            .set_config(None, Some("{root}/ev/{id}".into()), None, None, None, None, false)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidRequest(_)));
+                .expect("ok");
+
+            assert_eq!(
+                resp.extra.get("reconfigure_required"),
+                Some(&Value::Bool(false))
+            );
+            assert!(
+                resp.extra
+                    .get("changed")
+                    .and_then(Value::as_object)
+                    .unwrap()
+                    .is_empty()
+            );
+            // No effective change → file is left byte-for-byte untouched.
+            assert_eq!(before, tokio::fs::read_to_string(&cfg).await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn set_config_rejects_wildcards() {
+            let (ctx, _tmp, _cfg) = make_ctx_with_config("{}").await;
+            let err = ctx
+                .set_config(
+                    Some("{root}/cmd/#".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BridgeError::InvalidRequest(_)));
+        }
+
+        #[tokio::test]
+        async fn set_config_requires_a_config_file() {
+            let tmp = TempDir::new().unwrap();
+            let cli = Cli {
+                config: None,
+                state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
+                ..Cli::default()
+            };
+            let (ctx, _m, _s, _r) =
+                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new())
+                    .await
+                    .unwrap();
+            let err = ctx
+                .set_config(
+                    None,
+                    Some("{root}/ev/{id}".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BridgeError::InvalidRequest(_)));
+        }
+
+        #[tokio::test]
+        async fn set_config_apply_triggers_reconfigure() {
+            let (ctx, _tmp, _cfg) =
+                make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/event/{type}/{id}"}"#).await;
+            assert!(!ctx.cancel.is_cancelled());
+
+            let resp = ctx
+                .set_config(
+                    None,
+                    Some("{root}/ev/{id}".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .expect("ok");
+
+            assert_eq!(
+                resp.extra.get("reconfigure"),
+                Some(&Value::String("triggered".into()))
+            );
+            assert!(
+                ctx.cancel.is_cancelled(),
+                "apply=true with a real change must trip reconfigure"
+            );
+        }
     }
-
-    #[tokio::test]
-    async fn set_config_apply_triggers_reconfigure() {
-        let (ctx, _tmp, _cfg) =
-            make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/event/{type}/{id}"}"#).await;
-        assert!(!ctx.cancel.is_cancelled());
-
-        let resp = ctx
-            .set_config(None, Some("{root}/ev/{id}".into()), None, None, None, None, true)
-            .await
-            .expect("ok");
-
-        assert_eq!(
-            resp.extra.get("reconfigure"),
-            Some(&Value::String("triggered".into()))
-        );
-        assert!(
-            ctx.cancel.is_cancelled(),
-            "apply=true with a real change must trip reconfigure"
-        );
-    }
-}
 }

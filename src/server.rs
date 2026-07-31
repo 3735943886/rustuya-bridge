@@ -58,23 +58,22 @@ impl BridgeServer {
     /// directory is not writable, another bridge instance is already running, or
     /// the MQTT task fails to start.
     pub async fn setup(&mut self) -> Result<Arc<BridgeContext>> {
-        // Route panics (including those on background connection-task threads)
-        // through the `log` facade with their location, before the default hook
-        // aborts. Under our release build (`panic = "abort"` + `strip`) a worker
-        // panic would otherwise vanish to raw stderr with no symbols; this keeps
-        // the file:line even in stripped builds. Idempotent; install once here.
-        rustuya::install_panic_logging();
+        // Report panics (including those on background device-task threads)
+        // with their location before the default hook aborts. Under our release
+        // build (`panic = "abort"` + `strip`) a worker panic would otherwise
+        // vanish with no symbols; this keeps the file:line even there.
+        // Idempotent; install once here.
+        //
+        // These were rustuya library calls in 0.3. 0.4 owns no process-wide
+        // state, so the process helpers moved into the bridge — and the
+        // connect-storm cap became a `ConnectLimiter` object owned by
+        // [`crate::devices::Fleet`], built from `connect_concurrency` when the
+        // context is created.
+        crate::devices::install_panic_logging();
 
-        // Maximize file descriptor limit for better performance
-        rustuya::maximize_fd_limit()?;
-
-        // Cap concurrent connection establishment to tame the onboarding
-        // "connect storm" when a large fleet is added at once. `0` opts out
-        // (unbounded). Idempotent global; set once before any device connects.
-        let cc = self.cli.connect_concurrency();
-        if cc > 0 {
-            rustuya::set_connect_concurrency(cc);
-        }
+        // One socket per device: the default soft limit caps the fleet well
+        // below what the bridge can handle.
+        crate::devices::maximize_fd_limit()?;
 
         let session_id = format!(
             "sid_{}",

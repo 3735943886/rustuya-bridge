@@ -11,6 +11,16 @@ pub const DEFAULT_SCAVENGER_TIMEOUT_SECS: u64 = 1;
 /// Default cap on devices establishing a connection concurrently. Bounds the
 /// onboarding "connect storm" when a large fleet is added at once.
 pub const DEFAULT_CONNECT_CONCURRENCY: usize = 128;
+/// Default seconds a `scan` reports discovered devices before it stops.
+///
+/// This is tinytuya's `SCANTIME` (`tinytuya/core/const.py`), the reference LAN
+/// scanner every Tuya user compares against: a scan that gave up sooner would
+/// list fewer devices than `python -m tinytuya scan` on the same network and read
+/// as a bug. rustuya 0.4 deliberately has no library-side scan cadence
+/// (`Discovery::scan` takes a caller-chosen window), so the choice is the
+/// bridge's — raise it on a large or lossy network, lower it if you only care
+/// about devices that answer the active probe.
+pub const DEFAULT_SCAN_WINDOW_SECS: u64 = 18;
 pub const DEFAULT_MQTT_ROOT_TOPIC: &str = "rustuya";
 pub const DEFAULT_MQTT_COMMAND_TOPIC: &str = "{root}/command";
 pub const DEFAULT_MQTT_EVENT_TOPIC: &str = "{root}/event/{type}/{id}";
@@ -107,6 +117,13 @@ pub struct Cli {
     #[arg(long, env = "CONNECT_CONCURRENCY")]
     pub connect_concurrency: Option<usize>,
 
+    /// Seconds a `scan` collects discovered devices before publishing its
+    /// end-of-scan marker. Devices already known from passive announcements are
+    /// reported immediately; this only bounds the wait for ones that have to
+    /// answer the active probe. Defaults to tinytuya's `SCANTIME` (18).
+    #[arg(long, env = "SCAN_WINDOW_SECS")]
+    pub scan_window_secs: Option<u64>,
+
     /// Log level (error, warn, info, debug, trace)
     #[arg(short = 'l', long, env = "LOG_LEVEL")]
     pub log_level: Option<String>,
@@ -143,6 +160,7 @@ impl Default for Cli {
             save_debounce_secs: Some(DEFAULT_SAVE_DEBOUNCE_SECS),
             scavenger_timeout_secs: Some(DEFAULT_SCAVENGER_TIMEOUT_SECS),
             connect_concurrency: Some(DEFAULT_CONNECT_CONCURRENCY),
+            scan_window_secs: Some(DEFAULT_SCAN_WINDOW_SECS),
             log_level: Some(DEFAULT_LOG_LEVEL.into()),
             no_signals: Some(false),
             session_id: None,
@@ -197,8 +215,7 @@ impl Cli {
                 );
             }
             Some(p) if !Path::new(p).is_absolute() => {
-                self.state_file =
-                    Some(parent.join(p).to_string_lossy().into_owned());
+                self.state_file = Some(parent.join(p).to_string_lossy().into_owned());
             }
             Some(_) => {} // absolute path — respect as-is
         }
@@ -268,6 +285,7 @@ impl Cli {
             save_debounce_secs,
             scavenger_timeout_secs,
             connect_concurrency,
+            scan_window_secs,
             log_level,
             no_signals,
             session_id,
@@ -291,6 +309,7 @@ impl Cli {
             save_debounce_secs,
             scavenger_timeout_secs,
             connect_concurrency,
+            scan_window_secs,
             log_level,
             no_signals,
             session_id,
@@ -355,6 +374,12 @@ impl Cli {
     pub fn connect_concurrency(&self) -> usize {
         self.connect_concurrency
             .unwrap_or(DEFAULT_CONNECT_CONCURRENCY)
+    }
+
+    /// How long a `scan` collects results before it stops.
+    #[must_use]
+    pub fn scan_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.scan_window_secs.unwrap_or(DEFAULT_SCAN_WINDOW_SECS))
     }
 
     #[must_use]
@@ -599,10 +624,7 @@ mod tests {
     fn resolve_state_file_defaults_to_config_dir_when_unset() {
         let mut cli = make_cli(Some("/etc/rustuya/config.json"), None);
         cli.resolve_default_state_file();
-        assert_eq!(
-            cli.state_file.as_deref(),
-            Some("/etc/rustuya/rustuya.json")
-        );
+        assert_eq!(cli.state_file.as_deref(), Some("/etc/rustuya/rustuya.json"));
     }
 
     #[test]
@@ -611,18 +633,12 @@ mod tests {
         // mean "next to the config", not "wherever I cd-ed first".
         let mut cli = make_cli(Some("/etc/rustuya/config.json"), Some("mystate.json"));
         cli.resolve_default_state_file();
-        assert_eq!(
-            cli.state_file.as_deref(),
-            Some("/etc/rustuya/mystate.json")
-        );
+        assert_eq!(cli.state_file.as_deref(), Some("/etc/rustuya/mystate.json"));
     }
 
     #[test]
     fn resolve_state_file_rewrites_multi_segment_relative_path() {
-        let mut cli = make_cli(
-            Some("/etc/rustuya/config.json"),
-            Some("data/state.json"),
-        );
+        let mut cli = make_cli(Some("/etc/rustuya/config.json"), Some("data/state.json"));
         cli.resolve_default_state_file();
         assert_eq!(
             cli.state_file.as_deref(),
@@ -637,10 +653,7 @@ mod tests {
             Some("/var/lib/foo/state.json"),
         );
         cli.resolve_default_state_file();
-        assert_eq!(
-            cli.state_file.as_deref(),
-            Some("/var/lib/foo/state.json")
-        );
+        assert_eq!(cli.state_file.as_deref(), Some("/var/lib/foo/state.json"));
     }
 
     // ── topic fields: no CLI flag / env (single-source policy) ──────────
@@ -681,7 +694,10 @@ mod tests {
         assert_eq!(back.mqtt_event_topic.as_deref(), Some("{root}/ev/{id}"));
         assert_eq!(back.mqtt_message_topic.as_deref(), Some("{root}/msg/{id}"));
         assert_eq!(back.mqtt_scanner_topic.as_deref(), Some("{root}/scan"));
-        assert_eq!(back.mqtt_payload_template.as_deref(), Some(r#"{"v":{value}}"#));
+        assert_eq!(
+            back.mqtt_payload_template.as_deref(),
+            Some(r#"{"v":{value}}"#)
+        );
         assert_eq!(back.mqtt_retain, Some(true));
     }
 

@@ -62,10 +62,7 @@ fn placeholder_regex() -> &'static Regex {
             .chain(PAYLOAD_ONLY_VARS.iter())
             .copied()
             .collect();
-        let pattern = format!(
-            r#""\{{({0})\}}"|\{{({0})\}}"#,
-            alt.join("|")
-        );
+        let pattern = format!(r#""\{{({0})\}}"|\{{({0})\}}"#, alt.join("|"));
         Regex::new(&pattern).expect("known-vars regex compiles")
     })
 }
@@ -140,7 +137,10 @@ fn walk(
 /// template structure or the template has no recognized placeholders. See
 /// the module docs for the full failure-mode list.
 #[must_use]
-pub fn parse_payload_with_template(payload: &str, template: &str) -> Option<HashMap<String, Value>> {
+pub fn parse_payload_with_template(
+    payload: &str,
+    template: &str,
+) -> Option<HashMap<String, Value>> {
     let (sentinelled, sentinels) = substitute_sentinels(template);
     if sentinels.is_empty() {
         return None;
@@ -245,8 +245,8 @@ pub fn parse_seed_dps(
 /// Arrays of objects are handled per-element (vars merge into each item).
 #[must_use]
 pub fn parse_mqtt_payload(payload: &str, vars: &HashMap<String, String>) -> Value {
-    let mut val =
-        serde_json::from_str::<Value>(payload).unwrap_or_else(|_| Value::String(payload.to_string()));
+    let mut val = serde_json::from_str::<Value>(payload)
+        .unwrap_or_else(|_| Value::String(payload.to_string()));
 
     // Array: merge vars into each object element (and apply `set` heuristic).
     if let Some(arr) = val.as_array_mut() {
@@ -366,11 +366,7 @@ mod tests {
 
     #[test]
     fn multi_dp_dict_value_captured() {
-        let c = parse_payload_with_template(
-            r#"{"1":true,"2":50}"#,
-            r#"{value}"#,
-        )
-        .unwrap();
+        let c = parse_payload_with_template(r#"{"1":true,"2":50}"#, r#"{value}"#).unwrap();
         assert_eq!(c.get("value"), Some(&json!({"1": true, "2": 50})));
     }
 
@@ -397,7 +393,10 @@ mod tests {
     #[test]
     fn no_placeholders_returns_none() {
         let c = parse_payload_with_template(r#"{}"#, r#"{}"#);
-        assert!(c.is_none(), "template without {{var}} placeholders is unparseable");
+        assert!(
+            c.is_none(),
+            "template without {{var}} placeholders is unparseable"
+        );
     }
 
     #[test]
@@ -510,8 +509,7 @@ mod tests {
 
     #[test]
     fn parse_payload_merges_topic_vars_into_object() {
-        let vars: HashMap<String, String> =
-            [("id".into(), "dev-1".into())].into_iter().collect();
+        let vars: HashMap<String, String> = [("id".into(), "dev-1".into())].into_iter().collect();
         let val = parse_mqtt_payload(r#"{"action":"get"}"#, &vars);
         assert_eq!(val.get("id").and_then(|v| v.as_str()), Some("dev-1"));
         assert_eq!(val.get("action").and_then(|v| v.as_str()), Some("get"));
@@ -522,10 +520,7 @@ mod tests {
         let vars: HashMap<String, String> =
             [("id".into(), "from-topic".into())].into_iter().collect();
         let val = parse_mqtt_payload(r#"{"id":"from-payload"}"#, &vars);
-        assert_eq!(
-            val.get("id").and_then(|v| v.as_str()),
-            Some("from-payload")
-        );
+        assert_eq!(val.get("id").and_then(|v| v.as_str()), Some("from-payload"));
     }
 
     #[test]
@@ -538,10 +533,7 @@ mod tests {
     #[test]
     fn parse_payload_set_heuristic_promotes_loose_fields_into_dps() {
         let vars: HashMap<String, String> = HashMap::new();
-        let val = parse_mqtt_payload(
-            r#"{"action":"set","id":"dev-1","1":true,"2":50}"#,
-            &vars,
-        );
+        let val = parse_mqtt_payload(r#"{"action":"set","id":"dev-1","1":true,"2":50}"#, &vars);
         let dps = val.get("dps").and_then(|v| v.as_object()).unwrap();
         assert_eq!(dps.get("1"), Some(&json!(true)));
         assert_eq!(dps.get("2"), Some(&json!(50)));
@@ -567,8 +559,18 @@ mod tests {
         let dps = val.get("dps").and_then(|v| v.as_object()).unwrap();
         assert_eq!(dps.get("1"), Some(&json!(true)));
         for reserved in [
-            "action", "id", "name", "key", "ip", "version", "cid", "parent_id",
-            "cmd", "dp", "payload", "dps",
+            "action",
+            "id",
+            "name",
+            "key",
+            "ip",
+            "version",
+            "cid",
+            "parent_id",
+            "cmd",
+            "dp",
+            "payload",
+            "dps",
         ] {
             assert!(
                 !dps.contains_key(reserved),
@@ -582,18 +584,14 @@ mod tests {
         // Documented behavior: `data` opts out of the auto-wrap, so the
         // payload is passed through unchanged (no `dps` synthesized).
         let vars: HashMap<String, String> = HashMap::new();
-        let val = parse_mqtt_payload(
-            r#"{"action":"set","id":"dev","data":{"x":1}}"#,
-            &vars,
-        );
+        let val = parse_mqtt_payload(r#"{"action":"set","id":"dev","data":{"x":1}}"#, &vars);
         assert!(val.get("dps").is_none());
         assert_eq!(val.get("data"), Some(&json!({"x": 1})));
     }
 
     #[test]
     fn parse_payload_array_merges_vars_per_item() {
-        let vars: HashMap<String, String> =
-            [("id".into(), "dev-1".into())].into_iter().collect();
+        let vars: HashMap<String, String> = [("id".into(), "dev-1".into())].into_iter().collect();
         let val = parse_mqtt_payload(
             r#"[{"action":"get"},{"action":"status","id":"override"}]"#,
             &vars,

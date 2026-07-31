@@ -1,5 +1,4 @@
-use rustuya::Device;
-use rustuya::protocol::CommandType;
+use rustuya_tokio::{CommandType, Device};
 use serde_json::Value;
 use std::future::Future;
 use std::sync::Arc;
@@ -66,6 +65,47 @@ pub async fn handle_request(ctx: Arc<BridgeContext>, req: BridgeRequest) -> Vec<
 /// services the fleet in a few waves instead, while capping the simultaneous
 /// device + MQTT-publish load so the outbound channel isn't flooded all at once.
 const FANOUT_CONCURRENCY: usize = 100;
+
+/// One discovered device as the scanner-topic payload. Field names are the 0.3
+/// ones, so existing consumers of the scanner topic are unaffected.
+fn scan_payload(info: &rustuya_tokio::DeviceInfo) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("id".to_string(), Value::String(info.id.clone()));
+    payload.insert("ip".to_string(), Value::String(info.ip.to_string()));
+    if let Some(v) = info.version {
+        payload.insert("version".to_string(), Value::String(v.as_str().to_string()));
+    }
+    if let Some(pk) = &info.product_key {
+        payload.insert("product_key".to_string(), Value::String(pk.clone()));
+    }
+    Value::Object(payload)
+}
+
+/// Fires one command at a device, or at one of its gateway sub-devices when
+/// `cid` is set.
+///
+/// **Fire-and-forget.** This returns once the frame is queued — it does not wait
+/// for the device to answer, because the Tuya LAN protocol carries no
+/// request/response token: a device's status frames and its unsolicited pushes
+/// are indistinguishable, so nothing can correlate a reply to a request. rustuya
+/// 0.3 papered over that by treating the next frame as "the" reply; 0.4 drops the
+/// pretence, and so does the bridge.
+///
+/// What the caller's `ok` therefore means is **accepted**, not **applied**: the
+/// command reached a connected device. The device's actual state change arrives
+/// on the event topic like any other push. An `error` is still meaningful — the
+/// device was not connected, or the connection died while queueing.
+async fn fire(
+    dev: &Device,
+    cid: Option<String>,
+    cmd: CommandType,
+    data: Option<Value>,
+) -> rustuya_tokio::Result<()> {
+    match cid {
+        Some(cid) => dev.sub(cid).send(cmd, data).await,
+        None => dev.send(cmd, data).await,
+    }
+}
 
 /// Resolves targets, then runs `op(device, resolved_cid)` for each connected
 /// target with a timeout, collecting a per-target result. Unlike an
@@ -196,10 +236,11 @@ async fn handle_request_inner(
                     name.map(SingleOrList::into_vec),
                 )
                 .await?;
-            let results = run_per_target(&ctx, &targets, "get", cid, |dev, actual_cid| async move {
-                dev.request(CommandType::DpQuery, None, actual_cid).await
-            })
-            .await;
+            let results =
+                run_per_target(&ctx, &targets, "get", cid, |dev, actual_cid| async move {
+                    fire(&dev, actual_cid, CommandType::DpQuery, None).await
+                })
+                .await;
             Ok(responses_for_results("get", results, true))
         }
         BridgeRequest::Set { id, name, dps, cid } => {
@@ -212,8 +253,13 @@ async fn handle_request_inner(
             let results = run_per_target(&ctx, &targets, "set", cid, |dev, actual_cid| {
                 let dps = dps.clone();
                 async move {
-                    dev.request(CommandType::Control, Some(Value::Object(dps)), actual_cid)
-                        .await
+                    fire(
+                        &dev,
+                        actual_cid,
+                        CommandType::Control,
+                        Some(Value::Object(dps)),
+                    )
+                    .await
                 }
             })
             .await;
@@ -226,7 +272,7 @@ async fn handle_request_inner(
             data,
             cid,
         } => {
-            let command = CommandType::from_u32(cmd).ok_or(BridgeError::InvalidCommand(cmd))?;
+            let command = CommandType::from_code(cmd).ok_or(BridgeError::InvalidCommand(cmd))?;
             let targets = ctx
                 .get_targets(
                     id.map(SingleOrList::into_vec),
@@ -235,7 +281,7 @@ async fn handle_request_inner(
                 .await?;
             let results = run_per_target(&ctx, &targets, "request", cid, |dev, actual_cid| {
                 let data = data.clone();
-                async move { dev.request(command, data, actual_cid).await }
+                async move { fire(&dev, actual_cid, command, data).await }
             })
             .await;
             let label = format!("{command:?}").to_lowercase();
@@ -256,24 +302,50 @@ async fn handle_request_inner(
             Ok(responses_for_results("sub_discover", results, false))
         }
         BridgeRequest::Scan => {
+            // The bridge holds one long-lived `Discovery` that every device
+            // re-locates through, so a scan is a *window* on that shared stream
+            // rather than a scanner spun up for the occasion: subscribe, ask for
+            // one active probe round, and report for `SCAN_WINDOW`. Devices
+            // already known from passive announcements are replayed immediately,
+            // so a scan answers fast without waiting out the whole window.
+            let Some(disco) = ctx.fleet.discovery().cloned() else {
+                return Err(BridgeError::InvalidRequest(
+                    "LAN discovery is unavailable, so `scan` cannot run".into(),
+                ));
+            };
+
+            let window = ctx.cli.scan_window();
             let ctx_scan = ctx.clone();
             tokio::spawn(async move {
-                let stream = rustuya::Scanner::scan_stream();
-                tokio::pin!(stream);
+                let mut seen = std::collections::HashSet::new();
+                let mut found = disco.discovered();
+                disco.request_scan();
 
-                while let Some(dev) = stream.next().await {
-                    let mut payload = serde_json::Map::new();
-                    payload.insert("id".to_string(), Value::String(dev.id.clone()));
-                    payload.insert("ip".to_string(), Value::String(dev.ip.clone()));
-                    if let Some(v) = &dev.version {
-                        payload
-                            .insert("version".to_string(), Value::String(v.as_str().to_string()));
+                // Replay what discovery already knows before waiting on new
+                // announcements.
+                let known = disco.known();
+                let deadline = tokio::time::Instant::now() + window;
+                for info in known {
+                    if seen.insert(info.id.clone()) {
+                        ctx_scan.publish_scanner_event(scan_payload(&info)).await;
                     }
-                    if let Some(pk) = &dev.product_key {
-                        payload.insert("product_key".to_string(), Value::String(pk.clone()));
-                    }
+                }
 
-                    ctx_scan.publish_scanner_event(Value::Object(payload)).await;
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match timeout(remaining, found.recv()).await {
+                        Ok(Ok(info)) => {
+                            if seen.insert(info.id.clone()) {
+                                ctx_scan.publish_scanner_event(scan_payload(&info)).await;
+                            }
+                        }
+                        // The discovery actor is gone (shutdown); stop early.
+                        Ok(Err(_)) => break,
+                        Err(_) => break,
+                    }
                 }
 
                 // Final empty payload marks scan end
@@ -282,10 +354,14 @@ async fn handle_request_inner(
                     .await;
             });
 
-            Ok(vec![ApiResponse::ok("scan", "bridge").with_extra(
-                "message",
-                "Scan started. Results will be published to 'scanner' topic.",
-            )])
+            Ok(vec![
+                ApiResponse::ok("scan", "bridge")
+                    .with_extra(
+                        "message",
+                        "Scan started. Results will be published to 'scanner' topic.",
+                    )
+                    .with_extra("window_secs", window.as_secs()),
+            ])
         }
     }
 }
@@ -298,7 +374,10 @@ mod tests {
     fn single_ok_is_suppressed_for_set_get() {
         let results = vec![("dev-only".to_string(), Ok(()))];
         let out = responses_for_results("set", results, true);
-        assert!(out.is_empty(), "a lone successful set/get must be suppressed");
+        assert!(
+            out.is_empty(),
+            "a lone successful set/get must be suppressed"
+        );
     }
 
     #[test]
@@ -315,15 +394,19 @@ mod tests {
 
     #[test]
     fn fan_out_emits_one_response_per_id() {
-        let results = vec![
-            ("dev-a".to_string(), Ok(())),
-            ("dev-b".to_string(), Ok(())),
-        ];
+        let results = vec![("dev-a".to_string(), Ok(())), ("dev-b".to_string(), Ok(()))];
         let out = responses_for_results("set", results, true);
         let ids: Vec<_> = out.iter().filter_map(|r| r.id.as_deref()).collect();
-        assert_eq!(ids, vec!["dev-a", "dev-b"], "each target answers for itself");
+        assert_eq!(
+            ids,
+            vec!["dev-a", "dev-b"],
+            "each target answers for itself"
+        );
         // No comma-joined id — each response addresses exactly one device.
-        assert!(out.iter().all(|r| !r.id.as_deref().unwrap_or("").contains(',')));
+        assert!(
+            out.iter()
+                .all(|r| !r.id.as_deref().unwrap_or("").contains(','))
+        );
     }
 
     #[test]

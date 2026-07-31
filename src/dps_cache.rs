@@ -138,7 +138,11 @@ mod tests {
         cache.merge("dev-1", &map(&[("1", json!(false))]));
         cache.fill_missing("dev-1", &map(&[("1", json!(true)), ("2", json!(50))]));
         let snap = cache.snapshot("dev-1").unwrap();
-        assert_eq!(snap.get("1"), Some(&json!(false)), "existing value preserved");
+        assert_eq!(
+            snap.get("1"),
+            Some(&json!(false)),
+            "existing value preserved"
+        );
         assert_eq!(snap.get("2"), Some(&json!(50)), "missing key filled");
     }
 
@@ -199,7 +203,10 @@ mod tests {
         let cache = DpsCache::new();
         cache.merge("dev-1", &map(&[("1", json!(true))]));
         cache.merge("dev-2", &map(&[("1", json!(false))]));
-        assert_eq!(cache.snapshot("dev-1").unwrap().get("1"), Some(&json!(true)));
+        assert_eq!(
+            cache.snapshot("dev-1").unwrap().get("1"),
+            Some(&json!(true))
+        );
         assert_eq!(
             cache.snapshot("dev-2").unwrap().get("1"),
             Some(&json!(false))
