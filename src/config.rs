@@ -179,11 +179,36 @@ impl Cli {
     /// # Errors
     /// Returns an error if the config file cannot be read, parsed, or written.
     pub async fn load() -> Result<Self> {
-        let mut cli = Self::parse();
-        cli.apply_config_file().await?;
-        cli.resolve_default_state_file();
-        cli.merge(Self::default());
-        Ok(cli)
+        Self::from_env().layered().await
+    }
+
+    /// The **pristine** CLI/env layer: command-line arguments and environment
+    /// variables only, with every unspecified field left `None`.
+    ///
+    /// Kept separate from [`layered`](Self::layered) because it is the layer a
+    /// restart must replay against. Applying the config file *collapses* the
+    /// layering — afterwards a `Some` field cannot be attributed to CLI/env
+    /// versus the file — so re-reading a changed config file over an
+    /// already-merged `Cli` would either change nothing (`merge` only fills
+    /// `None`) or silently let the file override an explicit CLI/env value. Keep
+    /// this around and a restart simply re-runs [`layered`](Self::layered),
+    /// reproducing startup precedence exactly.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::parse()
+    }
+
+    /// Layers the config file and then the defaults over this (CLI/env) layer,
+    /// yielding the effective configuration. Highest precedence first: CLI/env >
+    /// config file > config-relative state-file default > [`Cli::default`].
+    ///
+    /// # Errors
+    /// Returns an error if the config file cannot be read, parsed, or written.
+    pub async fn layered(mut self) -> Result<Self> {
+        self.apply_config_file().await?;
+        self.resolve_default_state_file();
+        self.merge(Self::default());
+        Ok(self)
     }
 
     /// Resolves `state_file` against the directory of `--config` when both apply:

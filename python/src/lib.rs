@@ -227,26 +227,30 @@ impl PyBridgeServer {
             }
         }
 
-        // Apply config file (if requested) using a lightweight current-thread
-        // runtime — this constructor is sync but `apply_config_file` is async.
-        if cli.config.is_some() {
+        // `cli` is now the kwargs layer, the binding's equivalent of the
+        // command line: pristine, with everything unspecified still `None`. That
+        // is exactly what `BridgeServer` wants — it applies the config file and
+        // the defaults itself, once per cycle, so a `reconfigure` restart picks
+        // up an edited config file without kwargs losing their precedence.
+        let base = cli.clone();
+
+        // The snapshot exposed to Python must be the *effective* config, so
+        // layer a copy here too. Uses a lightweight current-thread runtime
+        // because this constructor is sync while the layering is async.
+        let cli_snapshot = {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_io()
                 .build()
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            rt.block_on(cli.apply_config_file())
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        }
+            rt.block_on(cli.layered())
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+        };
 
-        // Fall back to bridge defaults for any field still `None`.
-        cli.merge(Cli::default());
-
-        let cli_snapshot = cli.clone();
         // Create the shutdown token here and wire the same clone into the
         // server, so we keep a handle reachable without the `inner` mutex.
         let cancel = CancellationToken::new();
         Ok(Self {
-            inner: Arc::new(Mutex::new(BridgeServer::with_cancel(cli, cancel.clone()))),
+            inner: Arc::new(Mutex::new(BridgeServer::with_cancel(base, cancel.clone()))),
             cli_snapshot,
             cancel,
         })

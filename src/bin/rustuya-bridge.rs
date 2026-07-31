@@ -4,7 +4,12 @@ use rustuyabridge::server::BridgeServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::load().await?;
+    // The CLI/env layer, kept pristine: the server re-layers the config file
+    // over it on every cycle, so a `reconfigure` restart picks up an edited file
+    // while CLI/env keeps winning. `effective` is the same layering applied once
+    // here, for the logger and the env warnings below.
+    let base = Cli::from_env();
+    let cli = base.clone().layered().await?;
 
     // Initialize logger from config (CLI/Env/JSON)
     let log_level = cli
@@ -34,7 +39,7 @@ async fn main() -> Result<()> {
     }
 
     // Start the server
-    let mut server = BridgeServer::new(cli);
+    let mut server = BridgeServer::new(base);
     server.setup().await?;
     server.run().await
 }

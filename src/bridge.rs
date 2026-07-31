@@ -169,6 +169,11 @@ pub struct BridgeContext {
     /// Never cleared — the process exits shortly after it's set.
     pub retain_suppressed: AtomicBool,
 
+    /// Set by `reconfigure` immediately before it trips [`Self::cancel`], so the
+    /// server can tell "this context asked to be rebuilt" from "the process is
+    /// shutting down" — both of which look identical from the token alone.
+    pub restart_requested: AtomicBool,
+
     /// Per-device merged DPS cache. `Some` whenever `mqtt_retain=true` (cache
     /// mode); `None` in pass-through mode (`mqtt_retain=false`). Note `{type}`
     /// absence does *not* gate this — it only triggers a startup WARN (deltas
@@ -544,6 +549,7 @@ impl BridgeContext {
             mqtt_drop_count: AtomicU64::new(0),
             cancel,
             retain_suppressed: AtomicBool::new(false),
+            restart_requested: AtomicBool::new(false),
             cache,
             seed_done: AtomicBool::new(initial_seed_done),
             seed_pending: StdMutex::new(BTreeSet::new()),
@@ -2745,22 +2751,26 @@ impl BridgeContext {
     }
 
     /// Re-applies a configuration change by clearing old-scheme retained
-    /// messages and restarting the bridge.
+    /// messages and restarting the bridge **in place**.
     ///
-    /// The bridge reads its config only at startup, so any change to the
-    /// topic/payload templates or `mqtt_retain` needs a restart to take
-    /// effect. `reconfigure` performs that restart cleanly *while the old
-    /// (in-memory) config is still live*, so it can scavenge the retained
-    /// snapshots published under the old scheme before they become orphans.
+    /// This is the fallback for the settings [`Self::apply_hot`] cannot change
+    /// on a running bridge — the broker connection, the client id, the state
+    /// file, and the `mqtt_retain` mode flip. The bridge reads those only when a
+    /// context is built, so applying them means building a new one.
     ///
-    /// It **always** restarts (relying on a process supervisor to bring the
-    /// bridge back); device registrations are preserved on disk. When
-    /// `mqtt_retain` is off there are no bridge-published retained snapshots to
-    /// clear, so it warns but still restarts — letting "edit config →
-    /// reconfigure" be a uniform habit. The retained purge is skipped when the
-    /// scavenge-relevant config on disk is unchanged (see
-    /// [`Self::scavenge_config_unchanged`]), so a casual reconfigure on an
-    /// unchanged scheme is a plain restart, not a needless state wipe.
+    /// The restart happens **inside this process**: the context is torn down and
+    /// rebuilt, no `exec` and no process supervisor involved. It has to work that
+    /// way — the bridge also ships as a PyO3 extension, where re-executing the
+    /// binary would take the host Python interpreter down with it. 0.3 could only
+    /// exit and hope something restarted it.
+    ///
+    /// The teardown runs *while the old config is still live*, so it can scavenge
+    /// the retained snapshots published under the old scheme before they become
+    /// orphans. The purge is skipped when the scavenge-relevant config on disk is
+    /// unchanged (see [`Self::scavenge_config_unchanged`]), so a casual
+    /// reconfigure on an unchanged scheme is a plain restart, not a needless
+    /// state wipe. Device registrations live in the state file and survive either
+    /// way.
     ///
     /// # Errors
     /// Currently always returns `Ok`; reserved for future failure modes.
@@ -2778,18 +2788,10 @@ impl BridgeContext {
     /// response — used by the `reconfigure` command and by `set_config`'s
     /// `apply` path.
     async fn do_reconfigure(&self) {
-        let supervised = std::env::var_os("INVOCATION_ID").is_some()
-            || std::env::var_os("JOURNAL_STREAM").is_some();
-
-        info!("reconfigure: re-applying config via clean restart.");
-        if supervised {
-            info!("reconfigure: process supervisor detected; expecting an automatic restart.");
-        } else {
-            warn!(
-                "reconfigure: no process supervisor detected (no INVOCATION_ID/JOURNAL_STREAM). \
-                 The bridge will exit and must be restarted manually to apply the new config."
-            );
-        }
+        info!("reconfigure: re-applying config by restarting the bridge in place.");
+        // Claim the restart *before* tripping the token: `run()` reads this the
+        // moment it wakes, and a cancel with the flag unset means "shut down".
+        self.restart_requested.store(true, Ordering::Relaxed);
 
         if self.cli.mqtt_broker.is_none() {
             warn!(
@@ -2807,9 +2809,11 @@ impl BridgeContext {
                  config first if you intended a change."
             );
         } else {
-            // Latch retain off for the rest of this process's life so device
+            // Latch retain off for the rest of *this context's* life so device
             // events arriving during/after the purge can't recreate old-scheme
-            // retained snapshots. Live (non-retained) delivery continues.
+            // retained snapshots. Live (non-retained) delivery continues. Never
+            // cleared, and it doesn't need to be: the restart builds a fresh
+            // context whose own latch starts off.
             self.retain_suppressed.store(true, Ordering::Relaxed);
             if !self.mqtt_retain {
                 warn!(
@@ -2821,7 +2825,7 @@ impl BridgeContext {
             info!("reconfigure: cleared {cleared} retained message(s) under the old scheme.");
         }
 
-        info!("reconfigure: shutting down for restart.");
+        info!("reconfigure: tearing down for an in-place restart.");
         self.cancel.cancel();
     }
 
