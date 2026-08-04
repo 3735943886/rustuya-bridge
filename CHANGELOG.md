@@ -86,6 +86,20 @@ requiring an operator to restart the process.
   case where the retained sentinel found is guaranteed to be our own.
 
 ### Fixed
+- **A device with no configured `version` never worked properly.** Registering
+  by id alone is the point of discovery-backed config, and it had two faults
+  underneath it. `Version::Auto` stamped `"aut"` as its 15-byte wire header
+  instead of v3.3's (upstream), so a v3.3 device's own status pushes stopped
+  being recognised as headered and reached the bridge as raw ciphertext —
+  the `Non-UTF8 payload` warnings. And nothing ever *resolved* `Auto`: the core
+  does not probe and the discovery rewake carried only an address, so the device
+  ran the v3.3 dialect forever. Invisible for a real v3.3 device; for a v3.4 one
+  a silent ten-second flap, because v3.4's handshake is exactly what v3.3 lacks
+  — the TCP connect alone reads as connected and the device hangs up on the
+  first frame outside a session it never negotiated. Registration now resolves
+  address *and* version from discovery together (as the library's own examples
+  do), and an announcement's version rides the rewake so a cold start resolves
+  too.
 - **A device added without an `ip` could never connect.** Only a *first*
   sighting carried an address to a registered device, and discovery dedupes
   announcements against a TTL cache that each announcement refreshes — so for a

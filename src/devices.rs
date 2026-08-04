@@ -68,7 +68,8 @@ pub fn connection_event(code: u32) -> Value {
 }
 
 /// Dial target for a device registered without an IP that discovery has never
-/// seen either (when it has, [`Fleet::located`] supplies the announced address).
+/// seen either (when it has, [`Fleet::located`] supplies the announced address
+/// and version).
 ///
 /// 0.4 has no addressless connect: an address is required up front, and the only
 /// blocking alternative (`DeviceBuilder::discover`) would stall device
@@ -134,12 +135,13 @@ impl Fleet {
         self.discovery.as_ref()
     }
 
-    /// The address discovery last announced for `id`, if it has ever seen it.
+    /// What discovery last announced for `id` — address and protocol version —
+    /// if it has ever seen it.
     ///
     /// Reads the cache rather than awaiting an announcement, so registration
     /// never blocks. A stale entry is self-correcting: the dial fails and the
     /// next announcement relocates the device.
-    fn located(&self, id: &str) -> Option<String> {
+    fn located(&self, id: &str) -> Option<(String, Option<Version>)> {
         let info = self
             .discovery
             .as_ref()?
@@ -147,10 +149,11 @@ impl Fleet {
             .into_iter()
             .find(|d| d.id == id)?;
         info!(
-            "Device {id} has no configured ip; using discovered address {}",
-            info.ip
+            "Device {id}: discovery reports {} (version {})",
+            info.ip,
+            info.version.map_or("unknown", Version::as_str)
         );
-        Some(info.ip.to_string())
+        Some((info.ip.to_string(), info.version))
     }
 
     /// Spawns a connection for one **direct** device (a sub-device is pure
@@ -172,20 +175,43 @@ impl Fleet {
             )));
         }
 
-        // An unset version is `Version::Auto`, which the core treats as v3.3 —
-        // it does *not* probe. Discovery is what actually resolves it: a device
-        // that announces its version has it applied on the rewake. An explicit
-        // but unrecognised string is a config error worth reporting, not
-        // something to silently downgrade to the default.
-        let version = match cfg.version.as_deref() {
-            None => Version::Auto,
-            Some(s) => Version::parse(s).ok_or_else(|| {
+        // An explicit but unrecognised version string is a config error worth
+        // reporting, not something to silently downgrade to the default.
+        let configured = match cfg.version.as_deref() {
+            None => None,
+            Some(s) => Some(Version::parse(s).ok_or_else(|| {
                 BridgeError::InvalidRequest(format!(
                     "device {}: unknown protocol version '{s}'",
                     cfg.id
                 ))
-            })?,
+            })?),
         };
+
+        // Address *and* version come from discovery when the config omits them —
+        // they are one resolution, not two, and the library's own examples do
+        // exactly this before building a device. Reading the cache (rather than
+        // awaiting an announcement) keeps registration non-blocking, and it makes
+        // the common case instant: the bridge has been listening since startup,
+        // or the operator ran `scan` first, so a device's announcement is usually
+        // already cached by the time it is registered.
+        //
+        // Resolving the version is not a nicety. `Version::Auto` runs the v3.3
+        // dialect and the core deliberately never probes, so an unresolved v3.4
+        // device *appears* to connect — v3.3 has no handshake, so TCP alone reads
+        // as connected — and is then hung up on by the device the moment the
+        // first frame arrives without a negotiated session. That is a 10-second
+        // connect/drop cycle with no error anywhere. Discovery announcements
+        // carry the version precisely so this is knowable.
+        let discovered = (cfg.ip.is_none() || configured.is_none())
+            .then(|| self.located(&cfg.id))
+            .flatten();
+        let address = cfg
+            .ip
+            .clone()
+            .or_else(|| discovered.as_ref().map(|(ip, _)| ip.clone()));
+        let version = configured
+            .or_else(|| discovered.as_ref().and_then(|(_, v)| *v))
+            .unwrap_or(Version::Auto);
 
         // Every remaining knob — backoff curve, heartbeat, idle-liveness,
         // handshake/connect/send timeouts, channel depths — is left at the
@@ -193,16 +219,6 @@ impl Fleet {
         // behaviour the library documents (the ~30 s idle-drop typical firmware
         // enforces, say); overriding them here would move that reasoning
         // somewhere it can't be maintained.
-        // A device with no configured IP starts at whatever address discovery
-        // already holds for it, and only falls back to the placeholder when
-        // discovery has never seen it. This is the cache-first resolution 0.3's
-        // magic `"Auto"` address did, and it is what makes the common case
-        // instant: the bridge has been listening since startup (or the operator
-        // ran `scan` first), so by the time a device is registered its
-        // announcement is usually already cached. Without it the device would
-        // have to wait out a dial to the placeholder plus a fresh announcement.
-        let address = cfg.ip.clone().or_else(|| self.located(&cfg.id));
-
         let mut builder = Device::builder(&cfg.id, key.as_bytes().to_vec())
             .address(address.as_deref().unwrap_or(UNLOCATED_ADDR))
             .version(version);
