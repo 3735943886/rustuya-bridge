@@ -194,6 +194,20 @@ pub struct BridgeContext {
     /// shutting down" — both of which look identical from the token alone.
     pub restart_requested: AtomicBool,
 
+    /// Which of the six `set_config`-managed settings an **outer layer** has
+    /// pinned — CLI/env for the binary, constructor kwargs for the PyO3 binding.
+    ///
+    /// `set_config` writes to the config file, and the file loses to that layer.
+    /// So patching a pinned setting persists a value, restarts the bridge, and
+    /// changes nothing observable — a silent no-op the caller has no way to see,
+    /// since the response reports the file edit it did make. `set_config` warns
+    /// instead.
+    ///
+    /// Recorded at construction because only the caller of [`Self::new`] still
+    /// holds the pristine layer; by the time it reaches [`Self::cli`] it has been
+    /// merged with the file and the defaults, and the provenance is gone.
+    pub pinned_settings: Vec<&'static str>,
+
     /// Per-device merged DPS cache. `Some` whenever `mqtt_retain=true` (cache
     /// mode); `None` in pass-through mode (`mqtt_retain=false`). Note `{type}`
     /// absence does *not* gate this — it only triggers a startup WARN (deltas
@@ -374,6 +388,31 @@ fn validate_topic_template(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Which of the six `set_config`-managed settings the pristine CLI/env/kwargs
+/// layer specifies, and therefore pins against the config file.
+///
+/// The binary defines no flag or env for any of them, so for it this is always
+/// empty. It is the embedder that can hit this: the PyO3 binding's constructor
+/// kwargs *are* its command line, so `PyBridgeServer(mqtt_retain=True)` pins
+/// `mqtt_retain` exactly as `--mqtt-retain` would if it existed. See
+/// [`BridgeContext::pinned_settings`].
+fn pinned_by_outer_layer(base: &Cli) -> Vec<&'static str> {
+    [
+        ("mqtt_command_topic", base.mqtt_command_topic.is_some()),
+        ("mqtt_event_topic", base.mqtt_event_topic.is_some()),
+        ("mqtt_message_topic", base.mqtt_message_topic.is_some()),
+        ("mqtt_scanner_topic", base.mqtt_scanner_topic.is_some()),
+        (
+            "mqtt_payload_template",
+            base.mqtt_payload_template.is_some(),
+        ),
+        ("mqtt_retain", base.mqtt_retain.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, pinned)| pinned.then_some(name))
+    .collect()
+}
+
 /// Subscribes one device's three streams into the listener's maps.
 ///
 /// `StreamMap::insert` replaces any existing entry, so re-subscribing an id whose
@@ -404,6 +443,7 @@ impl BridgeContext {
     /// Returns an error if the state file directory is not writable.
     pub async fn new(
         cli: &Cli,
+        base: &Cli,
         cancel: tokio_util::sync::CancellationToken,
         warm: Option<WarmState>,
     ) -> Result<(
@@ -585,6 +625,7 @@ impl BridgeContext {
             cancel,
             retain_suppressed: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
+            pinned_settings: pinned_by_outer_layer(base),
             cache,
             seed_done: AtomicBool::new(initial_seed_done),
             seed_pending: StdMutex::new(BTreeSet::new()),
@@ -2807,9 +2848,33 @@ impl BridgeContext {
             info!("set_config: no effective changes; config file left untouched.");
         }
 
+        // A patched setting that an outer layer pins will be written, restarted
+        // for, and then ignored — CLI/env/kwargs outrank the config file. Nothing
+        // in the response would show that: it reports the file edit, which really
+        // did happen. Say so instead of letting the operator conclude the feature
+        // is broken.
+        let ignored: Vec<&str> = self
+            .pinned_settings
+            .iter()
+            .copied()
+            .filter(|name| changed.contains_key(*name))
+            .collect();
+        if !ignored.is_empty() {
+            warn!(
+                "set_config: {} written to the config file but pinned by an explicit \
+                 CLI/env/constructor value, which outranks it — the restart will not change \
+                 {} behaviour. Remove the override to let the config file govern.",
+                ignored.join(", "),
+                if ignored.len() == 1 { "this" } else { "their" },
+            );
+        }
+
         let mut resp = ApiResponse::ok_action("set_config")
             .with_extra("changed", Value::Object(changed))
             .with_extra("reconfigure_required", reconfigure_required);
+        if !ignored.is_empty() {
+            resp = resp.with_extra("pinned_elsewhere", Value::from(ignored));
+        }
 
         if apply && reconfigure_required {
             // Writes the file first (above) so the chained reconfigure's
@@ -3191,10 +3256,14 @@ mod tests {
                 ..Cli::default()
             };
             customize(&mut cli);
-            let (ctx, mqtt_rx, save_rx, refresh_rx) =
-                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new(), None)
-                    .await
-                    .expect("new context");
+            let (ctx, mqtt_rx, save_rx, refresh_rx) = BridgeContext::new(
+                &cli,
+                &Cli::pristine(),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("new context");
             (ctx, tmp, mqtt_rx, save_rx, refresh_rx)
         }
 
@@ -4536,11 +4605,98 @@ mod tests {
                 state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
                 ..Cli::default()
             };
-            let (ctx, _mqtt_rx, _save_rx, _refresh_rx) =
-                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new(), None)
-                    .await
-                    .expect("new context");
+            let (ctx, _mqtt_rx, _save_rx, _refresh_rx) = BridgeContext::new(
+                &cli,
+                &Cli::pristine(),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("new context");
             (ctx, tmp, cfg_str)
+        }
+
+        /// A setting that an explicit CLI/env/kwargs value pins is still written
+        /// to the file — it is the persisted config, and removing the override
+        /// later must find it there — but the caller is told it will not take
+        /// effect. Without this the response reports a successful change and a
+        /// restart, and nothing about the bridge's behaviour moves.
+        #[tokio::test]
+        async fn set_config_warns_when_an_outer_layer_pins_the_setting() {
+            let tmp = TempDir::new().unwrap();
+            let cfg_path = tmp.path().join("config.json");
+            tokio::fs::write(
+                &cfg_path,
+                r#"{"mqtt_event_topic":"{root}/event/{type}/{id}"}"#,
+            )
+            .await
+            .expect("write config");
+            let cfg_str = cfg_path.to_string_lossy().into_owned();
+
+            // The pristine layer specifies the event topic — an embedder passing
+            // it to the constructor, or a flag if one existed.
+            let mut base = Cli::pristine();
+            base.mqtt_event_topic = Some("{root}/pinned/{type}/{id}".into());
+            let cli = Cli {
+                config: Some(cfg_str.clone()),
+                state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
+                ..Cli::default()
+            };
+            let (ctx, _m, _s, _r) = BridgeContext::new(
+                &cli,
+                &base,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("new context");
+
+            let resp = ctx
+                .set_config(
+                    None,
+                    Some("{root}/ev/{id}".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("set_config ok");
+
+            assert_eq!(
+                resp.extra.get("pinned_elsewhere"),
+                Some(&serde_json::json!(["mqtt_event_topic"])),
+                "the caller must be told the change cannot take effect"
+            );
+            // Still persisted: the file is where the value lives once the
+            // override is gone.
+            let content = tokio::fs::read_to_string(&cfg_str)
+                .await
+                .expect("read back");
+            assert!(content.contains("{root}/ev/{id}"));
+        }
+
+        /// The binary defines no flag or env for any of the six, so nothing is
+        /// ever pinned there and the warning must stay out of the way.
+        #[tokio::test]
+        async fn set_config_is_silent_when_nothing_is_pinned() {
+            let (ctx, _tmp, _cfg) =
+                make_ctx_with_config(r#"{"mqtt_event_topic":"{root}/event/{type}/{id}"}"#).await;
+            let resp = ctx
+                .set_config(
+                    None,
+                    Some("{root}/ev/{id}".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("set_config ok");
+            assert!(ctx.pinned_settings.is_empty());
+            assert!(!resp.extra.contains_key("pinned_elsewhere"));
         }
 
         #[tokio::test]
@@ -4639,10 +4795,14 @@ mod tests {
                 state_file: Some(tmp.path().join("state.json").to_string_lossy().into_owned()),
                 ..Cli::default()
             };
-            let (ctx, _m, _s, _r) =
-                BridgeContext::new(&cli, tokio_util::sync::CancellationToken::new(), None)
-                    .await
-                    .unwrap();
+            let (ctx, _m, _s, _r) = BridgeContext::new(
+                &cli,
+                &Cli::pristine(),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
             let err = ctx
                 .set_config(
                     None,

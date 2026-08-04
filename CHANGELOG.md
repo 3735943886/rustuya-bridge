@@ -42,6 +42,12 @@ requiring an operator to restart the process.
 - **Bus lag is logged.** rustuya 0.4 surfaces a slow-consumer gap as an
   observable event rather than a silent drop; at fleet scale it is the signal
   that the bridge is falling behind its devices.
+- **`set_config` says when a patch cannot take effect.** The six settings it
+  manages have no CLI flag or env var, so for the binary the config file always
+  governs — but an embedder's `PyBridgeServer(...)` kwargs *are* its command
+  line, and those outrank the file. Patching a setting pinned that way used to
+  write the file, restart, and change nothing, with a response reporting success.
+  It now warns and lists the names in the response as `pinned_elsewhere`.
 - **A wire transcript at `RUST_LOG=rustuya_tokio=trace`.** Every frame sent and
   decoded, per device, with non-printable bytes escaped rather than replaced —
   a garbled payload is exactly the case worth reading, and `from_utf8_lossy`

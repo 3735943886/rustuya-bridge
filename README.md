@@ -181,6 +181,8 @@ Set them by editing the config file directly, or at runtime with [`set_config`](
 
 > **Breaking change (from earlier versions):** these settings were previously also accepted via `--mqtt-*` flags and `MQTT_*` env vars. Those paths are gone. If `MQTT_COMMAND_TOPIC`, `MQTT_EVENT_TOPIC`, `MQTT_MESSAGE_TOPIC`, `MQTT_SCANNER_TOPIC`, `MQTT_PAYLOAD_TEMPLATE`, or `MQTT_RETAIN` is set in the environment, the bridge **ignores it and logs a warning at startup** — move the value into the config file (mount one in Docker) or set it with `set_config`.
 
+> **Embedding note (PyO3 / `PyBridgeServer`):** the binding's constructor kwargs are its command line, and CLI/env outranks the config file. So passing one of these six to the constructor pins it, and a later `set_config` on that setting writes the file, restarts — and changes nothing. The bridge warns when this happens and lists the affected names in the response as `pinned_elsewhere`. Leave the kwarg out to let the config file govern. The binary is unaffected: it has no flag or env for any of the six.
+
 ### Configuration File
 A JSON file can be used to manage all settings. Command-line arguments take priority over settings in the config file (except the topic/template settings above, which are config-file/`set_config` only).
 

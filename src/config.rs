@@ -198,6 +198,20 @@ impl Cli {
         Self::parse()
     }
 
+    /// An all-`None` config: no value specified at any level.
+    ///
+    /// This is *not* [`Cli::default`], and the difference matters. `default`
+    /// fills every field with its default **value**, and [`Cli::merge`] only
+    /// fills fields that are `None` — so merging a config file into a
+    /// `Cli::default` can never change anything. A pristine `Cli` is what a
+    /// caller that specified nothing looks like, which is what the layering
+    /// needs as its starting point.
+    #[must_use]
+    pub fn pristine() -> Self {
+        serde_json::from_str("{}")
+            .expect("an empty JSON object must deserialize into Cli (every field is Option<T>)")
+    }
+
     /// Layers the config file and then the defaults over this (CLI/env) layer,
     /// yielding the effective configuration. Highest precedence first: CLI/env >
     /// config file > config-relative state-file default > [`Cli::default`].

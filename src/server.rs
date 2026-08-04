@@ -139,7 +139,7 @@ impl BridgeServer {
         self.cli.session_id = Some(session_id);
 
         let (ctx, mqtt_tx_rx, save_rx, refresh_rx) =
-            BridgeContext::new(&self.cli, self.cycle.clone(), warm).await?;
+            BridgeContext::new(&self.cli, &self.base_cli, self.cycle.clone(), warm).await?;
 
         if first {
             ctx.check_existing_instance().await?;
