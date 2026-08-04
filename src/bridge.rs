@@ -708,9 +708,24 @@ impl BridgeContext {
                             if msg.payload.is_empty() {
                                 continue;
                             }
+                            let (cmd, seqno, retcode) = (msg.cmd, msg.seqno, msg.retcode);
                             match String::from_utf8(msg.payload) {
                                 Ok(payload) => self.handle_device_event(&id, payload).await,
-                                Err(_) => warn!("Non-UTF8 payload from {id}"),
+                                // Say enough to act on. A device's payload is
+                                // always JSON when it decodes correctly, so
+                                // non-UTF8 means the *decode* went wrong, not the
+                                // device — and which frame it was is the whole
+                                // question. The bytes go to `debug` (they are a
+                                // wire dump, and the driver logs the frame there
+                                // too), the identification to `warn`.
+                                Err(e) => {
+                                    warn!(
+                                        "Undecodable payload from {id} (cmd 0x{cmd:02x}, seqno \
+                                         {seqno}, retcode {retcode:?}, {} bytes) — the frame did \
+                                         not decrypt to text; run with --log-level debug to see it",
+                                        e.as_bytes().len()
+                                    );
+                                }
                             }
                         }
                         // The device's event bus is bounded; a slow consumer
