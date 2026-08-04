@@ -63,11 +63,13 @@ requiring an operator to restart the process.
 - **`scan` is a window on the bridge's shared discovery** rather than a scanner
   spun up per request, so devices already known passively are reported
   immediately.
-- **Devices without an `ip` no longer block registration.** They dial TEST-NET-1
-  (RFC 5737, never a real host) with discovery linked; the failed dial elicits an
-  active probe and the answering announcement rewakes the actor with the real
-  address. That is the same path that self-corrects a device whose IP later
-  changes, so "never located" and "moved" are one mechanism.
+- **Devices without an `ip` no longer block registration.** Registration takes
+  the address discovery already holds for the device, and only when it has never
+  been announced does the device dial TEST-NET-1 (RFC 5737, never a real host)
+  with discovery linked — the failed dial elicits an active probe and the
+  answering announcement rewakes the actor with the real address. That is the
+  same path that self-corrects a device whose IP later changes, so "never
+  located" and "moved" are one mechanism.
 - **The connect-storm cap is an object, not a global.** 0.3's
   `set_connect_concurrency` became a shared `ConnectLimiter`. Same
   `--connect-concurrency` knob and default (128); it now applies to devices built
@@ -84,6 +86,17 @@ requiring an operator to restart the process.
   case where the retained sentinel found is guaranteed to be our own.
 
 ### Fixed
+- **A device added without an `ip` could never connect.** Only a *first*
+  sighting carried an address to a registered device, and discovery dedupes
+  announcements against a TTL cache that each announcement refreshes — so for a
+  device that keeps announcing, the first sighting is the only one there will
+  ever be. Since the bridge listens from startup, that sighting had almost always
+  already happened by the time an operator ran `add`, leaving the device
+  redialling the TEST-NET-1 placeholder forever. Measured against a `tuyamock`
+  announcer: 0.3 connected in 0.3s, 0.4 was still down after 150s. Fixed on both
+  sides — registration now reads discovery's cache, and upstream a repeat
+  announcement carries the cached address rather than waking the device with
+  nothing.
 - **Upstream: a device linked to `Discovery` never died.** The route registry
   that makes the reconnect fast-path O(1) held a *strong* sender to each device's
   actor, which kept the actor's receiver open forever — so dropping every

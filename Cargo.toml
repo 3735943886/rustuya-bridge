@@ -37,7 +37,7 @@ log = "0.4"
 # driver, living on the `0.4-sansio` branch. Neither crate is published yet, so
 # the dependency is taken straight from git; Cargo.lock pins the exact rev, and
 # this should become a `rev = "..."` (or a crates.io version) before release.
-rustuya-tokio = { git = "https://github.com/3735943886/rustuya", branch = "feat/bridge-driver-hooks" }
+rustuya-tokio = { git = "https://github.com/3735943886/rustuya", branch = "0.4-sansio" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }

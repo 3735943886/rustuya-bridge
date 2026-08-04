@@ -67,7 +67,8 @@ pub fn connection_event(code: u32) -> Value {
     json!({ "errorCode": code, "errorMsg": code::message(code) })
 }
 
-/// Dial target for a device registered without an IP.
+/// Dial target for a device registered without an IP that discovery has never
+/// seen either (when it has, [`Fleet::located`] supplies the announced address).
 ///
 /// 0.4 has no addressless connect: an address is required up front, and the only
 /// blocking alternative (`DeviceBuilder::discover`) would stall device
@@ -133,6 +134,25 @@ impl Fleet {
         self.discovery.as_ref()
     }
 
+    /// The address discovery last announced for `id`, if it has ever seen it.
+    ///
+    /// Reads the cache rather than awaiting an announcement, so registration
+    /// never blocks. A stale entry is self-correcting: the dial fails and the
+    /// next announcement relocates the device.
+    fn located(&self, id: &str) -> Option<String> {
+        let info = self
+            .discovery
+            .as_ref()?
+            .known()
+            .into_iter()
+            .find(|d| d.id == id)?;
+        info!(
+            "Device {id} has no configured ip; using discovered address {}",
+            info.ip
+        );
+        Some(info.ip.to_string())
+    }
+
     /// Spawns a connection for one **direct** device (a sub-device is pure
     /// routing metadata and never gets one).
     ///
@@ -173,8 +193,18 @@ impl Fleet {
         // behaviour the library documents (the ~30 s idle-drop typical firmware
         // enforces, say); overriding them here would move that reasoning
         // somewhere it can't be maintained.
+        // A device with no configured IP starts at whatever address discovery
+        // already holds for it, and only falls back to the placeholder when
+        // discovery has never seen it. This is the cache-first resolution 0.3's
+        // magic `"Auto"` address did, and it is what makes the common case
+        // instant: the bridge has been listening since startup (or the operator
+        // ran `scan` first), so by the time a device is registered its
+        // announcement is usually already cached. Without it the device would
+        // have to wait out a dial to the placeholder plus a fresh announcement.
+        let address = cfg.ip.clone().or_else(|| self.located(&cfg.id));
+
         let mut builder = Device::builder(&cfg.id, key.as_bytes().to_vec())
-            .address(cfg.ip.as_deref().unwrap_or(UNLOCATED_ADDR))
+            .address(address.as_deref().unwrap_or(UNLOCATED_ADDR))
             .version(version);
 
         // Link discovery for *every* device, not just unlocated ones: it also
