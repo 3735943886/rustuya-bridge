@@ -174,9 +174,10 @@ Issues = "https://github.com/3735943886/rustuya-bridge/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not scale'"
+addopts = "-m 'not scale and not matrix'"
 markers = [
     "scale: large-N broker-backed scavenger stress test; opt-in, run with -m scale",
+    "matrix: full protocol-version x optional-field grid; opt-in, run with -m matrix",
 ]
 
 [tool.maturin]

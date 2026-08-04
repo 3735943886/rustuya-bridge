@@ -722,7 +722,9 @@ impl BridgeContext {
                                     warn!(
                                         "Undecodable payload from {id} (cmd 0x{cmd:02x}, seqno \
                                          {seqno}, retcode {retcode:?}, {} bytes) — the frame did \
-                                         not decrypt to text; run with --log-level debug to see it",
+                                         not decrypt to text. Usually a wrong protocol version: \
+                                         check the device's `version`. RUST_LOG=rustuya_tokio=trace \
+                                         dumps the frame itself.",
                                         e.as_bytes().len()
                                     );
                                 }

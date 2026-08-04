@@ -73,6 +73,19 @@ jobs:
           . .venv/bin/activate
           pytest -v -rs
 
+      # Every protocol version against every combination of the two optional
+      # `add` fields. Opt-in because it is 20 cases each idling past the 10s
+      # keepalive, but it must run somewhere: the field bugs that reached users
+      # all lived in the combinations the default suite does not cover.
+      - name: Protocol-version x optional-field matrix
+        working-directory: python
+        env:
+          MQTT_BROKER: mqtt://localhost:1883
+          REQUIRE_BROKER: '1'
+        run: |
+          . .venv/bin/activate
+          pytest -m matrix -v -rs
+
       - name: 1000-device fleet-scale (onboard + mass clear scavenge)
         working-directory: python
         env:

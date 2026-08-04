@@ -42,6 +42,12 @@ requiring an operator to restart the process.
 - **Bus lag is logged.** rustuya 0.4 surfaces a slow-consumer gap as an
   observable event rather than a silent drop; at fleet scale it is the signal
   that the bridge is falling behind its devices.
+- **A wire transcript at `RUST_LOG=rustuya_tokio=trace`.** Every frame sent and
+  decoded, per device, with non-printable bytes escaped rather than replaced —
+  a garbled payload is exactly the case worth reading, and `from_utf8_lossy`
+  maps every bad byte to the same character. A peer hang-up is now logged too:
+  "the device closed on us" and "we gave up on a silent link" produce the same
+  offline state and had the same (empty) log.
 
 ### Changed
 - **BREAKING (MQTT): `set`/`get`/`request` are fire-and-forget.** The Tuya LAN
