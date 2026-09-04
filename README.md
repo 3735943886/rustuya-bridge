@@ -301,6 +301,16 @@ mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "status", "offset
 mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "status", "limit": 200}'
 ```
 
+> **Note**: All bridge-level responses (`status`, `reconfigure`, `set_config`,
+> `clear`) land on the same shared `{root}/response/bridge` topic — there is
+> no per-client routing or request correlation id. A single requester polling
+> `status` is fine. If **multiple** clients poll `status` concurrently —
+> especially with different `offset`/`limit` — each sees every other client's
+> responses too, so a client must match a response's own `offset`/`limit`
+> against what *it* requested rather than assuming the next message on the
+> topic is its own. Otherwise one client's "page 1" (e.g. `limit=10`) can be
+> mistaken for another's differently-sized "page 1" (e.g. `limit=50`).
+
 #### Clear All Devices
 ```bash
 mosquitto_pub -h localhost -t "rustuya/command" -m '{"action": "clear"}'
