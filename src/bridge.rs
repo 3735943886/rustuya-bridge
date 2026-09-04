@@ -654,6 +654,12 @@ impl BridgeContext {
                                 if let Err(e) = self.save_state().await {
                                     error!("Save failed during shutdown: {e}");
                                 }
+                                // `request_save`'s only callers are `add_device`,
+                                // `remove_device` and `clear_devices` — every flush
+                                // of this debounce is a registry change, so
+                                // republishing the config sentinel (it carries
+                                // `devices_updated_at`) here is deliberate.
+                                self.publish_bridge_config(Some(&self.cli), false).await;
                                 break;
                             }
                             () = tokio::time::sleep(Duration::from_secs(self.save_debounce_secs)) => {
@@ -661,6 +667,7 @@ impl BridgeContext {
                                 if let Err(e) = self.save_state().await {
                                     error!("Save failed: {e}");
                                 }
+                                self.publish_bridge_config(Some(&self.cli), false).await;
                             }
                         }
                     }
@@ -1226,8 +1233,11 @@ impl BridgeContext {
 
     /// Serializes the running config for the `{root}/bridge/config` topic,
     /// injecting the bridge `version` (a build constant, not a `Cli` field, so
-    /// it never round-trips through the config file). Credentials are stripped
-    /// by `#[serde(skip_serializing)]` on the `Cli` fields themselves.
+    /// it never round-trips through the config file) and `devices_updated_at`
+    /// (last time the device registry changed — see `spawn_state_saver`, which
+    /// republishes this payload on the same debounce that flushes a registry
+    /// mutation to disk). Credentials are stripped by
+    /// `#[serde(skip_serializing)]` on the `Cli` fields themselves.
     fn build_bridge_config_payload(cli: &crate::config::Cli) -> String {
         let mut v =
             serde_json::to_value(cli).unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
@@ -1235,6 +1245,10 @@ impl BridgeContext {
             obj.insert(
                 "version".to_string(),
                 Value::String(env!("CARGO_PKG_VERSION").to_string()),
+            );
+            obj.insert(
+                "devices_updated_at".to_string(),
+                Value::from(u64::try_from(unix_millis()).unwrap_or(u64::MAX)),
             );
         }
         serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string())
@@ -3161,6 +3175,25 @@ mod tests {
         assert!(
             !json.contains("S3cret-pw"),
             "password leaked into bridge/config: {json}"
+        );
+    }
+
+    #[test]
+    fn bridge_config_payload_includes_devices_updated_at() {
+        let cli = crate::config::Cli {
+            session_id: Some("sid_1".into()),
+            ..crate::config::Cli::default()
+        };
+        let before = unix_millis();
+        let json = BridgeContext::build_bridge_config_payload(&cli);
+        let after = unix_millis();
+        let val: Value = serde_json::from_str(&json).unwrap();
+        let ts = val["devices_updated_at"]
+            .as_u64()
+            .expect("devices_updated_at missing or not a number");
+        assert!(
+            u128::from(ts) >= before && u128::from(ts) <= after,
+            "devices_updated_at {ts} not within [{before}, {after}]"
         );
     }
 

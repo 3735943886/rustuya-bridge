@@ -54,6 +54,15 @@ requiring an operator to restart the process.
   maps every bad byte to the same character. A peer hang-up is now logged too:
   "the device closed on us" and "we gave up on a silent link" produce the same
   offline state and had the same (empty) log.
+- **`devices_updated_at` on the retained `{root}/bridge/config` topic.** A
+  millisecond timestamp of the last time a device was added, removed, or
+  cleared, so a client can tell the registry changed without subscribing to
+  or polling the (paginated, potentially large) `status` response — it can
+  just watch this field move and re-pull `status` when it does. Piggybacks on
+  the existing `save_debounce_secs` flush that already persists registry
+  changes to disk, so a burst of changes republishes once. Resets on
+  `reconfigure` (the restart republishes `bridge/config` fresh regardless of
+  whether devices changed).
 
 ### Changed
 - **BREAKING (MQTT): `set`/`get`/`request` are fire-and-forget.** The Tuya LAN
