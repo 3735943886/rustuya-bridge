@@ -11,10 +11,9 @@ default-members = ["."]
 # and the pyrustuyabridge wheel via `version.workspace = true`. The PyPI
 # package follows automatically (pyproject `dynamic = ["version"]` → maturin).
 [workspace.package]
-# `-dev` while the 0.4 line is unreleasable: it depends on `rustuya-tokio` from
-# git (the 0.4 crates aren't published yet), so there is nothing to tag. Mirrors
-# the upstream `0.4.0-dev`. Drop the suffix once the dependency is a crates.io
-# version or a pinned `rev`.
+# `-dev` while `rustuya` upstream is still beta (0.4.0-beta.2 as of this
+# writing, now a crates.io dependency rather than git). Revisit this suffix
+# once upstream cuts a stable 0.4.0.
 version = "0.4.0-dev"
 
 [package]
@@ -33,11 +32,9 @@ clap = { version = "4.5", features = ["derive", "env"] }
 env_logger = "0.11"
 futures-util = "0.3"
 log = "0.4"
-# 0.4 is the sans-I/O redesign: a `rustuya-core` FSM plus the `rustuya-tokio`
-# driver, living on the `0.4-sansio` branch. Neither crate is published yet, so
-# the dependency is taken straight from git; Cargo.lock pins the exact rev, and
-# this should become a `rev = "..."` (or a crates.io version) before release.
-rustuya-tokio = { git = "https://github.com/3735943886/rustuya", branch = "0.4-sansio" }
+# 0.4 is the sans-I/O redesign: a core FSM plus a tokio driver, now published
+# as a single `rustuya` crate with the driver behind the `tokio` feature.
+rustuya = { version = "0.4.0-beta.2", features = ["tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use log::{debug, error, info, trace, warn};
 use regex::Regex;
-use rustuya_tokio::{CoreError, Device, Event, Listener};
+use rustuya::tokio::{CoreError, Device, Event, Listener};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

@@ -16,7 +16,7 @@
 //!   process's panic hook or rlimits, so they live here now.
 
 use log::{info, warn};
-use rustuya_tokio::{ConnectLimiter, Device, Discovery, Version};
+use rustuya::tokio::{ConnectLimiter, Device, Discovery, Version};
 use serde_json::{Value, json};
 
 use crate::config::DeviceConfig;

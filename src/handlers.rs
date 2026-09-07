@@ -1,4 +1,4 @@
-use rustuya_tokio::{CommandType, Device};
+use rustuya::tokio::{CommandType, Device};
 use serde_json::Value;
 use std::future::Future;
 use std::sync::Arc;
@@ -68,7 +68,7 @@ const FANOUT_CONCURRENCY: usize = 100;
 
 /// One discovered device as the scanner-topic payload. Field names are the 0.3
 /// ones, so existing consumers of the scanner topic are unaffected.
-fn scan_payload(info: &rustuya_tokio::DeviceInfo) -> Value {
+fn scan_payload(info: &rustuya::tokio::DeviceInfo) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert("id".to_string(), Value::String(info.id.clone()));
     payload.insert("ip".to_string(), Value::String(info.ip.to_string()));
@@ -100,7 +100,7 @@ async fn fire(
     cid: Option<String>,
     cmd: CommandType,
     data: Option<Value>,
-) -> rustuya_tokio::Result<()> {
+) -> rustuya::tokio::Result<()> {
     match cid {
         Some(cid) => dev.sub(cid).send(cmd, data).await,
         None => dev.send(cmd, data).await,
