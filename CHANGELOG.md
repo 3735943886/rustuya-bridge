@@ -5,15 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.4.0-dev
+## [Unreleased]
+
+## [0.4.0-dev] — 2026-09-07
 
 The 0.4 line. Two themes: the device layer moves to rustuya 0.4 (the sans-I/O
 `rustuya-core` FSM plus the `rustuya-tokio` driver), and a config change stops
 requiring an operator to restart the process.
 
-> **Not releasable yet.** `rustuya-tokio` is taken from git — the 0.4 crates are
-> unpublished — and `Cargo.lock` is gitignored here, so the dependency should
-> become a pinned `rev` (or a crates.io version) before this is tagged.
+> **Pre-release.** `rustuya` upstream is still beta (`0.4.0-beta.2` on
+> crates.io as of this tag) — this line will keep moving until it cuts a
+> stable `0.4.0`.
 
 ### Added
 - **In-place restart.** `reconfigure` restarts the bridge *inside its own
