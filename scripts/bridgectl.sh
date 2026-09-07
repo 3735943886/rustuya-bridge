@@ -176,7 +176,10 @@ resolve_state_file_from_config() {
 # `base[-pre]`, compare bases via `sort -V`, then apply semver rule that
 # any pre-release is older than its base release; if both sides have pre,
 # fall back to `sort -V` over the full strings (handles `rc.1` < `rc.2`,
-# `alpha` < `beta` < `rc` alphabetically — same direction as semver).
+# `alpha` < `beta` < `rc` alphabetically — same direction as semver). `dev`
+# is special-cased first: it's the least mature channel (dev < alpha < beta
+# < rc) but "dev" alphabetically falls between "beta" and "rc", so `sort -V`
+# alone would rank it backwards against alpha/beta.
 version_direction() {
     if [ "$1" = "$2" ]; then
         printf 'equal'
@@ -200,6 +203,22 @@ version_direction() {
     elif [ -z "$b_pre" ]; then
         printf 'older'  # pre-release < release
     else
+        case "$a_pre" in
+            dev|dev.*)
+                case "$b_pre" in
+                    dev|dev.*) ;;
+                    *) printf 'older'; return ;;
+                esac
+                ;;
+        esac
+        case "$b_pre" in
+            dev|dev.*)
+                case "$a_pre" in
+                    dev|dev.*) ;;
+                    *) printf 'newer'; return ;;
+                esac
+                ;;
+        esac
         first="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)"
         [ "$first" = "$1" ] && printf 'older' || printf 'newer'
     fi

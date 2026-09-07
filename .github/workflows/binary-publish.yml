@@ -14,14 +14,14 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      # Pre-release tags (e.g. v0.3.0-rc.1, v1.0.0-alpha.2, v1.0.0-beta) must be
-      # flagged so they don't become `releases/latest` — bridgectl.sh queries that
-      # endpoint to drive `install` / `upgrade`, so a mis-flagged RC would auto-ship
-      # to users.
+      # Pre-release tags (e.g. v0.3.0-rc.1, v1.0.0-alpha.2, v1.0.0-beta,
+      # v0.4.0-dev) must be flagged so they don't become `releases/latest` —
+      # bridgectl.sh queries that endpoint to drive `install` / `upgrade`, so
+      # a mis-flagged pre-release would auto-ship to users.
       - name: Detect pre-release from tag
         id: prerel
         run: |
-          if [[ "${GITHUB_REF_NAME}" =~ -(rc|alpha|beta)(\.|$) ]]; then
+          if [[ "${GITHUB_REF_NAME}" =~ -(dev|rc|alpha|beta)(\.|$) ]]; then
             echo "value=true" >> "$GITHUB_OUTPUT"
           else
             echo "value=false" >> "$GITHUB_OUTPUT"
