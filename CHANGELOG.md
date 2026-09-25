@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-dev.1] — 2026-09-25
+
+> **Pre-release.** `rustuya` upstream is still beta (`0.4.0-beta.3` on
+> crates.io as of this tag) — this line will keep moving until it cuts a
+> stable `0.4.0`.
+
+### Changed
+- **Depend on `rustuya` `0.4.0-beta.3`**, up from `beta.2`. Upstream hardening
+  from a security review of the 0.4-sansio branch: discovery no longer trusts
+  an unauthenticated announcement's claimed `ip` — the datagram's source
+  address must match it by default (`require_source_match`), closing a
+  LAN-spoofable redirect of a linked device's reconnect target. Also bounds
+  discovery memory (`max_entries`/`max_devices`), validates announced
+  id/productKey/ip, zeroizes key material on drop, and fixes an IPv6 dial
+  address, local-IP auto-detection on isolated LANs, a poisoned discovery
+  mutex, and a pre-1970 clock. No bridge API or behavior change — the bridge
+  only uses `rustuya::tokio`'s high-level `Discovery::new()`/`Device`/etc., and
+  the full test suite (Rust units, and the Python discovery/version-matrix/
+  fleet-scale suites, which exercise the no-IP discovery-registration path
+  `require_source_match` gates) passes unchanged.
+
+### Fixed
+- **pyrustuyabridge's embedded PyPI readme still described 0.3's reconfigure
+  behavior.** It told embedders to wrap `PyBridgeServer` in a recreate loop
+  because `start()`/`start_async()` "returns on reconfigure" — true in 0.3,
+  false since 0.4's in-place restart (`reconfigure` no longer exits). The
+  section now describes the actual behavior: `start()`/`start_async()` return
+  only on `stop()`/`close()`/a signal, and a config change costs no reconnects.
+
 ## [0.4.0-dev] — 2026-09-07
 
 The 0.4 line. Two themes: the device layer moves to rustuya 0.4 (the sans-I/O
