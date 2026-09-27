@@ -3,7 +3,8 @@ use pyo3::types::{PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
 use rustuyabridge::config::Cli;
 use rustuyabridge::payload::{
-    parse_mqtt_payload, parse_payload_with_template, parse_seed_dps, validate_payload_template,
+    parse_mqtt_payload, parse_payload_with_template, parse_seed_dps, render_command,
+    validate_payload_template,
 };
 use rustuyabridge::server::BridgeServer;
 use rustuyabridge::template::{compile_topic_regex, match_topic, render_template, tpl_to_wildcard};
@@ -46,6 +47,68 @@ fn json_value_to_py<'py>(py: Python<'py>, val: &Value) -> PyResult<Bound<'py, Py
             Ok(dict.into_any())
         }
     }
+}
+
+/// Converts a Python value (JSON-shaped: dict, list, str, int, float, bool,
+/// None) into a `serde_json::Value`.
+fn py_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if obj.is_none() {
+        Ok(Value::Null)
+    } else if let Ok(b) = obj.cast::<pyo3::types::PyBool>() {
+        Ok(Value::Bool(b.is_true()))
+    } else if let Ok(i) = obj.extract::<i64>() {
+        Ok(Value::from(i))
+    } else if let Ok(u) = obj.extract::<u64>() {
+        Ok(Value::from(u))
+    } else if let Ok(f) = obj.cast::<pyo3::types::PyFloat>() {
+        Ok(serde_json::Number::from_f64(f.value()).map_or(Value::Null, Value::Number))
+    } else if let Ok(s) = obj.extract::<String>() {
+        Ok(Value::String(s))
+    } else if let Ok(d) = obj.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in d.iter() {
+            map.insert(k.extract::<String>()?, py_to_json_value(&v)?);
+        }
+        Ok(Value::Object(map))
+    } else if let Ok(l) = obj.cast::<PyList>() {
+        l.iter()
+            .map(|v| py_to_json_value(&v))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Value::Array)
+    } else if let Ok(t) = obj.cast::<pyo3::types::PyTuple>() {
+        t.iter()
+            .map(|v| py_to_json_value(&v))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Value::Array)
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "not JSON-serializable: {}",
+            obj.get_type().name()?
+        )))
+    }
+}
+
+/// Renders a command for the bridge: the topic and payload that make the
+/// bridge run `request`, the inverse of `parse_payload` over a topic matched
+/// by the command topic `template` (with `{root}` already substituted).
+///
+/// `request` is the request dict the bridge should read, e.g.
+/// `{"action": "set", "id": "eb...", "dps": {"1": True}}`. With `{dp}` in the
+/// template, a `set` of one scalar DP takes the single-DP form (the DP id in
+/// the topic, the bare JSON value as the payload); anything else is sent as
+/// the request object. Returns `(topic, payload)`, or `None` when the request
+/// cannot be expressed on this template (checked with the bridge's own topic
+/// matching and payload parsing).
+#[pyfunction]
+#[pyo3(name = "render_command")]
+fn render_command_py(
+    template: &str,
+    request: &Bound<'_, PyDict>,
+) -> PyResult<Option<(String, String)>> {
+    let Value::Object(map) = py_to_json_value(request.as_any())? else {
+        unreachable!("a dict converts to a JSON object");
+    };
+    Ok(render_command(template, &map))
 }
 
 /// Converts an MQTT topic template to a subscription wildcard.
@@ -437,5 +500,6 @@ fn pyrustuyabridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_payload_with_template_py, m)?)?;
     m.add_function(wrap_pyfunction!(parse_seed_dps_py, m)?)?;
     m.add_function(wrap_pyfunction!(validate_payload_template_py, m)?)?;
+    m.add_function(wrap_pyfunction!(render_command_py, m)?)?;
     Ok(())
 }

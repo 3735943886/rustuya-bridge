@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-dev.2] — 2026-09-27
+
+### Added
+- **`render_command` (Rust `payload::render_command`, Python
+  `pyrustuyabridge.render_command`)**: the inverse of the bridge's command
+  parsing, for clients. A request object and the command topic template in,
+  the `(topic, payload)` to publish out. With `{dp}` in the template, a `set`
+  of one scalar DP takes the documented single-DP form (`…/set/<id>/<dp>`
+  with the bare value, e.g. `false`); a multi-DP `set` stays one request
+  object so the device gets one command; other actions are the request object
+  too. A placeholder the request has no value for is filled with `-` and that
+  field is sent as `null`, so the filler is never read as a target. Every
+  result is checked against the bridge's own topic matching and
+  `parse_mqtt_payload`; `None` when the request cannot be expressed on the
+  template. Clients (rustuya-manager, rustuya-local) used to render only
+  `{action}`/`{id}`, leaving a literal `{dp}` in the topic. No bridge
+  behavior change.
+
 ## [0.4.0-dev.1] — 2026-09-25
 
 > **Pre-release.** `rustuya` upstream is still beta (`0.4.0-beta.3` on

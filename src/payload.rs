@@ -38,8 +38,15 @@
 //! present, and applies the `set` heuristic via [`apply_set_heuristic`]
 //! (loose top-level fields become DP id/value pairs unless they collide
 //! with a reserved `BridgeRequest` field name).
+//!
+//! ### Outbound command rendering
+//!
+//! [`render_command`] is its inverse, for clients sending the bridge a
+//! command: a request object and the command topic template in, the topic
+//! and payload out, such that the bridge's own matching and
+//! [`parse_mqtt_payload`] read back exactly that request.
 
-use crate::template::TOPIC_VARS;
+use crate::template::{TOPIC_VARS, render_template};
 use regex::Regex;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -331,6 +338,123 @@ pub fn apply_set_heuristic(obj: &mut Map<String, Value>) {
     }
 }
 
+/// Placeholder filler for a topic variable the request has no value for.
+/// Any non-empty segment matches the command regex; the field itself is sent
+/// as `null` so the bridge does not take the filler as a value.
+const FILLER: &str = "-";
+
+/// Renders a command for the bridge: the inverse of [`parse_mqtt_payload`]
+/// over a topic matched by the command topic `template` (with `{root}`
+/// already substituted).
+///
+/// `request` is the request object the bridge should read (`{"action":
+/// "set", "id": "...", "dps": {"1": true}}`). Topic placeholders are filled
+/// from the request's string fields of the same name. When the template has
+/// `{dp}` and the request is a `set` of exactly one scalar DP (and nothing
+/// else to carry), it takes the template's single-DP form: the DP id in the
+/// topic and the bare JSON value as the payload, which the bridge wraps back
+/// into `dps`. Otherwise the payload is the request object; a placeholder the
+/// request has no value for is filled with a filler segment, and that field
+/// is sent as `null` (except `dp`, which is not a request field) so the
+/// filler is not read as a target.
+///
+/// Returns `None` when a placeholder's field is not a string, or when the
+/// bridge would not read the result back as `request` (checked here with its
+/// own matching and parsing, so a caller never publishes a command the
+/// bridge would misread).
+#[must_use]
+pub fn render_command(template: &str, request: &Map<String, Value>) -> Option<(String, String)> {
+    let action = request.get("action")?.as_str()?;
+    let in_topic: Vec<&str> = TOPIC_VARS
+        .iter()
+        .copied()
+        .filter(|v| template.contains(&format!("{{{v}}}")))
+        .collect();
+
+    // single-DP form: `.../{dp}` with the bare value
+    if action == "set" && in_topic.contains(&"dp") {
+        let dps = request.get("dps").and_then(Value::as_object);
+        let only_targets = request
+            .keys()
+            .all(|k| matches!(k.as_str(), "action" | "id" | "name" | "cid" | "dps"));
+        if let (Some(dps), true) = (dps, only_targets)
+            && dps.len() == 1
+            && let Some((dp, value)) = dps.iter().next()
+            && !value.is_object()
+            && !value.is_array()
+        {
+            let mut vars: HashMap<&str, String> = HashMap::new();
+            vars.insert("dp", dp.clone());
+            let ok = in_topic
+                .iter()
+                .filter(|v| **v != "dp")
+                .all(|v| match request.get(*v) {
+                    Some(Value::String(s)) => {
+                        vars.insert(v, s.clone());
+                        true
+                    }
+                    _ => false,
+                });
+            if ok {
+                let topic = render(template, &vars);
+                let payload = value.to_string();
+                if reads_back(template, &topic, &payload, request) {
+                    return Some((topic, payload));
+                }
+            }
+        }
+    }
+
+    // the request object, fillers for what it does not carry
+    let mut body = request.clone();
+    let mut vars: HashMap<&str, String> = HashMap::new();
+    for v in &in_topic {
+        match request.get(*v) {
+            Some(Value::String(s)) => {
+                vars.insert(v, s.clone());
+            }
+            Some(_) => return None,
+            None => {
+                vars.insert(v, FILLER.to_string());
+                if *v != "dp" {
+                    body.insert((*v).to_string(), Value::Null);
+                }
+            }
+        }
+    }
+    let topic = render(template, &vars);
+    let payload = Value::Object(body).to_string();
+    reads_back(template, &topic, &payload, request).then_some((topic, payload))
+}
+
+fn render(template: &str, vars: &HashMap<&str, String>) -> String {
+    render_template(template, |key, out| {
+        vars.get(key).is_some_and(|v| {
+            out.push_str(v);
+            true
+        })
+    })
+}
+
+/// Whether the bridge reads `topic` + `payload` as `request`: its own topic
+/// match and [`parse_mqtt_payload`], compared without the topic-merged `dp`
+/// and the `null` fields (absent to the bridge's request types).
+fn reads_back(template: &str, topic: &str, payload: &str, request: &Map<String, Value>) -> bool {
+    let re = crate::template::compile_topic_regex(template);
+    let Some(vars) = crate::template::match_topic(topic, template, re.as_ref()) else {
+        return false;
+    };
+    let Value::Object(mut read) = parse_mqtt_payload(payload, &vars) else {
+        return false;
+    };
+    read.remove("dp");
+    read.retain(|_, v| !v.is_null());
+    let mut want = request.clone();
+    want.remove("dp");
+    want.retain(|_, v| !v.is_null());
+    read == want
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +723,117 @@ mod tests {
         let arr = val.as_array().unwrap();
         assert_eq!(arr[0].get("id").and_then(|v| v.as_str()), Some("dev-1"));
         assert_eq!(arr[1].get("id").and_then(|v| v.as_str()), Some("override"));
+    }
+
+    fn req(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    const PER_DP: &str = "rustuya/command/{action}/{id}/{dp}";
+
+    #[test]
+    fn render_command_single_dp_set_puts_the_dp_in_the_topic_and_the_bare_value_in_the_payload() {
+        let r = req(json!({"action": "set", "id": "eb1", "dps": {"1": false}}));
+        assert_eq!(
+            render_command(PER_DP, &r),
+            Some(("rustuya/command/set/eb1/1".into(), "false".into()))
+        );
+        for value in [
+            json!(true),
+            json!(50),
+            json!(2.5),
+            json!("white"),
+            json!(null),
+        ] {
+            let r = req(json!({"action": "set", "id": "eb1", "dps": {"20": value}}));
+            let (topic, payload) = render_command(PER_DP, &r).unwrap();
+            assert_eq!(topic, "rustuya/command/set/eb1/20");
+            assert_eq!(payload, value.to_string());
+        }
+    }
+
+    #[test]
+    fn render_command_keeps_a_multi_dp_set_in_one_message() {
+        // one command to the device, not one per DP: a light's mode and colour go together
+        let r = req(
+            json!({"action": "set", "id": "eb1", "dps": {"21": "colour", "24": "000003e803e8"}}),
+        );
+        let (topic, payload) = render_command(PER_DP, &r).unwrap();
+        assert_eq!(topic, "rustuya/command/set/eb1/-");
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap(),
+            Value::Object(r)
+        );
+    }
+
+    #[test]
+    fn render_command_object_values_and_extra_fields_use_the_request_object() {
+        for r in [
+            req(json!({"action": "set", "id": "eb1", "dps": {"5": {"a": 1}}})),
+            req(
+                json!({"action": "set", "id": "eb1", "cid": "c1", "dps": {"1": true}, "timeout": 3}),
+            ),
+        ] {
+            let (topic, payload) = render_command(PER_DP, &r).unwrap();
+            assert!(topic.starts_with("rustuya/command/set/eb1/"));
+            assert_eq!(
+                serde_json::from_str::<Value>(&payload).unwrap(),
+                Value::Object(r)
+            );
+        }
+    }
+
+    #[test]
+    fn render_command_actions_without_a_dp() {
+        let r = req(json!({"action": "status", "id": "bridge", "offset": 50}));
+        let (topic, payload) = render_command(PER_DP, &r).unwrap();
+        assert_eq!(topic, "rustuya/command/status/bridge/-");
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap(),
+            Value::Object(r)
+        );
+        let r = req(json!({"action": "get", "id": "eb1"}));
+        assert_eq!(
+            render_command(PER_DP, &r).unwrap().0,
+            "rustuya/command/get/eb1/-"
+        );
+    }
+
+    #[test]
+    fn render_command_default_and_other_templates() {
+        let r = req(json!({"action": "set", "id": "eb1", "dps": {"1": true}}));
+        let (topic, payload) = render_command("rustuya/command", &r).unwrap();
+        assert_eq!(topic, "rustuya/command");
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap(),
+            Value::Object(r.clone())
+        );
+        // README: `tuya/command/{id}/set`, the action comes from the payload
+        let (topic, _) = render_command("tuya/command/{id}/set", &r).unwrap();
+        assert_eq!(topic, "tuya/command/eb1/set");
+    }
+
+    #[test]
+    fn render_command_a_placeholder_without_a_value_is_not_read_as_a_target() {
+        // `{name}` in the topic but the request targets by id: the filler must not become a name
+        let r = req(json!({"action": "set", "id": "eb1", "dps": {"1": true}}));
+        let (topic, payload) = render_command("rustuya/cmd/{action}/{name}", &r).unwrap();
+        assert_eq!(topic, "rustuya/cmd/set/-");
+        let body: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(body["name"], Value::Null);
+        let vars = crate::template::match_topic(
+            &topic,
+            "rustuya/cmd/{action}/{name}",
+            crate::template::compile_topic_regex("rustuya/cmd/{action}/{name}").as_ref(),
+        )
+        .unwrap();
+        assert_eq!(parse_mqtt_payload(&payload, &vars)["name"], Value::Null);
+    }
+
+    #[test]
+    fn render_command_refuses_what_it_cannot_put_in_a_topic() {
+        assert_eq!(render_command(PER_DP, &req(json!({"id": "eb1"}))), None); // no action
+        let r = req(json!({"action": "get", "id": ["a", "b"]}));
+        assert_eq!(render_command(PER_DP, &r), None); // a list cannot be one topic segment
     }
 }
