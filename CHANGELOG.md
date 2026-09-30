@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-30
+
+First stable release of the `0.4` line, promoting the `0.4.0-dev` …
+`0.4.0-dev.2` series (see the entries below for the full history: rustuya's
+sans-I/O device layer, in-place `reconfigure` without fleet reconnects, and
+`render_command` for clients).
+
+### Changed
+- **Depend on `rustuya` `0.4` (stable, resolves to `0.4.2`)**, up from the
+  `0.4.0-beta.3` pre-release (`0.4.0`/`0.4.1` are yanked upstream). The
+  crate's `src/` is byte-identical to `beta.3` — the promotion only changes
+  metadata — so there is no bridge API or behavior change. The full test
+  suite (Rust units, and the Python default, version-matrix and fleet-scale
+  suites) passes against the stable crate.
+- **Minimum Rust for source builds is now 1.89** (`cargo install`), inherited
+  from stable `rustuya`, up from 1.88. Release binaries, the Docker image and
+  the PyPI wheels are unaffected.
+
 ## [0.4.0-dev.2] — 2026-09-27
 
 ### Added
