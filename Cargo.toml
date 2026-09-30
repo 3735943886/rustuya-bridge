@@ -38,7 +38,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", 
 tokio-stream = { version = "0.1", features = ["sync"] }
 # Raises the process fd limit (one socket per device). 0.3 did this inside the
 # library; setting a process rlimit is the application's call, so it lives here now.
-rlimit = "0.10"
+rlimit = "0.11"
 rumqttc = { version = "0.25", features = ["use-rustls"] }
 bytes = "1.0"
 regex = "1.11"
