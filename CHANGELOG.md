@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-10-06
+
+### Changed
+- Update `rustuya`, `rustuya-core` and `rustuya-tokio` from `0.4.2` to
+  `0.4.3`. The minimum dependency version is now `0.4.3`, including for
+  source installs and Python builds.
+- Include upstream's warning when reconnect backoff reaches its maximum
+  during an outage, and its fix for re-registering a device after dropping
+  its previous handle.
+- Update `rlimit` from `0.10` to `0.11`.
+
 ## [0.4.0] — 2026-09-30
 
 First stable release of the `0.4` line, promoting the `0.4.0-dev` …
