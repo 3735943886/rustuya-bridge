@@ -146,7 +146,7 @@ cargo build --release
 ```
 
 `Cargo.lock` is intentionally ignored. `cargo update` resolves the newest versions
-allowed by the manifests before each build (including rustuya >=0.4.5, <0.5).
+allowed by the manifests before each build (including rustuya >=0.4.6, <0.5).
 Cargo generates a local lock file while building; do not commit it.
 
 ### Docker
@@ -284,7 +284,10 @@ mosquitto_pub -h localhost -t "rustuya/command" -m '{
 resolves its address/version through LAN discovery in the background. Discovery
 misses and connection failures retry with the driver's normal backoff, including
 after bridge restart. An `add` success confirms registration, not connectivity;
-the first failed attempt reports error code `905`, and connection success reports `0`.
+the first failed attempt reports error code `905`, and connection success reports `0`. If the protocol
+version is omitted or `auto`, even a configured IP waits for a concrete discovery
+version before dialing. Specify both IP and protocol version to connect without
+discovery.
 
 #### Register a Sub-Device (Zigbee/Bluetooth Gateway)
 ```bash

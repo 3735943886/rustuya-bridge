@@ -266,7 +266,9 @@ zero orphans, exercised in CI (`Python Test` →
 ### 2.6 Devices without an address
 
 Addressless registrations create a driver immediately, including on cold start.
-The driver reads the shared discovery cache; a miss requests a probe and enters
+The driver reads the shared discovery cache. Both address and protocol version
+must be resolved before dialing: a configured IP with an `auto` version still
+waits for a concrete announced version. A miss requests a probe and enters
 its normal connection backoff. Later announcements provide the address and
 protocol version and wake that same driver. No placeholder IP, separate pending
 registry, or bridge retry loop is used. `scan_window_secs` bounds explicit scans

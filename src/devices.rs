@@ -88,15 +88,15 @@ impl Fleet {
     /// Binds the shared discovery and installs the connect-storm cap.
     ///
     /// Never fails: discovery that cannot bind is logged and disabled rather than
-    /// taking the bridge down with it, because a fleet of devices with configured
-    /// IPs does not need it.
+    /// taking the bridge down with it, because a fleet with explicit
+    /// addresses and protocol versions does not need it.
     #[must_use]
     pub fn new(connect_concurrency: usize) -> Self {
         let discovery = match Discovery::new() {
             Ok(d) => Some(d),
             Err(e) => {
                 warn!(
-                    "LAN discovery unavailable ({e}); devices registered with an explicit ip still \
+                    "LAN discovery unavailable ({e}); devices registered with an explicit ip and protocol version still \
                      connect, but devices without one cannot be located and the `scan` action will \
                      return nothing"
                 );
@@ -168,9 +168,10 @@ impl Fleet {
         // a backoff that may have grown to a minute.
         if let Some(disco) = &self.discovery {
             builder = builder.rediscover(disco);
-        } else if cfg.ip.is_none() {
+        } else if cfg.ip.is_none() || configured.unwrap_or(Version::Auto) == Version::Auto {
             return Err(BridgeError::InvalidRequest(format!(
-                "device {} has no ip and LAN discovery is unavailable, so it cannot be located",
+                "device {} requires LAN discovery to resolve its ip or protocol version; \
+                 discovery is unavailable, so specify both ip and version",
                 cfg.id
             )));
         }
@@ -296,6 +297,33 @@ mod tests {
         .await
         .expect("first discovery miss is reported as disconnected");
         assert!(!dev.is_connected());
+        dev.close().await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_discovery_requires_both_explicit_ip_and_version() {
+        let fleet = Fleet {
+            discovery: None,
+            limiter: None,
+        };
+        for (ip, version) in [
+            (Some("127.0.0.1"), None),
+            (Some("127.0.0.1"), Some("auto")),
+            (None, Some("3.3")),
+        ] {
+            assert!(matches!(
+                fleet.device_for(&cfg("dev", Some("0123456789abcdef"), ip, version)),
+                Err(BridgeError::InvalidRequest(_))
+            ));
+        }
+        let dev = fleet
+            .device_for(&cfg(
+                "dev",
+                Some("0123456789abcdef"),
+                Some("127.0.0.1"),
+                Some("3.3"),
+            ))
+            .expect("an explicit address and version do not need discovery");
         dev.close().await;
     }
 

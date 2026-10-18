@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-10-18
+
+### Fixed
+- Require `rustuya` 0.4.6: devices with a missing IP or an automatic protocol
+  version wait for discovery to resolve both before TCP connection. This also
+  applies to startup restoration and avoids reporting TCP-only success while
+  the actual protocol version is still unknown. Retry uses the existing driver
+  backoff, with no bridge-level resolution state or retry loop.
+- Report a configuration error when discovery is unavailable and either IP or
+  protocol version still needs discovery; an explicit IP alone is insufficient.
+
+### Validation
+- 155 Rust tests and workspace Clippy pass.
+- 26 MQTT-backed integration tests pass, including known-IP/Auto registration
+  and cold-start restoration against a reachable device that announces its
+  version only after proving no premature TCP connections occurred.
+
 ## [0.4.3] — 2026-10-18
 
 ### Added

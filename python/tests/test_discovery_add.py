@@ -15,9 +15,15 @@ scanner result is the readiness edge, and the connection is awaited on
 `mock.connected`.
 """
 import json
+import socket
 import time
 
+import pytest
+import tinytuya
 import tuyamock
+from tinytuya.core import command_types as CT
+from tinytuya.core import header as H
+from tinytuya.core.message_helper import TuyaMessage, pack_message
 
 from conftest import Collector, loopback_ips
 
@@ -140,3 +146,55 @@ def test_cold_start_restores_undiscovered_device_and_recovers(bridge, tmp_path):
     finally:
         mock.stop()
         coll.close()
+
+
+# Cover both a new registration and the first connection after a cold start.
+# The TCP listener is already reachable, but sends no discovery on its own.
+
+
+@pytest.mark.parametrize("restore", [False, True], ids=["add", "cold-start"])
+def test_known_ip_auto_does_not_dial_until_discovery_supplies_version(bridge, tmp_path, restore):
+    dev_id = f"ebknownipauto{int(restore)}000001"
+    ip = loopback_ips(1, start=93 + int(restore))[0]
+    cfg = {"id": dev_id, "key": KEY, "ip": ip, "version": "auto"}
+    state_file = tmp_path / "known-ip-auto.json"
+    if restore:
+        state_file.write_text(json.dumps({dev_id: cfg}))
+    mock = tuyamock.MockDevice(local_key=KEY, version=VER, host=ip, port=6668,
+                               gw_id=dev_id, dps={"1": True},
+                               discovery=False, discovery_addr=ip)
+    mock.start()
+    coll = None
+    try:
+        h = bridge(scan_window_secs=3600, state_file=str(state_file))
+        coll = Collector(f"{h.root}-known-auto-col")
+        coll.subscribe(f"{h.root}/#")
+        if not restore:
+            coll.publish(h.command(), json.dumps({"action": "add", **cfg}))
+        assert coll.wait_for(lambda t, p, r: t.endswith(f"/error/{dev_id}")
+                             and json.loads(p).get("errorCode") == 905, timeout=5), (
+            "an unresolved Auto version must report failure instead of TCP-only online"
+        )
+        assert mock.server.connections == 0, "known IP bypassed protocol resolution"
+
+        # Emit a real tinytuya-framed announcement only after proving no dial.
+        # Use the independent emulator's payload and wire format, not bridge code.
+        payload = mock.config.discovery_payload(ip=ip)
+        msg = TuyaMessage(1, CT.UDP_NEW, 0, payload, 0, True, H.PREFIX_6699_VALUE, True)
+        packet = pack_message(msg, hmac_key=tinytuya.udpkey)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.bind((ip, 0))
+
+            def announce_and_check():
+                sender.sendto(packet, (ip, 6667))
+                return mock.connected
+
+            assert _wait(announce_and_check, 15), "late discovery did not establish the 3.4 session"
+        coll.publish(h.command(), json.dumps(
+            {"action": "set", "id": dev_id, "dps": {"1": False}}))
+        assert _wait(lambda: mock.dps.get("1") is False, 10)
+        assert mock.server.connections == 1, "resolution must not cause failed fallback dials"
+    finally:
+        mock.stop()
+        if coll is not None:
+            coll.close()
