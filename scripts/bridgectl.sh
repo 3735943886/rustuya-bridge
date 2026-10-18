@@ -5,7 +5,7 @@
 #   ./bridgectl.sh                       # show status (default)
 #   ./bridgectl.sh status
 #   sudo ./bridgectl.sh install [--yes]  # downloads + installs + enables + starts
-#   sudo ./bridgectl.sh upgrade [--yes]
+#   sudo ./bridgectl.sh upgrade [--yes] [--version 0.4.1]
 #   sudo ./bridgectl.sh remove  [--yes]
 #   sudo ./bridgectl.sh purge   [--yes]
 #   ./bridgectl.sh help
@@ -36,6 +36,7 @@ SELF_URL="https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/master/script
 
 ASSUME_YES=0
 PRERELEASE=0
+REQUESTED_VERSION=""
 
 # ── Logging helpers ────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -146,6 +147,19 @@ api_latest_tag() {
     fi
 }
 
+# Explicit versions select a release directly, without consulting the latest
+# channel. Download + checksum validation still finishes before stopping service.
+release_tag() {
+    if [ -n "$REQUESTED_VERSION" ]; then
+        printf 'v%s\n' "$REQUESTED_VERSION"
+    else
+        local tag
+        tag="$(api_latest_tag)" || die "Failed to query latest release from GitHub."
+        [ -n "$tag" ] && [ "$tag" != "null" ] || die "Empty tag from GitHub API."
+        printf '%s\n' "$tag"
+    fi
+}
+
 current_version() {
     if [ -x "$BIN_PATH" ]; then
         "$BIN_PATH" --version 2>/dev/null | awk '{print $NF}' || true
@@ -232,9 +246,11 @@ download_release() {
     local sumfile="rustuya-bridge-${target}.sha256"
 
     log "  Downloading ${archive}..."
-    curl -fsSL -o "${tmpdir}/${archive}" "${base}/${archive}"
+    curl -fsSL -o "${tmpdir}/${archive}" "${base}/${archive}" \
+        || die "Could not download ${tag} for ${target}; check that the release and asset exist."
     log "  Downloading ${sumfile}..."
-    curl -fsSL -o "${tmpdir}/${sumfile}" "${base}/${sumfile}"
+    curl -fsSL -o "${tmpdir}/${sumfile}" "${base}/${sumfile}" \
+        || die "Could not download checksum for ${tag} (${target})."
 
     log "  Verifying sha256..."
     ( cd "$tmpdir" && sha256sum -c "$sumfile" >/dev/null ) \
@@ -449,12 +465,12 @@ cmd_install() {
 
     local target tag tmpdir
     target="$(detect_target)"
-    tag="$(api_latest_tag)" || die "Failed to query latest release from GitHub."
-    [ -n "$tag" ] || die "Empty tag from GitHub API."
+    tag="$(release_tag)" || exit 1
 
     tmpdir="$(mktemp -d)"
     # Bake the path into the trap (double-quoted) so it survives `local`
     # going out of scope when the function returns.
+    # shellcheck disable=SC2064 # Capture the local path before the function returns.
     trap "rm -rf -- '$tmpdir'" EXIT
 
     log "Installing rustuya-bridge ${tag} for ${target}..."
@@ -499,30 +515,30 @@ cmd_upgrade() {
     require_tools
     [ -x "$BIN_PATH" ] || die "rustuya-bridge is not installed. Use: sudo bridgectl install"
 
-    local cur target tag latest_ver tmpdir was_active=0
+    local cur target tag target_ver tmpdir was_active=0
     cur="$(current_version)"
     target="$(detect_target)"
-    tag="$(api_latest_tag)" || die "Failed to query latest release."
-    latest_ver="${tag#v}"
+    tag="$(release_tag)" || exit 1
+    target_ver="${tag#v}"
 
-    if [ "$cur" = "$latest_ver" ]; then
-        ok "Already up to date (${cur})."
+    if [ "$cur" = "$target_ver" ]; then
+        ok "Already at requested version (${cur})."
         return 0
     fi
 
     # Detect downgrade — e.g. an RC is installed and `upgrade` (stable channel)
-    # is run, where `latest_ver` is the older last-stable. Surface this clearly
+    # is run, where `target_ver` is the older last-stable. Surface this clearly
     # so the user doesn't yes-through a regression.
     local direction prompt
-    direction="$(version_direction "$cur" "$latest_ver")"
+    direction="$(version_direction "$cur" "$target_ver")"
     if [ "$direction" = "newer" ]; then
-        warn "Installed ${cur} is NEWER than the ${PRERELEASE:+pre-release }channel's latest (${latest_ver})."
-        if [ "$PRERELEASE" -ne 1 ]; then
+        warn "Installed ${cur} is newer than target ${target_ver}."
+        if [ -z "$REQUESTED_VERSION" ] && [ "$PRERELEASE" -ne 1 ]; then
             warn "For the newest pre-release instead, re-run: sudo bridgectl upgrade --prerelease"
         fi
-        prompt="Downgrade rustuya-bridge ${cur} → ${latest_ver}?"
+        prompt="Downgrade rustuya-bridge ${cur} → ${target_ver}?"
     else
-        prompt="Upgrade rustuya-bridge ${cur} → ${latest_ver}?"
+        prompt="Upgrade rustuya-bridge ${cur} → ${target_ver}?"
     fi
 
     confirm "$prompt" || { log "Aborted."; return 0; }
@@ -530,6 +546,7 @@ cmd_upgrade() {
     tmpdir="$(mktemp -d)"
     # Bake the path into the trap (double-quoted) so it survives `local`
     # going out of scope when the function returns.
+    # shellcheck disable=SC2064 # Capture the local path before the function returns.
     trap "rm -rf -- '$tmpdir'" EXIT
 
     download_release "$tag" "$target" "$tmpdir"
@@ -548,9 +565,9 @@ cmd_upgrade() {
     # daemon-reload, so the (re)start below picks up the new unit.
     write_unit
     if [ "$direction" = "newer" ]; then
-        ok "Downgraded to ${latest_ver}."
+        ok "Downgraded to ${target_ver}."
     else
-        ok "Upgraded to ${latest_ver}."
+        ok "Upgraded to ${target_ver}."
     fi
 
     if [ "$was_active" -eq 1 ]; then
@@ -652,14 +669,17 @@ ${C_BOLD}bridgectl${C_RESET} — install / manage rustuya-bridge as a systemd se
 
 ${C_BOLD}USAGE${C_RESET}
   bridgectl [status]              Show install / service / version state (default)
-  sudo bridgectl install [opts]   Download latest release, register + start systemd unit
-  sudo bridgectl upgrade [opts]   Replace binary with latest release (preserves config)
+  sudo bridgectl install [opts]   Download selected release, register + start systemd unit
+  sudo bridgectl upgrade [opts]   Replace binary with selected release (preserves config)
   sudo bridgectl remove  [opts]   Stop, disable, remove binary + unit (keeps data dir)
   sudo bridgectl purge   [opts]   Remove everything: binary, unit, data dir, user, helper
   bridgectl help                  Show this help
 
 ${C_BOLD}OPTIONS${C_RESET}
   --yes, -y          Skip confirmation prompts (required for non-interactive shells)
+  --version VERSION Install an exact release, e.g. 0.4.1 or v0.4.1 (also --version=...).
+                     Applies to: install, upgrade. Older versions prompt for downgrade.
+                     Cannot be combined with --prerelease; this does not pin later upgrades.
   --prerelease       Target the newest release including pre-releases (RC/alpha/beta).
                      Applies to: status, install, upgrade. Without this flag,
                      the stable channel (\`releases/latest\`) is used.
@@ -680,23 +700,46 @@ EOF
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 main() {
-    local subcmd="" rest=()
+    local subcmd=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --yes|-y)     ASSUME_YES=1 ;;
             --prerelease) PRERELEASE=1 ;;
+            --version)
+                [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] \
+                    || die "--version requires a release version (e.g. 0.4.1)."
+                [ -z "$REQUESTED_VERSION" ] || die "--version may only be specified once."
+                REQUESTED_VERSION="$2"
+                shift
+                ;;
+            --version=*)
+                [ -z "$REQUESTED_VERSION" ] || die "--version may only be specified once."
+                REQUESTED_VERSION="${1#*=}"
+                [ -n "$REQUESTED_VERSION" ] || die "--version requires a release version (e.g. 0.4.1)."
+                ;;
             -h|--help)    cmd_help; exit 0 ;;
             -*)           die "Unknown flag: $1" ;;
             *)
                 if [ -z "$subcmd" ]; then
                     subcmd="$1"
                 else
-                    rest+=("$1")
+                    die "Unexpected argument: $1 (use --version VERSION to select a release)."
                 fi
                 ;;
         esac
         shift
     done
+
+    if [ -n "$REQUESTED_VERSION" ]; then
+        REQUESTED_VERSION="${REQUESTED_VERSION#v}"
+        [[ "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] \
+            || die "Invalid release version: $REQUESTED_VERSION (expected e.g. 0.4.1 or v0.4.1-rc.1)."
+        [ "$PRERELEASE" -eq 0 ] || die "--version cannot be combined with --prerelease."
+        case "${subcmd:-status}" in
+            install|upgrade) ;;
+            *) die "--version is only supported for install and upgrade." ;;
+        esac
+    fi
 
     case "${subcmd:-status}" in
         status)   cmd_status ;;
@@ -709,4 +752,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    main "$@"
+fi

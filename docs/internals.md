@@ -113,10 +113,11 @@ spot it.
 | Sub-device (cid set), parent_id set, parent registered    | `"subdevice"`                                |
 | Sub-device (cid set), parent_id set, parent not registered| `"no parent"`                                |
 | Has `cid` but no `parent_id` (only via hand-edited state) | `"invalid subdevice"`                        |
-| Direct, in `instances`, no error history                  | `"online"`                                   |
-| Direct, in `instances`, last reported `errorCode 0`       | `"0"` — success/connected, **same as online**|
-| Direct, in `instances`, errored before (non-zero code)    | the raw error code as string (e.g. `"905"`)  |
-| Direct, *not* in `instances` (rare; broken state)         | `"offline"`                                  |
+| Direct, connected, success not yet handled by listener | `"online"` |
+| Direct, connected, last reported `errorCode 0`          | `"0"` — success/connected, **same as online** |
+| Direct, first attempt still pending                    | `"offline"` |
+| Direct, disconnected                                  | `"905"`, or `"914"` when that is the last reported error |
+| Direct, no driver instance                            | `"offline"` |
 
 `"invalid subdevice"` can only appear if you hand-edit the state file or
 load one from a buggy producer — `add_device` rejects `cid` without
@@ -130,13 +131,13 @@ unaffected. The bridge publishes three of them, from
 | Code | Meaning                                 | Published when                          |
 | ---- | --------------------------------------- | --------------------------------------- |
 | 0    | Connection Successful                   | the link comes up (**not** a fault)     |
-| 905  | Network Error: Device Unreachable       | the link goes down                      |
+| 905  | Network Error: Device Unreachable       | the first attempt fails or the link goes down |
 | 914  | Check device key or version             | the device rejects our credentials      |
 
 The source changed in 0.4 and the values did not. 0.3 pushed these through the
 device event stream as synthetic frames; 0.4 keeps connection state off the frame
 stream entirely and exposes it as watches, so the bridge synthesises the same
-payloads from `Device::watch_connected()` / `watch_error()` (§2.1).
+payloads from `Device::watch_connection_state()` / `watch_error()` (§2.1).
 
 `914` is new to the *event* path. In 0.3 it could only appear as the error return
 of a `request()` call, so a wrong local key stayed invisible until someone tried
@@ -145,8 +146,10 @@ rejects us.
 
 `last_error_code` is **stored in memory only** — `#[serde(skip)]` in
 `DeviceConfig` ([config.rs](../src/config.rs), field `last_error_code`) means
-it is not persisted to the state file. After a restart, every direct device looks
-`"online"` until it hits its next error.
+it is not persisted to the state file. Current driver state is also checked:
+a pending connection reports `"offline"` and a failed connection reports `"905"`
+(or the last reported authentication error `"914"`), even before the listener
+handles the connection change.
 
 ---
 
@@ -167,7 +170,7 @@ maps in [spawn_device_listener](../src/bridge.rs):
 | Map      | Carries                                    | Becomes                                    |
 | -------- | ------------------------------------------ | ------------------------------------------ |
 | `frames` | device pushes and command replies          | a device event (§3.3)                      |
-| `conns`  | connection state (`watch_connected`)       | a synthetic `errorCode` message (§1.4)     |
+| `conns`  | connection state (`watch_connection_state`)       | a synthetic `errorCode` message (§1.4)     |
 | `auths`  | auth failures (`watch_error`)              | an `errorCode 914` message                 |
 
 The split is 0.4's doing and it is the right one: connection state is *state*,
@@ -175,10 +178,11 @@ not an event, so it lives on a `watch` rather than in the frame stream. The
 bridge re-joins the two for MQTT, synthesising the same `errorCode` payloads 0.3
 published inline so nothing downstream had to change.
 
-Both watch maps subscribe with `WatchStream::from_changes`, which does **not**
-replay the value present at subscribe time. A device is never connected at the
-instant it is registered, so replaying would emit a spurious "offline" for every
-device at startup — a fleet-sized burst on the message topic.
+Connection and authentication watches replay their current value on subscription,
+so a failure before the listener attaches is still visible. The connection watch
+uses `ConnectionState`: `Pending` produces no message, the first failed attempt
+produces `905`, and success produces `0`. Repeated disconnected retries do not
+produce repeated offline messages.
 
 ### 2.2 Deltas, not rebuilds
 
@@ -261,11 +265,13 @@ zero orphans, exercised in CI (`Python Test` →
 
 ### 2.6 Devices without an address
 
-An addressless registration waits for the shared `Discovery` to resolve its
-actual address, up to `scan_window_secs`. Cached announcements resolve
-immediately. A timeout returns an error without changing the registry. Discovery
-runs before taking the registry write lock, so other device operations can
-continue while the address is being resolved. No placeholder IP is dialled.
+Addressless registrations create a driver immediately, including on cold start.
+The driver reads the shared discovery cache; a miss requests a probe and enters
+its normal connection backoff. Later announcements provide the address and
+protocol version and wake that same driver. No placeholder IP, separate pending
+registry, or bridge retry loop is used. `scan_window_secs` bounds explicit scans
+only. Invalid credentials/configuration still reject registration; an offline
+or undiscovered device does not.
 
 Every device is linked to discovery, not just unlocated ones — a re-announcement
 also cancels a pending reconnect backoff, so a rebooted device comes back

@@ -116,27 +116,6 @@ impl Fleet {
         self.discovery.as_ref()
     }
 
-    /// What discovery last announced for `id` — address and protocol version —
-    /// if it has ever seen it.
-    ///
-    /// Reads the cache rather than awaiting an announcement, so registration
-    /// never blocks. A stale entry is self-correcting: the dial fails and the
-    /// next announcement relocates the device.
-    fn located(&self, id: &str) -> Option<(String, Option<Version>)> {
-        let info = self
-            .discovery
-            .as_ref()?
-            .known()
-            .into_iter()
-            .find(|d| d.id == id)?;
-        info!(
-            "Device {id}: discovery reports {} (version {})",
-            info.ip,
-            info.version.map_or("unknown", Version::as_str)
-        );
-        Some((info.ip.to_string(), info.version))
-    }
-
     fn credentials(cfg: &DeviceConfig) -> Result<(&str, Option<Version>), BridgeError> {
         let key = cfg.key.as_deref().ok_or_else(|| {
             BridgeError::InvalidRequest(format!("device {} has no local key", cfg.id))
@@ -164,37 +143,6 @@ impl Fleet {
         Ok((key, configured))
     }
 
-    /// Resolve an addressless registration before creating its driver. Never
-    /// dial a placeholder IP or hold the device registry lock while waiting.
-    pub async fn resolve_address(
-        &self,
-        cfg: &DeviceConfig,
-        window: std::time::Duration,
-    ) -> Result<DeviceConfig, BridgeError> {
-        let mut resolved = cfg.clone();
-        if cfg.cid.is_some() && cfg.parent_id.is_some() {
-            return Ok(resolved);
-        }
-        Self::credentials(cfg)?;
-        if cfg.ip.is_some() {
-            return Ok(resolved);
-        }
-        let disco = self.discovery.as_ref().ok_or_else(|| {
-            BridgeError::InvalidRequest(format!(
-                "device {} has no ip and LAN discovery is unavailable",
-                cfg.id
-            ))
-        })?;
-        let info = disco.find(&cfg.id, window).await.map_err(|err| {
-            BridgeError::DeviceError(format!("device {} could not be located: {err}", cfg.id))
-        })?;
-        resolved.ip = Some(info.ip.to_string());
-        if resolved.version.is_none() {
-            resolved.version = info.version.map(|v| v.as_str().to_owned());
-        }
-        Ok(resolved)
-    }
-
     /// Spawns a connection for one **direct** device (a sub-device is pure
     /// routing metadata and never gets one).
     ///
@@ -205,44 +153,14 @@ impl Fleet {
     pub fn device_for(&self, cfg: &DeviceConfig) -> Result<Device, BridgeError> {
         let (key, configured) = Self::credentials(cfg)?;
 
-        // Address *and* version come from discovery when the config omits them —
-        // they are one resolution, not two, and the library's own examples do
-        // exactly this before building a device. Reading the cache (rather than
-        // awaiting an announcement) keeps registration non-blocking, and it makes
-        // the common case instant: the bridge has been listening since startup,
-        // or the operator ran `scan` first, so a device's announcement is usually
-        // already cached by the time it is registered.
-        //
-        // Resolving the version is not a nicety. `Version::Auto` runs the v3.3
-        // dialect and the core deliberately never probes, so an unresolved v3.4
-        // device *appears* to connect — v3.3 has no handshake, so TCP alone reads
-        // as connected — and is then hung up on by the device the moment the
-        // first frame arrives without a negotiated session. That is a 10-second
-        // connect/drop cycle with no error anywhere. Discovery announcements
-        // carry the version precisely so this is knowable.
-        let discovered = (cfg.ip.is_none() || configured.is_none())
-            .then(|| self.located(&cfg.id))
-            .flatten();
-        let address = cfg
-            .ip
-            .clone()
-            .or_else(|| discovered.as_ref().map(|(ip, _)| ip.clone()));
-        let version = configured
-            .or_else(|| discovered.as_ref().and_then(|(_, v)| *v))
-            .unwrap_or(Version::Auto);
-
-        // Every remaining knob — backoff curve, heartbeat, idle-liveness,
-        // handshake/connect/send timeouts, channel depths — is left at the
-        // driver's default on purpose. Those defaults are derived from device
-        // behaviour the library documents (the ~30 s idle-drop typical firmware
-        // enforces, say); overriding them here would move that reasoning
-        // somewhere it can't be maintained.
-        let address = address.ok_or_else(|| {
-            BridgeError::InvalidRequest(format!("device {} has no resolved address", cfg.id))
-        })?;
+        // Address resolution, protocol selection from discovery, and reconnect
+        // backoff all belong to the driver. Registration validates configuration
+        // and creates its handle without waiting for the device to be reachable.
         let mut builder = Device::builder(&cfg.id, key.as_bytes().to_vec())
-            .address(address)
-            .version(version);
+            .version(configured.unwrap_or(Version::Auto));
+        if let Some(address) = &cfg.ip {
+            builder = builder.address(address);
+        }
 
         // Link discovery for *every* device, not just unlocated ones: it also
         // cancels a pending reconnect backoff the moment a device re-announces,
@@ -359,17 +277,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_address_is_rejected_without_dialling_a_placeholder() {
+    async fn unresolved_address_registers_and_enters_backoff() {
         let fleet = Fleet::new(0);
-        let err = fleet
+        let dev = fleet
             .device_for(&cfg(
                 "never-announced",
                 Some("0123456789abcdef"),
                 None,
                 None,
             ))
-            .unwrap_err();
-        assert!(err.to_string().contains("no resolved address"));
+            .expect("addressless devices register without waiting for discovery");
+        let mut state = dev.watch_connection_state();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while *state.borrow_and_update() != rustuya::tokio::ConnectionState::Disconnected {
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("first discovery miss is reported as disconnected");
+        assert!(!dev.is_connected());
+        dev.close().await;
     }
 
     /// A bad key length is a config error caught at registration, not a device

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-10-18
+
+### Added
+- `bridgectl install/upgrade --version VERSION` selects an exact release, including
+  downgrades, with optional `v` prefix and `--version=VERSION` syntax. Existing
+  checksum verification and service-state preservation apply to selected releases.
+
+### Changed
+- Require `rustuya` 0.4.5. Addressless `add` and startup restoration create a
+  device immediately; discovery misses retry through the driver's existing
+  connection backoff, and later announcements wake it without re-registration.
+- Report first connection/discovery failures as `905`, replaying current state
+  when the listener attaches without reporting initial pending as a failure.
+  Status queries check actual driver state instead of assuming a registered
+  driver is online.
+
+### Validation
+- 154 Rust tests, workspace Clippy, and 24 MQTT-backed Python integration tests
+  pass, including late discovery and cold-start recovery without a saved address.
+- `bridgectl` release-selection tests and ShellCheck pass.
+
 ## [0.4.2] — 2026-10-18
 
 ### Changed

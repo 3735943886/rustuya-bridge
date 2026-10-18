@@ -7,6 +7,7 @@ on:
       - 'python/**'
       - 'src/**'
       - 'Cargo.toml'
+      - 'scripts/**'
       - '.github/workflows/python-test.yml'
   pull_request:
     branches: [master]
@@ -14,6 +15,7 @@ on:
       - 'python/**'
       - 'src/**'
       - 'Cargo.toml'
+      - 'scripts/**'
       - '.github/workflows/python-test.yml'
   workflow_dispatch:
 
@@ -26,6 +28,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+
+      - name: Test bridgectl release selection
+        run: bash scripts/tests/bridgectl.sh
 
       - uses: actions/setup-python@v7
         with:

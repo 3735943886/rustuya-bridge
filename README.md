@@ -90,6 +90,22 @@ All `install` / `upgrade` / `remove` / `purge` accept `--yes` (`-y`) to skip
 confirmation prompts — required when running non-interactively (e.g. via
 `curl | sudo bash`).
 
+#### Install a specific version / downgrade
+
+Use `--version` with `install` or `upgrade` to select an exact release:
+
+```bash
+sudo bridgectl upgrade --version 0.4.1   # downgrade, preserving config and device state
+sudo bridgectl install --version v0.4.1 # fresh install; optional v prefix
+```
+
+`--version=0.4.1` is also accepted. Older versions prompt for confirmation;
+`--yes` skips the prompt. Downloads and SHA-256 verification finish before an
+upgrade stops the service. A stopped service stays stopped after the upgrade.
+The selected version applies to this invocation only: a later `bridgectl upgrade`
+without `--version` selects the latest stable again. Do not combine `--version`
+with `--prerelease`; an exact RC tag can be selected directly with `--version`.
+
 #### Pre-release channel
 
 `bridgectl` defaults to the stable channel (GitHub's `releases/latest`,
@@ -130,7 +146,7 @@ cargo build --release
 ```
 
 `Cargo.lock` is intentionally ignored. `cargo update` resolves the newest versions
-allowed by the manifests before each build (including rustuya >=0.4.4, <0.5).
+allowed by the manifests before each build (including rustuya >=0.4.5, <0.5).
 Cargo generates a local lock file while building; do not commit it.
 
 ### Docker
@@ -263,6 +279,12 @@ mosquitto_pub -h localhost -t "rustuya/command" -m '{
   "ip": "device_ip"
 }'
 ```
+
+`ip` is optional. Without it, registration succeeds immediately and the device
+resolves its address/version through LAN discovery in the background. Discovery
+misses and connection failures retry with the driver's normal backoff, including
+after bridge restart. An `add` success confirms registration, not connectivity;
+the first failed attempt reports error code `905`, and connection success reports `0`.
 
 #### Register a Sub-Device (Zigbee/Bluetooth Gateway)
 ```bash

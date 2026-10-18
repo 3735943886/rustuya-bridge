@@ -82,3 +82,61 @@ def test_device_added_without_an_ip_is_located_by_discovery(bridge):
     finally:
         mock.stop()
         coll.close()
+
+
+def test_addressless_add_recovers_when_device_appears_later(bridge):
+    """An add must acknowledge before discovery, then connect without re-adding."""
+    h = bridge(scan_window_secs=3600)
+    dev_id = "eblatediscovery000001"
+    ip = loopback_ips(1, start=91)[0]
+    coll = Collector(f"{h.root}-late-col")
+    coll.subscribe(f"{h.root}/#")
+    mock = tuyamock.MockDevice(local_key=KEY, version=VER, host=ip, port=6668,
+                               gw_id=dev_id, dps={"1": True},
+                               discovery=True, discovery_addr=ip)
+    try:
+        # Neither IP nor version is known, and the mock is still stopped.
+        coll.publish(h.command(), json.dumps(
+            {"action": "add", "id": dev_id, "key": KEY}))
+        observed = {"ack": False, "offline": False}
+
+        def registered_and_offline(topic, payload, retained):
+            if topic.endswith(f"/response/{dev_id}"):
+                observed["ack"] = json.loads(payload).get("status") == "ok"
+            if topic.endswith(f"/error/{dev_id}"):
+                observed["offline"] = json.loads(payload).get("errorCode") == 905
+            return all(observed.values())
+
+        assert coll.wait_for(registered_and_offline, timeout=5) is not None, (
+            f"addressless add must acknowledge and report its first failure: {observed}"
+        )
+        mock.start()
+        assert _wait(lambda: mock.connected, 30), "late discovery did not wake the registered driver"
+        coll.publish(h.command(), json.dumps(
+            {"action": "set", "id": dev_id, "dps": {"1": False}}))
+        assert _wait(lambda: mock.dps.get("1") is False, 15), "Auto did not establish a working 3.4 session"
+    finally:
+        mock.stop()
+        coll.close()
+
+
+def test_cold_start_restores_undiscovered_device_and_recovers(bridge, tmp_path):
+    """A persisted addressless device must keep its retry actor after cold start."""
+    dev_id = "ebcoldiscovery0000001"
+    ip = loopback_ips(1, start=92)[0]
+    state_file = tmp_path / "cold-state.json"
+    state_file.write_text(json.dumps({dev_id: {"id": dev_id, "key": KEY}}))
+    h = bridge(scan_window_secs=3600, state_file=str(state_file))
+    coll = Collector(f"{h.root}-cold-col")
+    mock = tuyamock.MockDevice(local_key=KEY, version=VER, host=ip, port=6668,
+                               gw_id=dev_id, dps={"1": True},
+                               discovery=True, discovery_addr=ip)
+    try:
+        mock.start()
+        assert _wait(lambda: mock.connected, 30), "cold start failed to retain the addressless driver"
+        coll.publish(h.command(), json.dumps(
+            {"action": "set", "id": dev_id, "dps": {"1": False}}))
+        assert _wait(lambda: mock.dps.get("1") is False, 15), "restored device could not be controlled"
+    finally:
+        mock.stop()
+        coll.close()

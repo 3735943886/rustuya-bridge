@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use log::{debug, error, info, trace, warn};
 use regex::Regex;
-use rustuya::tokio::{CoreError, Device, Event, Listener};
+use rustuya::tokio::{ConnectionState, CoreError, Device, Event, Listener};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -409,14 +409,14 @@ fn pinned_by_outer_layer(base: &Cli) -> Vec<&'static str> {
 /// single place instance replacement is handled.
 fn subscribe(
     frames: &mut StreamMap<String, Listener>,
-    conns: &mut StreamMap<String, WatchStream<bool>>,
+    conns: &mut StreamMap<String, WatchStream<ConnectionState>>,
     auths: &mut StreamMap<String, WatchStream<Option<CoreError>>>,
     id: String,
     dev: &Device,
 ) {
     frames.insert(id.clone(), dev.listener());
-    conns.insert(id.clone(), WatchStream::from_changes(dev.watch_connected()));
-    auths.insert(id, WatchStream::from_changes(dev.watch_error()));
+    conns.insert(id.clone(), WatchStream::new(dev.watch_connection_state()));
+    auths.insert(id, WatchStream::new(dev.watch_error()));
 }
 
 impl BridgeContext {
@@ -499,9 +499,11 @@ impl BridgeContext {
         let mut initial_instances = HashMap::new();
         let mut initial_name_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut initial_cid_map = HashMap::new();
-        let mut pending_devices = futures_util::stream::FuturesUnordered::new();
 
         for (id, cfg) in &initial_configs {
+            if cancel.is_cancelled() {
+                anyhow::bail!("Bridge startup cancelled");
+            }
             if let Some(cid) = &cfg.cid
                 && let Some(parent_id) = &cfg.parent_id
             {
@@ -515,16 +517,12 @@ impl BridgeContext {
                 if let Some(dev) = inherited.remove(id) {
                     initial_instances.insert(id.clone(), dev);
                 } else {
-                    // Resolve startup devices concurrently so absent devices share
-                    // one discovery window instead of delaying startup N windows.
-                    let fleet = fleet.clone();
-                    let cfg = cfg.clone();
-                    let id = id.clone();
-                    let window = cli.scan_window();
-                    pending_devices.push(async move {
-                        let resolved = fleet.resolve_address(&cfg, window).await;
-                        (id, resolved.and_then(|cfg| fleet.device_for(&cfg)))
-                    });
+                    match fleet.device_for(cfg) {
+                        Ok(device) => {
+                            initial_instances.insert(id.clone(), device);
+                        }
+                        Err(err) => error!("Device {id} could not be initialized: {err}"),
+                    }
                 }
             } else {
                 error!("Device {id} is invalid: missing key or parent info");
@@ -535,22 +533,6 @@ impl BridgeContext {
                     .entry(name.clone())
                     .or_default()
                     .push(id.clone());
-            }
-        }
-
-        while !pending_devices.is_empty() {
-            let next = tokio::select! {
-                biased;
-                () = cancel.cancelled() => anyhow::bail!("Bridge startup cancelled"),
-                next = pending_devices.next() => next,
-            };
-            if let Some((id, result)) = next {
-                match result {
-                    Ok(device) => {
-                        initial_instances.insert(id, device);
-                    }
-                    Err(err) => error!("Device {id} could not be connected: {err}"),
-                }
             }
         }
 
@@ -729,11 +711,8 @@ impl BridgeContext {
     ///   `errorCode` messages 0.3 published inline. See [`connection_event`].
     /// * `auths` — authentication failures, i.e. a wrong local key or version.
     ///
-    /// Both watch maps use [`WatchStream::from_changes`], which does *not*
-    /// replay the value present at subscribe time. That matters: a device is
-    /// never connected at the instant it is registered, so replaying would emit
-    /// a spurious "offline" for every device at startup — a fleet-sized burst on
-    /// the message topic that 0.3 never produced.
+    /// Replay current watch values so a failure before subscription is retained.
+    /// `Pending` is ignored: a newly spawned actor is not a failed connection.
     pub fn spawn_device_listener(
         self: Arc<Self>,
         mut refresh_rx: mpsc::UnboundedReceiver<DeviceUpdate>,
@@ -741,7 +720,7 @@ impl BridgeContext {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut frames: StreamMap<String, Listener> = StreamMap::new();
-            let mut conns: StreamMap<String, WatchStream<bool>> = StreamMap::new();
+            let mut conns: StreamMap<String, WatchStream<ConnectionState>> = StreamMap::new();
             let mut auths: StreamMap<String, WatchStream<Option<CoreError>>> = StreamMap::new();
 
             // Seed from the devices built at startup; every later change arrives
@@ -819,8 +798,12 @@ impl BridgeContext {
                         }
                     }},
 
-                    Some((id, connected)) = conns.next(), if !conns.is_empty() => {
-                        let code = if connected { code::SUCCESS } else { code::OFFLINE };
+                    Some((id, connection)) = conns.next(), if !conns.is_empty() => {
+                        let code = match connection {
+                            ConnectionState::Pending => continue,
+                            ConnectionState::Connected => code::SUCCESS,
+                            ConnectionState::Disconnected => code::OFFLINE,
+                        };
                         self.handle_device_event(&id, connection_event(code).to_string()).await;
                     }
 
@@ -2464,11 +2447,6 @@ impl BridgeContext {
     /// `(cid + parent_id)` nor `key`.
     pub async fn add_device(&self, mut cfg: DeviceConfig) -> Result<ApiResponse, BridgeError> {
         Self::normalize_config(&mut cfg);
-        let resolved = self
-            .fleet
-            .resolve_address(&cfg, self.cli.scan_window())
-            .await?;
-
         let id = cfg.id.clone();
         let name = cfg.name.clone();
 
@@ -2517,7 +2495,7 @@ impl BridgeContext {
                             && state.instances.contains_key(&id)
                 );
                 if !unchanged {
-                    fresh = Some(self.fleet.device_for(&resolved)?);
+                    fresh = Some(self.fleet.device_for(&cfg)?);
                 }
             }
 
@@ -3141,10 +3119,22 @@ impl BridgeContext {
                     }
                 })
                 .to_string()
-        } else if instances.contains_key(&cfg.id) {
-            // Direct device: use last_error_code if present, else "online"
-            cfg.last_error_code
-                .map_or_else(|| "online".to_string(), |code| code.to_string())
+        } else if let Some(dev) = instances.get(&cfg.id) {
+            match *dev.watch_connection_state().borrow() {
+                ConnectionState::Pending => "offline".to_string(),
+                ConnectionState::Connected => if cfg.last_error_code == Some(code::SUCCESS) {
+                    "0"
+                } else {
+                    "online"
+                }
+                .to_string(),
+                ConnectionState::Disconnected => if cfg.last_error_code == Some(code::KEY_OR_VER) {
+                    code::KEY_OR_VER
+                } else {
+                    code::OFFLINE
+                }
+                .to_string(),
+            }
         } else {
             "offline".to_string()
         }
@@ -3617,6 +3607,124 @@ mod tests {
                 watch.has_changed().is_err(),
                 "a shutdown must stop the device's driver task"
             );
+        }
+
+        #[tokio::test]
+        async fn addressless_add_is_immediate_persistent_and_restored_as_a_driver() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|cli| {
+                cli.scan_window_secs = Some(3600);
+            })
+            .await;
+            let cfg = direct_device("missing-address", "0123456789abcdef", None);
+            tokio::time::timeout(Duration::from_secs(1), ctx.add_device(cfg.clone()))
+                .await
+                .expect("registration must not wait for a discovery window")
+                .unwrap();
+            expect_up(
+                &mut refresh_rx,
+                &cfg.id,
+                "an unresolved device still has a driver",
+            );
+            ctx.add_device(cfg.clone()).await.unwrap();
+            expect_no_delta(
+                &mut refresh_rx,
+                "re-add must keep the unresolved driver and backoff",
+            );
+            ctx.save_state().await.unwrap();
+            let cli = ctx.cli.clone();
+            ctx.close().await;
+            drop(ctx);
+            let (restored, _mqtt_rx, _save_rx, _refresh_rx) = tokio::time::timeout(
+                Duration::from_secs(1),
+                BridgeContext::new(
+                    &cli,
+                    &Cli::pristine(),
+                    tokio_util::sync::CancellationToken::new(),
+                    None,
+                ),
+            )
+            .await
+            .expect("cold start must not wait for discovery")
+            .unwrap();
+            {
+                let state = restored.state.read().await;
+                assert!(state.configs.contains_key(&cfg.id));
+                assert!(state.instances.contains_key(&cfg.id));
+                assert!(state.configs[&cfg.id].ip.is_none());
+                assert_ne!(
+                    BridgeContext::determine_device_status(
+                        &state.configs[&cfg.id],
+                        &state.instances
+                    ),
+                    "online"
+                );
+            }
+            restored.close().await;
+        }
+
+        #[tokio::test]
+        async fn listener_replays_first_failure_that_precedes_subscription() {
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+            ctx.add_device(direct_device("missing-address", "0123456789abcdef", None))
+                .await
+                .unwrap();
+            let dev = ctx.state.read().await.instances["missing-address"].clone();
+            let mut state = dev.watch_connection_state();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while *state.borrow_and_update() != ConnectionState::Disconnected {
+                    state.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            // This test seeds from the registry, as cold startup does, rather
+            // than registering through the running listener's delta channel.
+            let _ = refresh_rx.try_recv();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let listener = ctx
+                .clone()
+                .spawn_device_listener(refresh_rx, cancel.clone());
+            let msg = tokio::time::timeout(Duration::from_secs(2), mqtt_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                msg.topic.ends_with("/error/missing-address"),
+                "{}",
+                msg.topic
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&msg.payload).unwrap()["errorCode"],
+                code::OFFLINE
+            );
+            // Repeated disconnected retries must not duplicate the same state.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), mqtt_rx.recv())
+                    .await
+                    .is_err()
+            );
+            cancel.cancel();
+            listener.await.unwrap();
+            dev.close().await;
+            ctx.close().await;
+        }
+
+        #[tokio::test]
+        async fn invalid_addressless_update_keeps_existing_registration() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
+            let cfg = direct_device("missing-address", "0123456789abcdef", None);
+            ctx.add_device(cfg.clone()).await.unwrap();
+            expect_up(&mut refresh_rx, &cfg.id, "first registration");
+            let mut invalid = cfg.clone();
+            invalid.key = Some("short".into());
+            assert!(ctx.add_device(invalid).await.is_err());
+            assert_eq!(ctx.state.read().await.configs[&cfg.id].key, cfg.key);
+            expect_no_delta(
+                &mut refresh_rx,
+                "invalid update cannot replace the retrying driver",
+            );
+            ctx.close().await;
         }
 
         // ── #10: add_device idempotency ───────────────────────────────────────
