@@ -224,13 +224,10 @@ than a silent skip — and the bridge logs it with the device id. At fleet scale
 it is the signal that the bridge is falling behind its devices, so treat it as a
 real alarm, not noise.
 
-### 2.4 The 300-second idle report
+### 2.4 Listener wakeups
 
-[LISTENER_TIMEOUT_SECS](../src/bridge.rs) drives an interval that is **reset by
-any device traffic**, so the log line means "nothing at all arrived for five
-minutes", not "five minutes elapsed". It is a liveness *signal*, not a recovery
-mechanism: each device's own actor is already reconnecting underneath, and the
-bridge's loop is purely a consumer.
+The listener waits for device events, registry changes, or cancellation. It has
+no periodic idle-report timer; connection recovery belongs to each device actor.
 
 ### 2.5 Onboarding the fleet — the connect-storm cap
 
@@ -264,20 +261,11 @@ zero orphans, exercised in CI (`Python Test` →
 
 ### 2.6 Devices without an address
 
-0.3 resolved an addressless device through a hidden process-global scanner behind
-the magic address `"Auto"`. 0.4 dropped that on purpose: there is no global
-scanner, and the only blocking alternative would stall registration for the
-length of a discovery timeout.
-
-So the bridge points an unlocated device at **192.0.2.1** — TEST-NET-1
-(RFC 5737), reserved for documentation and guaranteed never to be a real host —
-and links it to the shared `Discovery`. The dial fails, which makes the driver
-ask discovery for an active probe, and the device's answering announcement
-rewakes the actor with its real address.
-
-The placeholder is the *mechanism*, not a hack: it is the same path that
-self-corrects a device whose IP later changes, so "never located" and "moved" are
-one code path, and neither blocks an `add` from returning.
+An addressless registration waits for the shared `Discovery` to resolve its
+actual address, up to `scan_window_secs`. Cached announcements resolve
+immediately. A timeout returns an error without changing the registry. Discovery
+runs before taking the registry write lock, so other device operations can
+continue while the address is being resolved. No placeholder IP is dialled.
 
 Every device is linked to discovery, not just unlocated ones — a re-announcement
 also cancels a pending reconnect backoff, so a rebooted device comes back
@@ -1307,16 +1295,19 @@ Implications:
 
 Graceful shutdown:
 
-1. Send `None` over the MQTT channel → loop enters the shutdown branch.
+1. Cancel auxiliary work, then signal the MQTT loop to shut down.
+   Close the outbound channel and drain accepted messages before the clear.
 2. Publish empty retained payload to clear `bridge/config`.
-3. Poll the eventloop until PubAck arrives (5s timeout).
+3. Poll the eventloop until every queued QoS1 publish, including the clear,
+   has been acknowledged (5s timeout). Earlier PUBACKs cannot confirm the clear.
 4. Send `disconnect()`.
 5. Drain the eventloop until it returns an error (its "socket closed"
    signal).
 
 The whole sequence is wrapped in a 7s outer timeout in
 [BridgeServer::close](../src/server.rs), so a misbehaving broker can't hang
-shutdown indefinitely.
+shutdown indefinitely. A timed-out task is aborted and awaited before a restart
+can create another MQTT connection.
 
 ### 8.4 Packet size & the `status` paging gotcha
 

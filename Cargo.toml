@@ -11,7 +11,7 @@ default-members = ["."]
 # and the pyrustuyabridge wheel via `version.workspace = true`. The PyPI
 # package follows automatically (pyproject `dynamic = ["version"]` → maturin).
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 
 [package]
 name = "rustuyabridge"
@@ -29,7 +29,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 env_logger = "0.11"
 futures-util = "0.3"
 log = "0.4"
-rustuya = { version = "0.4.3", features = ["tokio"] }
+rustuya = { version = "0.4.4", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
@@ -45,9 +45,7 @@ regex = "1.11"
 anyhow = "1.0"
 thiserror = "2.0"
 url = "2.5"
-tokio-util = "0.7"
-
-[dev-dependencies]
+tokio-util = { version = "0.7", features = ["rt"] }
 tempfile = "3"
 
 [profile.release]

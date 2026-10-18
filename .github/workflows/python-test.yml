@@ -62,6 +62,7 @@ jobs:
           . .venv/bin/activate
           pip install --upgrade pip maturin
           pip install pytest 'paho-mqtt>=2' tuyamock
+          cargo update
           maturin develop --release
 
       - name: Default suite (smoke + shutdown)

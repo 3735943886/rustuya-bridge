@@ -67,25 +67,6 @@ pub fn connection_event(code: u32) -> Value {
     json!({ "errorCode": code, "errorMsg": code::message(code) })
 }
 
-/// Dial target for a device registered without an IP that discovery has never
-/// seen either (when it has, [`Fleet::located`] supplies the announced address
-/// and version).
-///
-/// 0.4 has no addressless connect: an address is required up front, and the only
-/// blocking alternative (`DeviceBuilder::discover`) would stall device
-/// registration for the length of its timeout. So an unlocated device is pointed
-/// at TEST-NET-1 ([RFC 5737], reserved for documentation and guaranteed never to
-/// be a real host) and linked to the shared [`Discovery`].
-///
-/// That turns the placeholder into the *mechanism* rather than a hack: the dial
-/// fails, which makes the driver ping discovery for an active probe, and the
-/// device's answering announcement rewakes the actor with its real address. The
-/// same path self-corrects a device whose IP later changes, so an unlocated
-/// device and a relocated one are one code path, and neither blocks registration.
-///
-/// [RFC 5737]: https://www.rfc-editor.org/rfc/rfc5737
-const UNLOCATED_ADDR: &str = "192.0.2.1";
-
 /// Shared, per-process device machinery: the one [`Discovery`] every device
 /// resolves and re-locates through, and the [`ConnectLimiter`] that bounds how
 /// many of them may be dialling and handshaking at once.
@@ -156,14 +137,7 @@ impl Fleet {
         Some((info.ip.to_string(), info.version))
     }
 
-    /// Spawns a connection for one **direct** device (a sub-device is pure
-    /// routing metadata and never gets one).
-    ///
-    /// # Errors
-    /// Returns [`BridgeError::InvalidRequest`] if the config has no key, the key
-    /// is not the 16 bytes the protocol requires, or the version string is not a
-    /// recognised protocol version.
-    pub fn device_for(&self, cfg: &DeviceConfig) -> Result<Device, BridgeError> {
+    fn credentials(cfg: &DeviceConfig) -> Result<(&str, Option<Version>), BridgeError> {
         let key = cfg.key.as_deref().ok_or_else(|| {
             BridgeError::InvalidRequest(format!("device {} has no local key", cfg.id))
         })?;
@@ -186,6 +160,50 @@ impl Fleet {
                 ))
             })?),
         };
+
+        Ok((key, configured))
+    }
+
+    /// Resolve an addressless registration before creating its driver. Never
+    /// dial a placeholder IP or hold the device registry lock while waiting.
+    pub async fn resolve_address(
+        &self,
+        cfg: &DeviceConfig,
+        window: std::time::Duration,
+    ) -> Result<DeviceConfig, BridgeError> {
+        let mut resolved = cfg.clone();
+        if cfg.cid.is_some() && cfg.parent_id.is_some() {
+            return Ok(resolved);
+        }
+        Self::credentials(cfg)?;
+        if cfg.ip.is_some() {
+            return Ok(resolved);
+        }
+        let disco = self.discovery.as_ref().ok_or_else(|| {
+            BridgeError::InvalidRequest(format!(
+                "device {} has no ip and LAN discovery is unavailable",
+                cfg.id
+            ))
+        })?;
+        let info = disco.find(&cfg.id, window).await.map_err(|err| {
+            BridgeError::DeviceError(format!("device {} could not be located: {err}", cfg.id))
+        })?;
+        resolved.ip = Some(info.ip.to_string());
+        if resolved.version.is_none() {
+            resolved.version = info.version.map(|v| v.as_str().to_owned());
+        }
+        Ok(resolved)
+    }
+
+    /// Spawns a connection for one **direct** device (a sub-device is pure
+    /// routing metadata and never gets one).
+    ///
+    /// # Errors
+    /// Returns [`BridgeError::InvalidRequest`] if the config has no key, the key
+    /// is not the 16 bytes the protocol requires, or the version string is not a
+    /// recognised protocol version.
+    pub fn device_for(&self, cfg: &DeviceConfig) -> Result<Device, BridgeError> {
+        let (key, configured) = Self::credentials(cfg)?;
 
         // Address *and* version come from discovery when the config omits them —
         // they are one resolution, not two, and the library's own examples do
@@ -219,8 +237,11 @@ impl Fleet {
         // behaviour the library documents (the ~30 s idle-drop typical firmware
         // enforces, say); overriding them here would move that reasoning
         // somewhere it can't be maintained.
+        let address = address.ok_or_else(|| {
+            BridgeError::InvalidRequest(format!("device {} has no resolved address", cfg.id))
+        })?;
         let mut builder = Device::builder(&cfg.id, key.as_bytes().to_vec())
-            .address(address.as_deref().unwrap_or(UNLOCATED_ADDR))
+            .address(address)
             .version(version);
 
         // Link discovery for *every* device, not just unlocated ones: it also
@@ -335,6 +356,20 @@ mod tests {
         );
         assert_eq!(connection_event(code::OFFLINE)["errorCode"], 905);
         assert_eq!(connection_event(code::KEY_OR_VER)["errorCode"], 914);
+    }
+
+    #[tokio::test]
+    async fn unresolved_address_is_rejected_without_dialling_a_placeholder() {
+        let fleet = Fleet::new(0);
+        let err = fleet
+            .device_for(&cfg(
+                "never-announced",
+                Some("0123456789abcdef"),
+                None,
+                None,
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("no resolved address"));
     }
 
     /// A bad key length is a config error caught at registration, not a device

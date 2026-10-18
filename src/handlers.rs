@@ -316,7 +316,7 @@ async fn handle_request_inner(
 
             let window = ctx.cli.scan_window();
             let ctx_scan = ctx.clone();
-            tokio::spawn(async move {
+            ctx.spawn_task(async move {
                 let mut seen = std::collections::HashSet::new();
                 let mut found = disco.discovered();
                 disco.request_scan();

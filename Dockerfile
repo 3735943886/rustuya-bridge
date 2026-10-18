@@ -27,6 +27,7 @@ COPY python ./python
 RUN --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/app/target \
+    cargo update && \
     xx-cargo build --release --target-dir ./target && \
     # Move the binary to a common location (/bin) as the build path varies by architecture
     cp ./target/$(xx-cargo --print-target-triple)/release/rustuya-bridge /bin/rustuya-bridge

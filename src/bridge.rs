@@ -50,7 +50,11 @@ pub const STATUS_MAX_PAGE: usize = 500;
 pub const MAX_MQTT_PACKET_SIZE: usize = 1024 * 1024;
 pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
-pub const LISTENER_TIMEOUT_SECS: u64 = 300;
+const MQTT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const MQTT_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+// Bound concurrent commands independently of the per-command target fan-out.
+const MAX_CONCURRENT_REQUESTS: usize = 100;
+const AUXILIARY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 pub const REQUEST_TIMEOUT_SECS: u64 = 15;
 
 /// A change to the set of live device connections, handed to the listener task.
@@ -151,6 +155,10 @@ pub struct BridgeState {
 }
 
 pub struct BridgeContext {
+    tasks: tokio_util::task::TaskTracker,
+    task_cancel: tokio_util::sync::CancellationToken,
+    mqtt_shutdown: tokio_util::sync::CancellationToken,
+    save_lock: tokio::sync::Mutex<()>,
     pub cli: Cli,
     pub mqtt_tx: Option<mpsc::Sender<Option<MqttMessage>>>,
     pub mqtt_root_topic: String,
@@ -333,40 +341,21 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Unique per-write temp name. Two saves can race at shutdown — the debounce
-    // task's cancel-branch save and close()'s own final save — and a shared temp
-    // path would let them interleave truncating writes, then rename a torn file
-    // over the real state (silently wiping the whole device registry on next
-    // boot, since load_state treats a parse failure as an empty map). A per-call
-    // suffix keeps each write self-contained; whichever renames last wins and
-    // both candidates are complete.
-    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
-    {
-        let mut f = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .await?;
-        f.write_all(bytes).await?;
-        f.sync_all().await?;
-    }
+    // TempPath removes the temporary file on every error/cancellation path.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let (file, tmp_path) = tempfile::NamedTempFile::new_in(parent)?.into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp_path, path).await?;
 
-    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        anyhow::bail!("Failed to commit file {}: {}", path.display(), e);
-    }
-
-    // Fsync the directory entry (Unix). On Windows this is a no-op and
-    // `File::open` on a directory fails — silently ignore.
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Ok(dir) = tokio::fs::File::open(parent).await
-    {
-        let _ = dir.sync_all().await;
-    }
+    // Persist the renamed directory entry as well as the file contents.
+    #[cfg(unix)]
+    tokio::fs::File::open(parent).await?.sync_all().await?;
 
     Ok(())
 }
@@ -431,6 +420,43 @@ fn subscribe(
 }
 
 impl BridgeContext {
+    /// Own auxiliary work for this cycle and stop it when the cycle ends.
+    pub(crate) fn spawn_task(
+        &self,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        if self.tasks.is_closed() {
+            return;
+        }
+        let cancel = self.task_cancel.clone();
+        self.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {},
+                () = future => {},
+            }
+        });
+    }
+
+    pub(crate) fn shutdown_guard(
+        &self,
+    ) -> (
+        tokio_util::sync::DropGuard,
+        tokio_util::sync::DropGuard,
+        tokio_util::sync::DropGuard,
+    ) {
+        (
+            self.cancel.clone().drop_guard(),
+            self.task_cancel.clone().drop_guard(),
+            self.mqtt_shutdown.clone().drop_guard(),
+        )
+    }
+
+    pub(crate) fn cancel_tasks(&self) {
+        self.tasks.close();
+        self.task_cancel.cancel();
+    }
+
     /// Constructs a new bridge context. Verifies write permission to the state
     /// file, then loads existing device configs and prepares background channels.
     ///
@@ -473,6 +499,7 @@ impl BridgeContext {
         let mut initial_instances = HashMap::new();
         let mut initial_name_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut initial_cid_map = HashMap::new();
+        let mut pending_devices = futures_util::stream::FuturesUnordered::new();
 
         for (id, cfg) in &initial_configs {
             if let Some(cid) = &cfg.cid
@@ -488,17 +515,16 @@ impl BridgeContext {
                 if let Some(dev) = inherited.remove(id) {
                     initial_instances.insert(id.clone(), dev);
                 } else {
-                    // A device that fails to build is a *config* problem (bad key
-                    // length, unknown version) that survived into the state file.
-                    // Log it and carry on rather than refusing to start: the rest
-                    // of the fleet is fine, and the operator can fix the entry
-                    // with a fresh `add`.
-                    match fleet.device_for(cfg) {
-                        Ok(dev) => {
-                            initial_instances.insert(id.clone(), dev);
-                        }
-                        Err(e) => error!("Device {id} could not be connected: {e}"),
-                    }
+                    // Resolve startup devices concurrently so absent devices share
+                    // one discovery window instead of delaying startup N windows.
+                    let fleet = fleet.clone();
+                    let cfg = cfg.clone();
+                    let id = id.clone();
+                    let window = cli.scan_window();
+                    pending_devices.push(async move {
+                        let resolved = fleet.resolve_address(&cfg, window).await;
+                        (id, resolved.and_then(|cfg| fleet.device_for(&cfg)))
+                    });
                 }
             } else {
                 error!("Device {id} is invalid: missing key or parent info");
@@ -509,6 +535,22 @@ impl BridgeContext {
                     .entry(name.clone())
                     .or_default()
                     .push(id.clone());
+            }
+        }
+
+        while !pending_devices.is_empty() {
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => anyhow::bail!("Bridge startup cancelled"),
+                next = pending_devices.next() => next,
+            };
+            if let Some((id, result)) = next {
+                match result {
+                    Ok(device) => {
+                        initial_instances.insert(id, device);
+                    }
+                    Err(err) => error!("Device {id} could not be connected: {err}"),
+                }
             }
         }
 
@@ -600,6 +642,10 @@ impl BridgeContext {
         let initial_seed_done = !seed_supported;
 
         let ctx = Arc::new(Self {
+            tasks: tokio_util::task::TaskTracker::new(),
+            task_cancel: tokio_util::sync::CancellationToken::new(),
+            mqtt_shutdown: tokio_util::sync::CancellationToken::new(),
+            save_lock: tokio::sync::Mutex::new(()),
             cli: cli.clone(),
             mqtt_tx: cli.mqtt_broker.is_some().then_some(mqtt_tx_sender),
             mqtt_root_topic: root_topic_str,
@@ -654,12 +700,6 @@ impl BridgeContext {
                                 if let Err(e) = self.save_state().await {
                                     error!("Save failed during shutdown: {e}");
                                 }
-                                // `request_save`'s only callers are `add_device`,
-                                // `remove_device` and `clear_devices` — every flush
-                                // of this debounce is a registry change, so
-                                // republishing the config sentinel (it carries
-                                // `devices_updated_at`) here is deliberate.
-                                self.publish_bridge_config(Some(&self.cli), false).await;
                                 break;
                             }
                             () = tokio::time::sleep(Duration::from_secs(self.save_debounce_secs)) => {
@@ -719,10 +759,6 @@ impl BridgeContext {
             }
             debug!("Device listener watching {} device(s)", frames.len());
 
-            let mut idle = tokio::time::interval(Duration::from_secs(LISTENER_TIMEOUT_SECS));
-            idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            idle.tick().await; // the first tick is immediate; skip it
-
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => return,
@@ -744,10 +780,6 @@ impl BridgeContext {
                     // rather than parking — an unguarded arm would spin the loop
                     // whenever no devices are registered.
                     Some((id, event)) = frames.next(), if !frames.is_empty() => {
-                        // Any device traffic pushes the idle report out — the
-                        // tick below is a "nothing at all is arriving" alarm,
-                        // not a periodic heartbeat.
-                        idle.reset();
                         match event {
                         Event::Frame(msg) => {
                             // Bare acks carry no payload and say nothing a
@@ -788,7 +820,6 @@ impl BridgeContext {
                     }},
 
                     Some((id, connected)) = conns.next(), if !conns.is_empty() => {
-                        idle.reset();
                         let code = if connected { code::SUCCESS } else { code::OFFLINE };
                         self.handle_device_event(&id, connection_event(code).to_string()).await;
                     }
@@ -804,12 +835,7 @@ impl BridgeContext {
                         }
                     }
 
-                    _ = idle.tick() => {
-                        info!(
-                            "Device listener idle for {LISTENER_TIMEOUT_SECS}s ({} device(s) watched)",
-                            frames.len()
-                        );
-                    }
+
                 }
             }
         })
@@ -990,7 +1016,28 @@ impl BridgeContext {
         const SEED_QUIET: Duration = Duration::from_millis(200);
         let seed_wildcard = self.seed_state_wildcard.clone();
 
+        // Buffer bursts using the same bounded budget as the outbound channel.
+        // One tracked driver owns all request futures; no detached task per command.
+        let (request_tx, request_rx) = mpsc::channel(MQTT_CHANNEL_CAPACITY);
+        let requests_ctx = self.clone();
+        let stop_requests = self.cancel.clone();
+        self.spawn_task(async move {
+            tokio_stream::wrappers::ReceiverStream::new(request_rx)
+                .take_until(stop_requests.cancelled_owned())
+                .for_each_concurrent(MAX_CONCURRENT_REQUESTS, |req| {
+                    let ctx = requests_ctx.clone();
+                    async move {
+                        let responses = crate::handlers::handle_request(ctx.clone(), req).await;
+                        for response in responses {
+                            ctx.publish_api_response(response).await;
+                        }
+                    }
+                })
+                .await;
+        });
+
         let handle = tokio::spawn(async move {
+            let mut outstanding_publishes = 0usize;
             let mut retry_delay = INITIAL_RETRY_DELAY_SECS;
             let mut next_retry: Option<Instant> = None;
             let mut seed_active = false;
@@ -1027,6 +1074,9 @@ impl BridgeContext {
                     false
                 };
                 if flushed {
+                    if pending.as_ref().is_some_and(|msg| msg.retain) {
+                        outstanding_publishes += 1;
+                    }
                     pending = None;
                 }
                 tokio::select! {
@@ -1139,18 +1189,15 @@ impl BridgeContext {
                                 };
 
                                 for req in requests {
-                                    let ctx_h = self.clone();
-                                    tokio::spawn(async move {
-                                        // Each affected target answers with its own response
-                                        // (per-id), addressed to its own topic. An empty Vec
-                                        // means the handler suppressed it (single successful
-                                        // set/get).
-                                        let responses = crate::handlers::handle_request(ctx_h.clone(), req).await;
-                                        for res in responses {
-                                            ctx_h.publish_api_response(res).await;
-                                        }
-                                    });
+                                    let action = req.action_name().to_owned();
+                                    if let Err(err) = request_tx.try_send(req) {
+                                        warn!("MQTT request queue unavailable: {err}");
+                                        self.publish_api_response(ApiResponse::error("Bridge is busy; retry the request").with_action(action)).await;
+                                    }
                                 }
+                            }
+                            Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_))) => {
+                                outstanding_publishes = outstanding_publishes.saturating_sub(1);
                             }
                             Err(e) => {
                                 error!("MQTT Error: {e}. Retrying in {retry_delay}s...");
@@ -1161,7 +1208,13 @@ impl BridgeContext {
                             _ => {}
                         }
                     }
-                    msg_opt = mqtt_tx_receiver.recv(), if pending.is_none() => {
+                    msg_opt = async {
+                        tokio::select! {
+                            biased;
+                            () = self.mqtt_shutdown.cancelled() => None,
+                            msg = mqtt_tx_receiver.recv(), if pending.is_none() => msg,
+                        }
+                    } => {
                         if let Some(Some(msg)) = msg_opt {
                             debug!("MQTT Publish queued: [{}] {}", msg.topic, msg.payload);
                             // Hand off to the non-blocking flush at the loop top.
@@ -1173,41 +1226,47 @@ impl BridgeContext {
                         } else {
                                 debug!("MQTT shutdown signal received, clearing and disconnecting...");
 
-                                // Clear bridge config retain topic
-                                let config_topic = crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
-                                let expected_pubacks = 1;
-                                let _ = client.publish(config_topic, rumqttc::QoS::AtLeastOnce, true, "").await;
-
-                                debug!("Waiting for {expected_pubacks} PubAcks before disconnecting...");
-
-                                // 3. Poll eventloop until all PubAcks are received (with timeout)
-                                let mut received_pubacks: usize = 0;
-                                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                                loop {
-                                    if received_pubacks >= expected_pubacks {
-                                        break;
-                                    }
-                                    if tokio::time::Instant::now() >= deadline {
-                                        warn!("Timed out waiting for PubAcks ({received_pubacks}/{expected_pubacks} received)");
-                                        break;
-                                    }
-                                    match tokio::time::timeout_at(deadline, eventloop.poll()).await {
-                                        Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)))) => {
-                                            received_pubacks += 1;
-                                        }
-                                        Ok(Err(e)) => {
-                                            warn!("MQTT error while waiting for PubAck: {e}");
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            warn!("Timed out waiting for PubAcks");
-                                            break;
-                                        }
-                                        _ => {}
-                                    }
+                                // Queue the clear while polling, then wait for *all* queued
+                                // QoS1 publishes, including the clear, to be acknowledged.
+                                // A prior publish's ACK must never stand in for this clear.
+                                // Stop producers and preserve FIFO for all accepted messages.
+                                // The config clear must be the final retained publish.
+                                mqtt_tx_receiver.close();
+                                let mut outbound = std::collections::VecDeque::new();
+                                if let Some(msg) = pending.take() {
+                                    outbound.push_back(msg);
                                 }
-
-                                debug!("PubAck flush done ({received_pubacks}/{expected_pubacks}).");
+                                while let Ok(msg) = mqtt_tx_receiver.try_recv() {
+                                    if let Some(msg) = msg { outbound.push_back(msg); }
+                                }
+                                let flush = async {
+                                    let mut clear_queued = false;
+                                    loop {
+                                        while let Some(msg) = outbound.front() {
+                                            let qos = if msg.retain { rumqttc::QoS::AtLeastOnce } else { rumqttc::QoS::AtMostOnce };
+                                            let retain = msg.retain && !self.retain_suppressed.load(Ordering::Relaxed);
+                                            if client.try_publish(&msg.topic, qos, retain, msg.payload.clone()).is_err() { break; }
+                                            if msg.retain { outstanding_publishes += 1; }
+                                            outbound.pop_front();
+                                        }
+                                        if outbound.is_empty() && !clear_queued && client.try_publish(
+                                            &config_topic, rumqttc::QoS::AtLeastOnce, true, ""
+                                        ).is_ok() {
+                                            outstanding_publishes += 1;
+                                            clear_queued = true;
+                                        }
+                                        if clear_queued && outstanding_publishes == 0 {
+                                            return Ok::<(), rumqttc::ConnectionError>(());
+                                        }
+                                        if let rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)) = eventloop.poll().await? {
+                                            outstanding_publishes = outstanding_publishes.saturating_sub(1);
+                                        }
+                                    }
+                                };
+                                match tokio::time::timeout(MQTT_FLUSH_TIMEOUT, flush).await {
+                                    Ok(Ok(())) => debug!("MQTT retained clear acknowledged"),
+                                    result => warn!("MQTT shutdown flush failed: {result:?}"),
+                                }
 
                                 // 4. Disconnect, then drain the eventloop until rumqttc surfaces
                                 // an error (its signal that the connection is fully torn down).
@@ -1270,13 +1329,15 @@ impl BridgeContext {
     }
 
     pub async fn shutdown_mqtt(&self) {
+        self.mqtt_shutdown.cancel();
         if let Some(tx) = &self.mqtt_tx {
-            let _ = tx.send(None).await;
+            let _ = tx.try_send(None);
         }
     }
 
     /// Signals MQTT to shutdown (synchronous version for Drop)
     pub fn signal_shutdown_mqtt(&self) {
+        self.mqtt_shutdown.cancel();
         if let Some(tx) = &self.mqtt_tx {
             let _ = tx.try_send(None);
         }
@@ -1285,48 +1346,53 @@ impl BridgeContext {
     /// Fully closes the bridge context, dropping every device connection.
     pub async fn close(&self) {
         info!("Closing bridge context...");
-        drop(self.teardown(false).await);
+        drop(self.teardown().await);
     }
 
     /// Closes the context but **keeps the fleet connected**, handing the live
     /// device machinery to the next cycle. See [`WarmState`].
     pub async fn close_for_restart(&self) -> WarmState {
         info!("Closing bridge context, keeping device connections...");
-        self.teardown(true)
-            .await
-            .expect("teardown(true) always yields the warm state")
+        self.teardown().await
     }
 
-    /// The shared teardown. `keep_devices` decides whether the device handles are
-    /// dropped here — which stops their driver tasks — or moved out to be
-    /// re-registered by the next context.
-    async fn teardown(&self, keep_devices: bool) -> Option<WarmState> {
-        // Take the instances out either way. Dropping the last handle is what
-        // stops a device's driver task, so a shutdown must do it *before*
-        // anything else waits on task completion.
+    /// Stop auxiliary work before moving out the connections and saving the
+    /// final registry. The caller either adopts or drops the returned fleet.
+    async fn teardown(&self) -> WarmState {
+        let _cancel_on_drop = self.task_cancel.clone().drop_guard();
+        self.cancel.cancel();
+        self.tasks.close();
+        if tokio::time::timeout(AUXILIARY_SHUTDOWN_TIMEOUT, self.tasks.wait())
+            .await
+            .is_err()
+        {
+            self.task_cancel.cancel();
+            self.tasks.wait().await;
+        }
         let instances = {
             let mut state = self.state.write().await;
             std::mem::take(&mut state.instances)
         };
-        let warm = keep_devices.then(|| WarmState {
+        let warm = WarmState {
             fleet: self.fleet.clone(),
             instances,
-        });
-
-        self.cancel.cancel();
+        };
         self.shutdown_mqtt().await;
-        let _ = self.save_state().await;
+        if let Err(err) = self.save_state().await {
+            error!("Final state save failed: {err}");
+        }
         warm
     }
 
     async fn try_send_mqtt(&self, msg: Option<MqttMessage>) {
-        if let Some(tx) = &self.mqtt_tx
-            && tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
-                .await
-                .is_err()
-        {
-            let n = self.mqtt_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
-            error!("MQTT queue full, dropping message (cumulative drops: {n})");
+        if let Some(tx) = &self.mqtt_tx {
+            match tokio::time::timeout(MQTT_SEND_TIMEOUT, tx.send(msg)).await {
+                Ok(Ok(())) => {}
+                result => {
+                    let n = self.mqtt_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    error!("MQTT message not delivered ({result:?}; cumulative drops: {n})");
+                }
+            }
         }
     }
 
@@ -1490,41 +1556,30 @@ impl BridgeContext {
         cli: &Cli,
         with_lwt: bool,
     ) -> Result<rumqttc::MqttOptions> {
-        let mut opts = if broker_url.contains("://") {
-            let url = url::Url::parse(broker_url)?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing host in broker URL"))?;
-            let is_ssl = matches!(url.scheme(), "mqtts" | "ssl");
-            let port = url.port().unwrap_or(if is_ssl { 8883 } else { 1883 });
-
-            let mut opts = rumqttc::MqttOptions::new(client_id, host, port);
-
-            // Priority: Cli fields > URL components
-            if let Some(user) = &cli.mqtt_user {
-                opts.set_credentials(user, cli.mqtt_password.as_deref().unwrap_or(""));
-            } else if !url.username().is_empty() {
-                opts.set_credentials(url.username(), url.password().unwrap_or(""));
-            }
-
-            if is_ssl {
-                // Load the platform's native root certificates so `mqtts://`
-                // validates against public CAs (hosted brokers). Passing an
-                // empty CA Vec to `Transport::tls` builds an empty root store
-                // and fails every handshake with `NoValidCertInChain`.
-                opts.set_transport(rumqttc::Transport::tls_with_default_config());
-            }
-            opts
+        let normalized = if broker_url.contains("://") {
+            broker_url.to_owned()
         } else {
-            let parts: Vec<&str> = broker_url.split(':').collect();
-            let host = parts[0];
-            let port = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1883);
-            let mut opts = rumqttc::MqttOptions::new(client_id, host, port);
-            if let Some(user) = &cli.mqtt_user {
-                opts.set_credentials(user, cli.mqtt_password.as_deref().unwrap_or(""));
-            }
-            opts
+            format!("mqtt://{broker_url}")
         };
+        let url = url::Url::parse(&normalized)?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "mqtt" | "tcp" | "mqtts" | "ssl"),
+            "Unsupported MQTT URL scheme"
+        );
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing host in broker URL"))?;
+        let is_ssl = matches!(url.scheme(), "mqtts" | "ssl");
+        let port = url.port().unwrap_or(if is_ssl { 8883 } else { 1883 });
+        let mut opts = rumqttc::MqttOptions::new(client_id, host.trim_matches(['[', ']']), port);
+        if let Some(user) = &cli.mqtt_user {
+            opts.set_credentials(user, cli.mqtt_password.as_deref().unwrap_or(""));
+        } else if !url.username().is_empty() {
+            opts.set_credentials(url.username(), url.password().unwrap_or(""));
+        }
+        if is_ssl {
+            opts.set_transport(rumqttc::Transport::tls_with_default_config());
+        }
 
         opts.set_keep_alive(Duration::from_secs(30));
         // rumqttc caps both directions at 10 KiB by default — far too small for
@@ -1554,6 +1609,7 @@ impl BridgeContext {
     /// # Errors
     /// Returns an error if the state file cannot be serialized, written, or atomically renamed.
     pub async fn save_state(&self) -> Result<()> {
+        let _save = self.save_lock.lock().await;
         let json = {
             let state = self.state.read().await;
             serde_json::to_string_pretty(&state.configs)?
@@ -2180,7 +2236,7 @@ impl BridgeContext {
         // the exit handling at the bottom of the loop.
         let scav_tx = Arc::clone(&self.scavenger_tx);
 
-        tokio::spawn(async move {
+        self.spawn_task(async move {
             let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 64);
 
             // Loop-until-dry. A single collect window ends on an idle gap, but
@@ -2408,6 +2464,10 @@ impl BridgeContext {
     /// `(cid + parent_id)` nor `key`.
     pub async fn add_device(&self, mut cfg: DeviceConfig) -> Result<ApiResponse, BridgeError> {
         Self::normalize_config(&mut cfg);
+        let resolved = self
+            .fleet
+            .resolve_address(&cfg, self.cli.scan_window())
+            .await?;
 
         let id = cfg.id.clone();
         let name = cfg.name.clone();
@@ -2457,7 +2517,7 @@ impl BridgeContext {
                             && state.instances.contains_key(&id)
                 );
                 if !unchanged {
-                    fresh = Some(self.fleet.device_for(&cfg)?);
+                    fresh = Some(self.fleet.device_for(&resolved)?);
                 }
             }
 
@@ -3149,6 +3209,7 @@ impl BridgeContext {
 
 impl Drop for BridgeContext {
     fn drop(&mut self) {
+        self.cancel_tasks();
         self.signal_shutdown_mqtt();
     }
 }
@@ -3267,6 +3328,161 @@ mod tests {
         use super::*;
         use serde_json::json;
         use tempfile::TempDir;
+
+        #[tokio::test]
+        async fn shutdown_waits_for_clear_ack_after_earlier_publish_ack() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            async fn read_packet(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+                let header = socket.read_u8().await.unwrap();
+                let mut len = 0;
+                let mut multiplier = 1;
+                loop {
+                    let byte = socket.read_u8().await.unwrap();
+                    len += usize::from(byte & 127) * multiplier;
+                    if byte & 128 == 0 {
+                        break;
+                    }
+                    multiplier *= 128;
+                }
+                let mut body = vec![0; len];
+                socket.read_exact(&mut body).await.unwrap();
+                (header, body)
+            }
+            fn publish_id(body: &[u8]) -> [u8; 2] {
+                let topic_len = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                [body[2 + topic_len], body[3 + topic_len]]
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let broker_url = format!("mqtt://{}", listener.local_addr().unwrap());
+            let (ctx, _tmp, mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_broker = Some(broker_url);
+                cli.mqtt_retain = Some(false);
+            })
+            .await;
+            let (published, received) = tokio::sync::oneshot::channel();
+            let (connected, ready) = tokio::sync::oneshot::channel();
+            let broker = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_packet(&mut socket).await.0 >> 4, 1); // CONNECT
+                socket.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+                let mut connected = Some(connected);
+                let mut subscriptions = 0;
+                let earlier = loop {
+                    let (header, body) = read_packet(&mut socket).await;
+                    match header >> 4 {
+                        8 => {
+                            socket
+                                .write_all(&[0x90, 3, body[0], body[1], 0])
+                                .await
+                                .unwrap();
+                            subscriptions += 1;
+                            if subscriptions == 2 {
+                                connected.take().unwrap().send(()).unwrap();
+                            }
+                        }
+                        3 => break publish_id(&body),
+                        kind => panic!("unexpected packet {kind}"),
+                    }
+                };
+                published.send(()).unwrap();
+                let (header, body) = read_packet(&mut socket).await;
+                assert_eq!(header, 0x33); // QoS1 retained clear
+                let clear = publish_id(&body);
+                assert_ne!(earlier, clear);
+                socket
+                    .write_all(&[0x40, 2, earlier[0], earlier[1]])
+                    .await
+                    .unwrap();
+                // The earlier ACK must not cause DISCONNECT. read_u8 is cancel-safe.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), socket.read_u8())
+                        .await
+                        .is_err()
+                );
+                socket
+                    .write_all(&[0x40, 2, clear[0], clear[1]])
+                    .await
+                    .unwrap();
+                assert_eq!(read_packet(&mut socket).await.0, 0xe0); // DISCONNECT
+            });
+            let mqtt = ctx
+                .clone()
+                .spawn_mqtt_task(&ctx.cli, mqtt_rx)
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            ctx.try_send_mqtt(Some(MqttMessage {
+                topic: "earlier".into(),
+                payload: "value".into(),
+                retain: true,
+            }))
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), received)
+                .await
+                .unwrap()
+                .unwrap();
+            ctx.shutdown_mqtt().await;
+            tokio::time::timeout(Duration::from_secs(2), broker)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), mqtt)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn broker_options_reject_bad_ports_and_support_ipv6() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+            for address in [
+                "localhost:bad",
+                "localhost:65536",
+                "mqtt://localhost:bad",
+                "http://localhost",
+            ] {
+                assert!(
+                    ctx.create_mqtt_options(address, "test", &ctx.cli, false)
+                        .is_err(),
+                    "accepted {address}"
+                );
+            }
+            let options = ctx
+                .create_mqtt_options("[::1]:1884", "test", &ctx.cli, false)
+                .unwrap();
+            assert_eq!(options.broker_address(), ("::1".to_owned(), 1884));
+        }
+
+        #[tokio::test]
+        async fn closed_mqtt_channel_is_counted_as_a_dropped_message() {
+            let (ctx, _tmp, mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+            drop(mqtt_rx);
+            ctx.try_send_mqtt(Some(MqttMessage {
+                topic: "test".into(),
+                payload: "value".into(),
+                retain: false,
+            }))
+            .await;
+            assert_eq!(ctx.mqtt_drop_count.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn cancelling_auxiliary_tasks_releases_their_owned_resources() {
+            let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
+            let (owned, observed) = tokio::sync::oneshot::channel::<()>();
+            ctx.spawn_task(async move {
+                let _owned = owned;
+                std::future::pending::<()>().await;
+            });
+            ctx.cancel_tasks();
+            tokio::time::timeout(Duration::from_secs(1), ctx.tasks.wait())
+                .await
+                .unwrap();
+            assert!(observed.await.is_err());
+        }
 
         /// Constructs a BridgeContext writing state to a fresh tempdir, with the
         /// MQTT channel wired (so `publish_*` actually sends) but no real broker.
@@ -3431,14 +3647,22 @@ mod tests {
         async fn add_device_rebuilds_connection_when_key_changes() {
             let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
 
-            ctx.add_device(direct_device("dev-1", "aaaaaaaaaaaaaaaa", None))
-                .await
-                .unwrap();
+            ctx.add_device(direct_device(
+                "dev-1",
+                "aaaaaaaaaaaaaaaa",
+                Some("127.0.0.1"),
+            ))
+            .await
+            .unwrap();
             let _ = refresh_rx.try_recv();
 
-            ctx.add_device(direct_device("dev-1", "bbbbbbbbbbbbbbbb", None))
-                .await
-                .unwrap();
+            ctx.add_device(direct_device(
+                "dev-1",
+                "bbbbbbbbbbbbbbbb",
+                Some("127.0.0.1"),
+            ))
+            .await
+            .unwrap();
             expect_up(
                 &mut refresh_rx,
                 "dev-1",
@@ -3469,9 +3693,13 @@ mod tests {
         async fn add_device_drops_connection_when_shape_changes_direct_to_sub() {
             let (ctx, _tmp, _mqtt_rx, _save_rx, mut refresh_rx) = make_ctx(|_| {}).await;
 
-            ctx.add_device(direct_device("dev-1", "0123456789abcdef", None))
-                .await
-                .unwrap();
+            ctx.add_device(direct_device(
+                "dev-1",
+                "0123456789abcdef",
+                Some("127.0.0.1"),
+            ))
+            .await
+            .unwrap();
             let _ = refresh_rx.try_recv();
 
             // Re-add as sub-device — direct instance must drop, listener must refresh.
@@ -3644,7 +3872,7 @@ mod tests {
             DeviceConfig {
                 id: id.into(),
                 name: Some(name.into()),
-                ip: None,
+                ip: Some("127.0.0.1".into()),
                 key: Some("0123456789abcdef".into()),
                 version: None,
                 cid: None,

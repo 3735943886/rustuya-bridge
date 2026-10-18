@@ -1,11 +1,15 @@
 use crate::bridge::{BridgeContext, WarmState};
 use crate::config::Cli;
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+const BACKGROUND_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const MQTT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
 
 pub struct BridgeServer {
     /// The **pristine** CLI/env layer, kept for the lifetime of the server.
@@ -37,9 +41,9 @@ pub struct BridgeServer {
     cycle: CancellationToken,
     ctx: Option<Arc<BridgeContext>>,
     /// Handles for `state_saver` and `device_listener` - aborted on close
-    background_handles: Vec<tokio::task::JoinHandle<()>>,
+    background_handles: Vec<AbortOnDropHandle<()>>,
     /// MQTT task handle - waited on close to ensure clean disconnect
-    mqtt_handle: Option<tokio::task::JoinHandle<()>>,
+    mqtt_handle: Option<AbortOnDropHandle<()>>,
 }
 
 impl BridgeServer {
@@ -146,19 +150,27 @@ impl BridgeServer {
         }
 
         // Start background services
-        let h1 = ctx.clone().spawn_state_saver(save_rx, ctx.cancel.clone());
-        let h2 = ctx
-            .clone()
-            .spawn_device_listener(refresh_rx, ctx.cancel.clone());
-        let h3 = ctx.clone().spawn_mqtt_task(&self.cli, mqtt_tx_rx)?;
-
-        // Publish current running config
-        ctx.publish_bridge_config(Some(&self.cli), false).await;
+        let h1 = AbortOnDropHandle::new(ctx.clone().spawn_state_saver(save_rx, ctx.cancel.clone()));
+        let h2 = AbortOnDropHandle::new(
+            ctx.clone()
+                .spawn_device_listener(refresh_rx, ctx.cancel.clone()),
+        );
+        let h3 = match ctx.clone().spawn_mqtt_task(&self.cli, mqtt_tx_rx) {
+            Ok(handle) => handle.map(AbortOnDropHandle::new),
+            Err(err) => {
+                ctx.cancel.cancel();
+                h1.abort();
+                h2.abort();
+                let _ = tokio::join!(h1, h2);
+                return Err(err);
+            }
+        };
 
         self.ctx = Some(ctx.clone());
         self.background_handles.push(h1);
         self.background_handles.push(h2);
         self.mqtt_handle = h3;
+        ctx.publish_bridge_config(Some(&self.cli), false).await;
         Ok(ctx)
     }
 
@@ -169,6 +181,13 @@ impl BridgeServer {
     /// Returns an error if [`Self::setup`] has not been called, or if shutdown fails.
     pub async fn run(&mut self) -> Result<()> {
         loop {
+            let _cancel_on_drop = self.ctx.as_ref().map(|ctx| ctx.shutdown_guard());
+            let _abort_on_drop: Vec<_> = self
+                .background_handles
+                .iter()
+                .chain(self.mqtt_handle.iter())
+                .map(|handle| tokio_util::task::AbortOnDrop::new(handle.abort_handle()))
+                .collect();
             self.await_cycle_end().await?;
             if !self.finish_cycle().await? {
                 return Ok(());
@@ -302,21 +321,32 @@ impl BridgeServer {
         // Wait for state_saver and device_listener to exit gracefully due to cancellation.
         // A task that doesn't observe the cancel within 2 seconds is aborted so a
         // restart can't stall behind it.
-        for mut handle in self.background_handles.drain(..) {
-            if tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-            }
+        for handle in self.background_handles.drain(..) {
+            join_task(handle, BACKGROUND_SHUTDOWN_TIMEOUT, "background").await;
         }
-
-        // Wait for MQTT task to fully flush and disconnect cleanly (up to 7s).
-        // The MQTT task has its own internal 5s PubAck timeout. On a restart this
-        // matters twice over: the next cycle reconnects with the same client id,
-        // so the old session must be gone before the new one dials.
         if let Some(handle) = self.mqtt_handle.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(7), handle).await;
+            join_task(handle, MQTT_SHUTDOWN_TIMEOUT, "MQTT").await;
+        }
+    }
+}
+
+async fn join_task(mut handle: AbortOnDropHandle<()>, deadline: std::time::Duration, name: &str) {
+    match tokio::time::timeout(deadline, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("{name} task failed: {err}"),
+        Err(_) => {
+            warn!("{name} shutdown timed out; aborting task");
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for BridgeServer {
+    fn drop(&mut self) {
+        self.cycle.cancel();
+        if let Some(ctx) = &self.ctx {
+            ctx.cancel_tasks();
         }
     }
 }
@@ -326,6 +356,78 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn timed_out_task_is_aborted_and_dropped_before_join_returns() {
+        let (dropped, mut observed) = tokio::sync::oneshot::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _owned = dropped;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        join_task(
+            AbortOnDropHandle::new(task),
+            Duration::from_millis(1),
+            "test",
+        )
+        .await;
+        assert!(matches!(
+            observed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_join_also_aborts_the_owned_task() {
+        let (owned, observed) = tokio::sync::oneshot::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _owned = owned;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        }));
+        ready.await.unwrap();
+        let joining = tokio::spawn(join_task(task, Duration::from_secs(60), "test"));
+        joining.abort();
+        let _ = joining.await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), observed)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_server_releases_context_owned_by_background_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let mut server = BridgeServer::new(standalone_cli(&tmp));
+        let ctx = server.setup().await.unwrap();
+        let weak = Arc::downgrade(&ctx);
+        drop(ctx);
+        drop(server);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background tasks retained the dropped server's context");
+    }
+
+    #[tokio::test]
+    async fn dropping_run_future_cancels_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let mut server = BridgeServer::new(standalone_cli(&tmp));
+        let ctx = server.setup().await.unwrap();
+        let mut running = Box::pin(server.run());
+        assert!(futures_util::poll!(&mut running).is_pending());
+        drop(running);
+        assert!(ctx.cancel.is_cancelled());
+        server.close().await.unwrap();
+    }
 
     /// Standalone (no-broker) config writing state into `tmp`, in embedded
     /// mode (`no_signals`) so shutdown is driven purely by the cancel token —

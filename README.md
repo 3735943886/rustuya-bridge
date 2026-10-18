@@ -118,14 +118,20 @@ elsewhere:
 ```bash
 git clone https://github.com/3735943886/rustuya-bridge
 cd rustuya-bridge
+cargo update
 
 # One-shot run (development)
 cargo run --release -- --mqtt-broker mqtt://localhost:1883
 
 # Build only — binary at ./target/release/rustuya-bridge
+cargo update
 cargo build --release
 ./target/release/rustuya-bridge --mqtt-broker mqtt://localhost:1883
 ```
+
+`Cargo.lock` is intentionally ignored. `cargo update` resolves the newest versions
+allowed by the manifests before each build (including rustuya >=0.4.4, <0.5).
+Cargo generates a local lock file while building; do not commit it.
 
 ### Docker
 Run with **host network mode** to ensure Tuya device discovery works correctly:

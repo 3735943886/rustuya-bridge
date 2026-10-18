@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-10-18
+
+### Changed
+- Raise the minimum `rustuya` version to `0.4.4`. Refresh compatible dependencies
+  before CI and Docker builds; keep generated `Cargo.lock` files out of source control.
+- Process MQTT commands through a bounded queue with at most 100 concurrent
+  requests, and manage request, scan and retained-cleanup work within each bridge cycle.
+- Resolve addressless devices through LAN discovery instead of dialling a
+  placeholder IP. Registration waits up to `scan_window_secs` and reports a
+  discovery timeout; startup resolves devices concurrently.
+- Remove the periodic device-listener idle log timer.
+
+### Fixed
+- Abort and await tasks that exceed shutdown deadlines. Abort-on-drop handles
+  and cancellation guards also clean up tasks when the server or a running
+  future is dropped, including cancellation while joining shutdown tasks.
+- Drain accepted MQTT messages and wait for all outstanding QoS1 acknowledgements,
+  including the retained configuration clear, before disconnecting.
+- Reject malformed broker ports and unsupported URL schemes rather than falling
+  back to port 1883; support bracketed IPv6 broker addresses.
+- Report final state-save failures and closed MQTT channels. Serialize state
+  saves and use RAII temporary files to clean up failed or cancelled writes.
+
+### Validation
+- 151 Rust tests and workspace Clippy checks pass.
+- Python broker-backed tests cover shutdown, discovery, in-place reconfiguration,
+  retained cleanup, and onboarding plus clearing a 1,000-device fleet.
+
 ## [0.4.1] — 2026-10-06
 
 ### Changed

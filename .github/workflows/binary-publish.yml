@@ -81,6 +81,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Resolve latest compatible dependencies
+        run: cargo update
+
       - name: Build and upload archive
         uses: taiki-e/upload-rust-binary-action@v1
         with:
