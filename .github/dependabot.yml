@@ -14,3 +14,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # pyo3-log (0.13.x) caps pyo3 <0.30, and pyo3-ffi's `links = "python"`
+      # forbids two pyo3 versions in one graph. Drop this once pyo3-log
+      # supports 0.30, then bump all three together.
+      - dependency-name: "pyo3"
+        versions: [">=0.30"]
+      - dependency-name: "pyo3-async-runtimes"
+        versions: [">=0.30"]
