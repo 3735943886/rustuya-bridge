@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::StreamMap;
@@ -17,7 +17,7 @@ use crate::devices::{Fleet, code, connection_event};
 use crate::dps_cache::DpsCache;
 use crate::error::BridgeError;
 use crate::outbound::{DeltaKind, Outbound};
-use crate::transport::mqtt::{MqttLayout, MqttMessage};
+use crate::transport::mqtt::{MqttMessage, MqttTransport};
 use crate::types::{ApiResponse, BridgeRequest};
 use std::collections::BTreeSet;
 use std::sync::Mutex as StdMutex;
@@ -103,11 +103,9 @@ pub struct BridgeState {
 pub struct BridgeContext {
     tasks: tokio_util::task::TaskTracker,
     task_cancel: tokio_util::sync::CancellationToken,
-    pub(crate) mqtt_shutdown: tokio_util::sync::CancellationToken,
     save_lock: tokio::sync::Mutex<()>,
     pub cli: Cli,
-    pub mqtt_tx: Option<mpsc::Sender<Option<MqttMessage>>>,
-    pub mqtt: MqttLayout,
+    pub mqtt: MqttTransport,
     pub state_file: String,
     pub save_debounce_secs: u64,
     pub state: RwLock<BridgeState>,
@@ -121,19 +119,7 @@ pub struct BridgeContext {
     /// Shared device machinery: the LAN discovery every device re-locates
     /// through, and the connect-storm cap.
     pub fleet: Fleet,
-    pub scavenger_tx:
-        Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<crate::types::ScavengerTarget>>>>>,
-    /// Count of MQTT messages dropped because the outbound channel stayed
-    /// full past `try_send_mqtt`'s timeout. Exposed in `status` responses.
-    pub mqtt_drop_count: AtomicU64,
     pub cancel: tokio_util::sync::CancellationToken,
-
-    /// When set, the outbound publish loop forces `retain=false` on every
-    /// message regardless of its `MqttMessage::retain` flag. Latched on by the
-    /// `reconfigure` action so device events arriving during/after the
-    /// old-scheme retained purge can't recreate orphaned retained snapshots.
-    /// Never cleared — the process exits shortly after it's set.
-    pub retain_suppressed: AtomicBool,
 
     /// Set by `reconfigure` immediately before it trips [`Self::cancel`], so the
     /// server can tell "this context asked to be rebuilt" from "the process is
@@ -325,7 +311,7 @@ impl BridgeContext {
         (
             self.cancel.clone().drop_guard(),
             self.task_cancel.clone().drop_guard(),
-            self.mqtt_shutdown.clone().drop_guard(),
+            self.mqtt.shutdown.clone().drop_guard(),
         )
     }
 
@@ -416,7 +402,7 @@ impl BridgeContext {
         let (save_tx, save_rx) = mpsc::channel(1);
         let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
 
-        let mqtt = MqttLayout::from_cli(cli);
+        let mqtt = MqttTransport::from_cli(cli, mqtt_tx_sender);
         let cache = mqtt.retain.then(|| Arc::new(DpsCache::new()));
 
         // If we can't seed (pass-through mode or unsupported template), pre-flip seed_done so
@@ -426,10 +412,8 @@ impl BridgeContext {
         let ctx = Arc::new(Self {
             tasks: tokio_util::task::TaskTracker::new(),
             task_cancel: tokio_util::sync::CancellationToken::new(),
-            mqtt_shutdown: tokio_util::sync::CancellationToken::new(),
             save_lock: tokio::sync::Mutex::new(()),
             cli: cli.clone(),
-            mqtt_tx: cli.mqtt_broker.is_some().then_some(mqtt_tx_sender),
             mqtt,
             state_file: cli.state_file().to_string(),
             save_debounce_secs: cli.save_debounce_secs(),
@@ -442,10 +426,7 @@ impl BridgeContext {
             save_tx,
             refresh_tx,
             fleet,
-            scavenger_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            mqtt_drop_count: AtomicU64::new(0),
             cancel,
-            retain_suppressed: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
             pinned_settings: pinned_by_outer_layer(base),
             cache,
@@ -845,16 +826,16 @@ impl BridgeContext {
     }
 
     pub async fn shutdown_mqtt(&self) {
-        self.mqtt_shutdown.cancel();
-        if let Some(tx) = &self.mqtt_tx {
+        self.mqtt.shutdown.cancel();
+        if let Some(tx) = &self.mqtt.tx {
             let _ = tx.try_send(None);
         }
     }
 
     /// Signals MQTT to shutdown (synchronous version for Drop)
     pub fn signal_shutdown_mqtt(&self) {
-        self.mqtt_shutdown.cancel();
-        if let Some(tx) = &self.mqtt_tx {
+        self.mqtt.shutdown.cancel();
+        if let Some(tx) = &self.mqtt.tx {
             let _ = tx.try_send(None);
         }
     }
@@ -1021,7 +1002,7 @@ impl BridgeContext {
 
         debug!("Device Event: [{id}] {dps}");
 
-        if self.mqtt_tx.is_none() || !exists {
+        if self.mqtt.tx.is_none() || !exists {
             return;
         }
 
@@ -1608,7 +1589,7 @@ impl BridgeContext {
             // retained snapshots. Live (non-retained) delivery continues. Never
             // cleared, and it doesn't need to be: the restart builds a fresh
             // context whose own latch starts off.
-            self.retain_suppressed.store(true, Ordering::Relaxed);
+            self.mqtt.retain_suppressed.store(true, Ordering::Relaxed);
             if !self.mqtt.retain {
                 warn!(
                     "reconfigure: mqtt_retain is off — clearing any stale retained from a prior \
@@ -1699,7 +1680,7 @@ impl BridgeContext {
         drop(state);
 
         let returned = devices.len();
-        let mqtt_drop_count = self.mqtt_drop_count.load(Ordering::Relaxed);
+        let mqtt_drop_count = self.mqtt.drop_count.load(Ordering::Relaxed);
         ApiResponse::ok_action("status")
             .with_extra("devices", Value::Object(devices))
             .with_extra("device_count", Value::from(total))
@@ -2092,7 +2073,7 @@ mod tests {
                 retain: false,
             }))
             .await;
-            assert_eq!(ctx.mqtt_drop_count.load(Ordering::Relaxed), 1);
+            assert_eq!(ctx.mqtt.drop_count.load(Ordering::Relaxed), 1);
         }
 
         #[tokio::test]
@@ -2724,7 +2705,7 @@ mod tests {
         async fn status_response_includes_mqtt_drop_count() {
             let (ctx, _tmp, _mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|_| {}).await;
             // Simulate a drop having happened.
-            ctx.mqtt_drop_count.store(3, Ordering::Relaxed);
+            ctx.mqtt.drop_count.store(3, Ordering::Relaxed);
 
             let res = ctx.get_bridge_status(None, None).await;
             let v = serde_json::to_value(&res).unwrap();

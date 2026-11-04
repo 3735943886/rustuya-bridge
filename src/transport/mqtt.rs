@@ -8,7 +8,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -164,8 +164,23 @@ impl IdentifierSet {
     }
 }
 
-/// How the bridge's output is laid out on the broker, from the configuration.
-pub struct MqttLayout {
+/// The bridge's MQTT side: how its output is laid out on the broker, from the
+/// configuration, and the state of the connection that carries it.
+pub struct MqttTransport {
+    /// To the connection loop; `None` without a broker.
+    pub tx: Option<mpsc::Sender<Option<MqttMessage>>>,
+    pub(crate) shutdown: tokio_util::sync::CancellationToken,
+    pub scavenger_tx:
+        Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<Vec<crate::types::ScavengerTarget>>>>>,
+    /// Count of MQTT messages dropped because the outbound channel stayed
+    /// full past `try_send_mqtt`'s timeout. Exposed in `status` responses.
+    pub drop_count: AtomicU64,
+    /// When set, the outbound publish loop forces `retain=false` on every
+    /// message regardless of its `MqttMessage::retain` flag. Latched on by the
+    /// `reconfigure` action so device events arriving during/after the
+    /// old-scheme retained purge can't recreate orphaned retained snapshots.
+    /// Never cleared — the process exits shortly after it's set.
+    pub retain_suppressed: AtomicBool,
     pub root_topic: String,
     pub event_topic: String,
     pub retain: bool,
@@ -179,8 +194,8 @@ pub struct MqttLayout {
     pub seed_state_regex: Option<Regex>,
 }
 
-impl MqttLayout {
-    pub(crate) fn from_cli(cli: &Cli) -> Self {
+impl MqttTransport {
+    pub(crate) fn from_cli(cli: &Cli, tx: mpsc::Sender<Option<MqttMessage>>) -> Self {
         let (_, mqtt_event_topic) = cli.mqtt_topics();
         let payload_tpl = cli
             .mqtt_payload_template
@@ -260,6 +275,11 @@ impl MqttLayout {
         };
 
         Self {
+            tx: cli.mqtt_broker.is_some().then_some(tx),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            scavenger_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            drop_count: AtomicU64::new(0),
+            retain_suppressed: AtomicBool::new(false),
             root_topic: root_topic_str,
             event_topic: mqtt_event_topic,
             retain: effective_retain,
@@ -340,7 +360,7 @@ impl BridgeContext {
     /// Sends an event to the broker. Rendering happens here on the sender's task,
     /// so the loop only moves finished messages.
     pub(crate) async fn send_over_mqtt(&self, event: &Outbound) {
-        if self.mqtt_tx.is_none() {
+        if self.mqtt.tx.is_none() {
             return;
         }
         for msg in self.render(event) {
@@ -723,11 +743,11 @@ impl BridgeContext {
     }
 
     pub(crate) async fn try_send_mqtt(&self, msg: Option<MqttMessage>) {
-        if let Some(tx) = &self.mqtt_tx {
+        if let Some(tx) = &self.mqtt.tx {
             match tokio::time::timeout(MQTT_SEND_TIMEOUT, tx.send(msg)).await {
                 Ok(Ok(())) => {}
                 result => {
-                    let n = self.mqtt_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    let n = self.mqtt.drop_count.fetch_add(1, Ordering::Relaxed) + 1;
                     // Under overload this runs for every message; logging each one
                     // would add to the load, and through Python would wait on the GIL.
                     if n == 1 || n.is_multiple_of(DROP_LOG_INTERVAL) {
@@ -930,7 +950,7 @@ impl BridgeContext {
                     msg_opt = async {
                         tokio::select! {
                             biased;
-                            () = self.mqtt_shutdown.cancelled() => None,
+                            () = self.mqtt.shutdown.cancelled() => None,
                             msg = mqtt_tx_receiver.recv(), if pending.is_none() => msg,
                         }
                     } => {
@@ -973,7 +993,7 @@ impl BridgeContext {
         };
         (
             qos,
-            msg.retain && !self.retain_suppressed.load(Ordering::Relaxed),
+            msg.retain && !self.mqtt.retain_suppressed.load(Ordering::Relaxed),
         )
     }
 
@@ -1333,7 +1353,7 @@ impl BridgeContext {
         }
 
         let mut rx = {
-            let mut lock = self.scavenger_tx.lock().await;
+            let mut lock = self.mqtt.scavenger_tx.lock().await;
             if let Some(tx) = &*lock
                 && tx.send(targets.clone()).is_ok()
             {
@@ -1391,7 +1411,7 @@ impl BridgeContext {
         // Shared with the sender side (the coalesce-or-spawn block above) so the
         // task can atomically retire the coalescing channel when it stops — see
         // the exit handling at the bottom of the loop.
-        let scav_tx = Arc::clone(&self.scavenger_tx);
+        let scav_tx = Arc::clone(&self.mqtt.scavenger_tx);
 
         self.spawn_task(async move {
             let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 64);
