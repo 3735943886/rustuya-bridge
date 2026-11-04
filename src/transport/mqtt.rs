@@ -3,8 +3,8 @@
 //! talks to `rumqttc` lives here.
 
 use anyhow::Result;
-use futures_util::StreamExt;
 use log::{debug, error, info, warn};
+use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -13,10 +13,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::bridge::{BridgeContext, MQTT_CHANNEL_CAPACITY, MqttMessage, TopicVars, unix_millis};
+use crate::bridge::{BridgeContext, MqttMessage, TopicVars, unix_millis};
 use crate::config::Cli;
 use crate::template::{compile_topic_regex, match_topic, tpl_to_wildcard};
-use crate::types::{ApiResponse, BridgeRequest};
+use crate::types::BridgeRequest;
 
 /// Client-side MQTT packet size cap (incoming and outgoing). rumqttc defaults
 /// *both* to a tiny 10 KiB, which silently refuses any larger publish — a big
@@ -28,8 +28,6 @@ pub const MAX_MQTT_PACKET_SIZE: usize = 1024 * 1024;
 pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
 const MQTT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
-// Bound concurrent commands independently of the per-command target fan-out.
-const MAX_CONCURRENT_REQUESTS: usize = 100;
 
 /// Decides whether a retained message belongs to a device being removed, from
 /// the variables its topic yielded (`None` if it matched no template) and its
@@ -67,6 +65,69 @@ fn retained_belongs_to_targets(
     })
 }
 
+/// The seed phase (cache mode only). After the first `ConnAck` the bridge subscribes
+/// to its own retained state topic to recover prior-session snapshots, then
+/// unsubscribes and calls `on_seed_complete()` once either the broker quiets
+/// (`SEED_QUIET` since the last retained message) or `SEED_HARD_CAP` fires.
+struct SeedWindow {
+    deadline: Instant,
+    last_retained: Option<Instant>,
+}
+
+impl SeedWindow {
+    const SEED_HARD_CAP: Duration = Duration::from_secs(5);
+    const SEED_QUIET: Duration = Duration::from_millis(200);
+
+    fn opening_now() -> Self {
+        Self {
+            deadline: Instant::now() + Self::SEED_HARD_CAP,
+            last_retained: None,
+        }
+    }
+
+    fn wakeup(&self) -> Instant {
+        self.last_retained.map_or(self.deadline, |last| {
+            (last + Self::SEED_QUIET).min(self.deadline)
+        })
+    }
+}
+
+/// Waits for `deadline`, or forever if there is none: an arm of `select!` that is
+/// only live while its timer is set.
+async fn sleep_until_set(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => futures_util::future::pending().await,
+    }
+}
+
+/// The session on a config-topic payload, if it belongs to another instance.
+fn foreign_session(payload: &str, own: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    let session = value.get("session_id")?.as_str()?;
+    (Some(session) != own).then(|| session.to_owned())
+}
+
+/// The requests in a message on the command topic. A malformed request, on its own
+/// or as an element of an array, is dropped.
+fn parse_commands(
+    topic: &str,
+    payload: &str,
+    template: &str,
+    template_re: Option<&Regex>,
+) -> Vec<BridgeRequest> {
+    let vars = match_topic(topic, template, template_re).unwrap_or_default();
+    match crate::payload::parse_mqtt_payload(payload, &vars) {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        other => serde_json::from_value(other)
+            .map(|req| vec![req])
+            .unwrap_or_default(),
+    }
+}
+
 impl BridgeContext {
     /// Starts MQTT task for command processing and event publishing.
     ///
@@ -94,46 +155,19 @@ impl BridgeContext {
         let config_topic =
             crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
 
-        // ── Seed phase (cache mode only) ──────────────────────────────────────────
-        // After the first ConnAck the bridge subscribes to its own retained
-        // state topic to recover prior-session snapshots, then unsubscribes
-        // and calls `on_seed_complete()` once either the broker quiets (200ms
-        // since last retained) or the 5s hard cap fires.
-        const SEED_HARD_CAP: Duration = Duration::from_secs(5);
-        const SEED_QUIET: Duration = Duration::from_millis(200);
         let seed_wildcard = self.seed_state_wildcard.clone();
 
         // How long after a reconnect to watch for another instance's sentinel
         // before restoring ours. Same window `check_existing_instance` observes.
         const SENTINEL_RESTORE_DELAY: Duration = Duration::from_millis(500);
 
-        // Buffer bursts using the same bounded budget as the outbound channel.
-        // One tracked driver owns all request futures; no detached task per command.
-        let (request_tx, request_rx) = mpsc::channel(MQTT_CHANNEL_CAPACITY);
-        let requests_ctx = self.clone();
-        let stop_requests = self.cancel.clone();
-        self.spawn_task(async move {
-            tokio_stream::wrappers::ReceiverStream::new(request_rx)
-                .take_until(stop_requests.cancelled_owned())
-                .for_each_concurrent(MAX_CONCURRENT_REQUESTS, |req| {
-                    let ctx = requests_ctx.clone();
-                    async move {
-                        let responses = crate::handlers::handle_request(ctx.clone(), req).await;
-                        for response in responses {
-                            ctx.publish_api_response(response).await;
-                        }
-                    }
-                })
-                .await;
-        });
+        let request_tx = self.spawn_request_driver();
 
         let handle = tokio::spawn(async move {
             let mut outstanding_publishes = 0usize;
             let mut retry_delay = INITIAL_RETRY_DELAY_SECS;
             let mut next_retry: Option<Instant> = None;
-            let mut seed_active = false;
-            let mut seed_deadline: Option<Instant> = None;
-            let mut seed_last_msg: Option<Instant> = None;
+            let mut seed: Option<SeedWindow> = None;
             // An unclean disconnect fires the will, which clears the sentinel, and
             // nothing else restores it until the next registry change. Until then a
             // second instance finds the root unclaimed, starts, and takes over. The
@@ -163,12 +197,7 @@ impl BridgeContext {
                 // would stall the loop; a dropped live delta self-heals via the next
                 // push or the retained snapshot).
                 let flushed = if let Some(msg) = &pending {
-                    let retain = msg.retain && !self.retain_suppressed.load(Ordering::Relaxed);
-                    let qos = if msg.retain {
-                        rumqttc::QoS::AtLeastOnce
-                    } else {
-                        rumqttc::QoS::AtMostOnce
-                    };
+                    let (qos, retain) = self.publish_params(msg);
                     client
                         .try_publish(msg.topic.clone(), qos, retain, msg.payload.clone())
                         .is_ok()
@@ -187,42 +216,17 @@ impl BridgeContext {
                     pending = None;
                 }
                 tokio::select! {
-                    () = async {
-                        if let Some(deadline) = next_retry {
-                            tokio::time::sleep_until(deadline).await;
-                        } else {
-                            futures_util::future::pending::<()>().await;
-                        }
-                    } => {
+                    () = sleep_until_set(next_retry) => {
                         next_retry = None;
                     }
-                    () = async {
-                        let wakeup = match (seed_last_msg, seed_deadline) {
-                            (Some(t), Some(d)) => Some((t + SEED_QUIET).min(d)),
-                            (None, Some(d)) => Some(d),
-                            _ => None,
-                        };
-                        if let Some(w) = wakeup {
-                            tokio::time::sleep_until(w).await;
-                        } else {
-                            futures_util::future::pending::<()>().await;
-                        }
-                    }, if seed_active => {
-                        seed_active = false;
-                        seed_deadline = None;
-                        seed_last_msg = None;
+                    () = sleep_until_set(seed.as_ref().map(SeedWindow::wakeup)) => {
+                        seed = None;
                         if let Some(w) = &seed_wildcard {
                             let _ = client.unsubscribe(w).await;
                         }
                         self.on_seed_complete().await;
                     }
-                    () = async {
-                        if let Some(deadline) = sentinel_restore_at {
-                            tokio::time::sleep_until(deadline).await;
-                        } else {
-                            futures_util::future::pending::<()>().await;
-                        }
-                    } => {
+                    () = sleep_until_set(sentinel_restore_at) => {
                         sentinel_restore_at = None;
                         if let Some(sentinel) = &last_sentinel {
                             if client
@@ -255,13 +259,12 @@ impl BridgeContext {
                                 // First-connect seed bootstrap (cache mode only).
                                 if let Some(w) = &seed_wildcard
                                     && !self.seed_done.load(Ordering::Acquire)
-                                    && !seed_active
+                                    && seed.is_none()
                                 {
                                     match client.subscribe(w, rumqttc::QoS::AtLeastOnce).await {
                                         Ok(()) => {
                                             info!("Seeding cache from broker via '{w}'");
-                                            seed_active = true;
-                                            seed_deadline = Some(Instant::now() + SEED_HARD_CAP);
+                                            seed = Some(SeedWindow::opening_now());
                                         }
                                         Err(e) => {
                                             error!("Seed subscribe failed: {e}; skipping seed");
@@ -279,25 +282,17 @@ impl BridgeContext {
                                 // without firing the publish path. The retain check
                                 // protects us from picking up live (non-retained)
                                 // events that incidentally match the wildcard.
-                                if seed_active && p.retain
-                                    && let Some((id, dp_opt)) = self.match_seed_topic(&p.topic)
+                                if let Some(window) = &mut seed && p.retain
+                                    && let Some((id, dp)) = self.match_seed_topic(&p.topic)
                                 {
-                                    if let Some(dps) = crate::payload::parse_seed_dps(
-                                        &payload,
-                                        dp_opt.as_deref(),
-                                        self.mqtt_payload_template.as_deref(),
-                                    ) && let Some(cache) = &self.cache
-                                    {
-                                        cache.fill_missing(&id, &dps);
-                                        seed_last_msg = Some(Instant::now());
+                                    if self.seed_cache(&id, dp.as_deref(), &payload) {
+                                        window.last_retained = Some(Instant::now());
                                     }
                                     continue;
                                 }
 
                                 if p.topic == config_topic {
-                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload)
-                                        && let Some(sid) = val.get("session_id").and_then(Value::as_str)
-                                        && Some(sid) != self.cli.session_id.as_deref() {
+                                    if let Some(sid) = foreign_session(&payload, self.cli.session_id.as_deref()) {
                                         error!("Another bridge instance took over (session_id: {sid}). Shutting down.");
                                         self.cancel.cancel();
                                         return;
@@ -305,25 +300,9 @@ impl BridgeContext {
                                     continue;
                                 }
 
-                                let vars = match_topic(&p.topic, &mqtt_command_topic, command_topic_re.as_ref()).unwrap_or_default();
-                                let req_val = crate::payload::parse_mqtt_payload(&payload, &vars);
-
-                                let requests = match req_val {
-                                    Value::Array(arr) => arr
-                                        .into_iter()
-                                        .filter_map(|v| serde_json::from_value::<BridgeRequest>(v).ok())
-                                        .collect::<Vec<_>>(),
-                                    other => serde_json::from_value::<BridgeRequest>(other)
-                                        .map(|req| vec![req])
-                                        .unwrap_or_default(),
-                                };
-
+                                let requests = parse_commands(&p.topic, &payload, &mqtt_command_topic, command_topic_re.as_ref());
                                 for req in requests {
-                                    let action = req.action_name().to_owned();
-                                    if let Err(err) = request_tx.try_send(req) {
-                                        warn!("MQTT request queue unavailable: {err}");
-                                        self.publish_api_response(ApiResponse::error("Bridge is busy; retry the request").with_action(action)).await;
-                                    }
+                                    self.submit_request(&request_tx, req).await;
                                 }
                             }
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_))) => {
@@ -355,62 +334,15 @@ impl BridgeContext {
                             // arm that frees it.
                             pending = Some(msg);
                         } else {
-                                debug!("MQTT shutdown signal received, clearing and disconnecting...");
-
-                                // Queue the clear while polling, then wait for *all* queued
-                                // QoS1 publishes, including the clear, to be acknowledged.
-                                // A prior publish's ACK must never stand in for this clear.
-                                // Stop producers and preserve FIFO for all accepted messages.
-                                // The config clear must be the final retained publish.
-                                mqtt_tx_receiver.close();
-                                let mut outbound = std::collections::VecDeque::new();
-                                if let Some(msg) = pending.take() {
-                                    outbound.push_back(msg);
-                                }
-                                while let Ok(msg) = mqtt_tx_receiver.try_recv() {
-                                    if let Some(msg) = msg { outbound.push_back(msg); }
-                                }
-                                let flush = async {
-                                    let mut clear_queued = false;
-                                    loop {
-                                        while let Some(msg) = outbound.front() {
-                                            let qos = if msg.retain { rumqttc::QoS::AtLeastOnce } else { rumqttc::QoS::AtMostOnce };
-                                            let retain = msg.retain && !self.retain_suppressed.load(Ordering::Relaxed);
-                                            if client.try_publish(&msg.topic, qos, retain, msg.payload.clone()).is_err() { break; }
-                                            if msg.retain { outstanding_publishes += 1; }
-                                            outbound.pop_front();
-                                        }
-                                        if outbound.is_empty() && !clear_queued && client.try_publish(
-                                            &config_topic, rumqttc::QoS::AtLeastOnce, true, ""
-                                        ).is_ok() {
-                                            outstanding_publishes += 1;
-                                            clear_queued = true;
-                                        }
-                                        if clear_queued && outstanding_publishes == 0 {
-                                            return Ok::<(), rumqttc::ConnectionError>(());
-                                        }
-                                        if let rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)) = eventloop.poll().await? {
-                                            outstanding_publishes = outstanding_publishes.saturating_sub(1);
-                                        }
-                                    }
-                                };
-                                match tokio::time::timeout(MQTT_FLUSH_TIMEOUT, flush).await {
-                                    Ok(Ok(())) => debug!("MQTT retained clear acknowledged"),
-                                    result => warn!("MQTT shutdown flush failed: {result:?}"),
-                                }
-
-                                // 4. Disconnect, then drain the eventloop until rumqttc surfaces
-                                // an error (its signal that the connection is fully torn down).
-                                // No inner timeout: bounded externally by the 7s timeout that
-                                // `BridgeServer::close` wraps around this task's JoinHandle, so a
-                                // broker that never closes the socket cannot hang shutdown.
-                                let _ = client.disconnect().await;
-                                loop {
-                                    if eventloop.poll().await.is_err() {
-                                        break;
-                                    }
-                                }
-                                debug!("MQTT eventloop terminated");
+                                self.flush_and_disconnect(
+                                    &client,
+                                    &mut eventloop,
+                                    &mut mqtt_tx_receiver,
+                                    pending.take(),
+                                    &config_topic,
+                                    outstanding_publishes,
+                                )
+                                .await;
                                 return;
                         }
                     }
@@ -419,6 +351,117 @@ impl BridgeContext {
         });
 
         Ok(Some(handle))
+    }
+
+    /// QoS and retain flag for a message, by its kind: retained state is
+    /// acknowledged, live traffic is not. A retained message keeps its QoS while
+    /// `retain_suppressed` drops the flag.
+    fn publish_params(&self, msg: &MqttMessage) -> (rumqttc::QoS, bool) {
+        let qos = if msg.retain {
+            rumqttc::QoS::AtLeastOnce
+        } else {
+            rumqttc::QoS::AtMostOnce
+        };
+        (
+            qos,
+            msg.retain && !self.retain_suppressed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Takes a retained snapshot from the seed phase into the cache, as backfill.
+    /// Returns whether it held any DPS.
+    fn seed_cache(&self, id: &str, dp: Option<&str>, payload: &str) -> bool {
+        let dps =
+            crate::payload::parse_seed_dps(payload, dp, self.mqtt_payload_template.as_deref());
+        match (dps, &self.cache) {
+            (Some(dps), Some(cache)) => {
+                cache.fill_missing(id, &dps);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The end of the connection: publish everything already accepted, then clear
+    /// the sentinel, wait for the broker to acknowledge it all, and disconnect.
+    async fn flush_and_disconnect(
+        &self,
+        client: &rumqttc::AsyncClient,
+        eventloop: &mut rumqttc::EventLoop,
+        receiver: &mut mpsc::Receiver<Option<MqttMessage>>,
+        pending: Option<MqttMessage>,
+        config_topic: &str,
+        mut outstanding_publishes: usize,
+    ) {
+        debug!("MQTT shutdown signal received, clearing and disconnecting...");
+
+        // Queue the clear while polling, then wait for *all* queued
+        // QoS1 publishes, including the clear, to be acknowledged.
+        // A prior publish's ACK must never stand in for this clear.
+        // Stop producers and preserve FIFO for all accepted messages.
+        // The config clear must be the final retained publish.
+        receiver.close();
+        let mut outbound = std::collections::VecDeque::new();
+        if let Some(msg) = pending {
+            outbound.push_back(msg);
+        }
+        while let Ok(msg) = receiver.try_recv() {
+            if let Some(msg) = msg {
+                outbound.push_back(msg);
+            }
+        }
+        let flush = async {
+            let mut clear_queued = false;
+            loop {
+                while let Some(msg) = outbound.front() {
+                    let (qos, retain) = self.publish_params(msg);
+                    if client
+                        .try_publish(&msg.topic, qos, retain, msg.payload.clone())
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if msg.retain {
+                        outstanding_publishes += 1;
+                    }
+                    outbound.pop_front();
+                }
+                if outbound.is_empty()
+                    && !clear_queued
+                    && client
+                        .try_publish(config_topic, rumqttc::QoS::AtLeastOnce, true, "")
+                        .is_ok()
+                {
+                    outstanding_publishes += 1;
+                    clear_queued = true;
+                }
+                if clear_queued && outstanding_publishes == 0 {
+                    return Ok::<(), rumqttc::ConnectionError>(());
+                }
+                if let rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)) =
+                    eventloop.poll().await?
+                {
+                    outstanding_publishes = outstanding_publishes.saturating_sub(1);
+                }
+            }
+        };
+        match tokio::time::timeout(MQTT_FLUSH_TIMEOUT, flush).await {
+            Ok(Ok(())) => debug!("MQTT retained clear acknowledged"),
+            result => warn!("MQTT shutdown flush failed: {result:?}"),
+        }
+
+        // 4. Disconnect, then drain the eventloop until rumqttc surfaces
+        // an error (its signal that the connection is fully torn down).
+        // No inner timeout: bounded externally by the 7s timeout that
+        // `BridgeServer::close` wraps around this task's JoinHandle, so a
+        // broker that never closes the socket cannot hang shutdown.
+        let _ = client.disconnect().await;
+        loop {
+            if eventloop.poll().await.is_err() {
+                break;
+            }
+        }
+        debug!("MQTT eventloop terminated");
     }
 
     /// Renders the topic the liveness probe publishes its `status` ping to,
@@ -993,6 +1036,57 @@ impl BridgeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_session_ignores_our_own_and_anything_without_one() {
+        assert_eq!(
+            foreign_session(r#"{"session_id":"other"}"#, Some("ours")),
+            Some("other".to_string())
+        );
+        for payload in [
+            r#"{"session_id":"ours"}"#,
+            r#"{"session_id":1}"#,
+            "{}",
+            "",
+            "not json",
+        ] {
+            assert_eq!(foreign_session(payload, Some("ours")), None, "{payload}");
+        }
+    }
+
+    #[test]
+    fn parse_commands_keeps_valid_requests_and_merges_topic_vars() {
+        let template = "root/command/{action}/{id}";
+        let re = compile_topic_regex(template);
+        let parse = |topic, payload| parse_commands(topic, payload, template, re.as_ref());
+
+        let from_topic = parse("root/command/status/x", "{}");
+        assert!(matches!(from_topic[..], [BridgeRequest::Status { .. }]));
+
+        let array = parse(
+            "other",
+            r#"[{"action":"status"},{"action":"no-such"},42,{"action":"status"}]"#,
+        );
+        assert_eq!(array.len(), 2);
+
+        for payload in ["not json", "", "42", r#"{"action":"no-such"}"#] {
+            assert!(parse("other", payload).is_empty(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn seed_window_closes_on_quiet_but_never_past_its_cap() {
+        let mut window = SeedWindow::opening_now();
+        let cap = window.deadline;
+        assert_eq!(window.wakeup(), cap);
+
+        let now = Instant::now();
+        window.last_retained = Some(now);
+        assert_eq!(window.wakeup(), now + SeedWindow::SEED_QUIET);
+
+        window.last_retained = Some(cap);
+        assert_eq!(window.wakeup(), cap);
+    }
 
     fn scav_target(
         id: &str,

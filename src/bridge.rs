@@ -18,7 +18,7 @@ use crate::devices::{Fleet, code, connection_event};
 use crate::dps_cache::DpsCache;
 use crate::error::BridgeError;
 use crate::template::{compile_topic_regex, render_template, tpl_to_wildcard};
-use crate::types::ApiResponse;
+use crate::types::{ApiResponse, BridgeRequest};
 use std::collections::BTreeSet;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
@@ -41,6 +41,8 @@ pub const STATUS_DEFAULT_PAGE: usize = 50;
 /// bounds the worst-case response size for capable brokers.
 pub const STATUS_MAX_PAGE: usize = 500;
 const MQTT_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+// Bound concurrent commands independently of the per-command target fan-out.
+const MAX_CONCURRENT_REQUESTS: usize = 100;
 const AUXILIARY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 pub const REQUEST_TIMEOUT_SECS: u64 = 15;
 
@@ -817,6 +819,46 @@ impl BridgeContext {
     /// updates per-device error state, and dispatches to the appropriate
     /// `publish_*` method. Extracted from the listener loop to keep the
     /// `tokio::select!` driver shallow.
+    /// Starts the task that runs requests from a transport. Its queue buffers bursts
+    /// with the same bounded budget as the outbound channel, and one tracked driver
+    /// owns all request futures: no detached task per command.
+    pub(crate) fn spawn_request_driver(self: &Arc<Self>) -> mpsc::Sender<BridgeRequest> {
+        let (request_tx, request_rx) = mpsc::channel(MQTT_CHANNEL_CAPACITY);
+        let requests_ctx = self.clone();
+        let stop_requests = self.cancel.clone();
+        self.spawn_task(async move {
+            tokio_stream::wrappers::ReceiverStream::new(request_rx)
+                .take_until(stop_requests.cancelled_owned())
+                .for_each_concurrent(MAX_CONCURRENT_REQUESTS, |req| {
+                    let ctx = requests_ctx.clone();
+                    async move {
+                        let responses = crate::handlers::handle_request(ctx.clone(), req).await;
+                        for response in responses {
+                            ctx.publish_api_response(response).await;
+                        }
+                    }
+                })
+                .await;
+        });
+        request_tx
+    }
+
+    /// Queues a request for the driver, answering right away if the queue is full.
+    pub(crate) async fn submit_request(
+        &self,
+        request_tx: &mpsc::Sender<BridgeRequest>,
+        req: BridgeRequest,
+    ) {
+        let action = req.action_name().to_owned();
+        if let Err(err) = request_tx.try_send(req) {
+            warn!("Request queue unavailable: {err}");
+            self.publish_api_response(
+                ApiResponse::error("Bridge is busy; retry the request").with_action(action),
+            )
+            .await;
+        }
+    }
+
     async fn handle_device_event(&self, device_id: &str, payload_str: String) {
         trace!("Raw event from {device_id}: {payload_str}");
         let payload: Value = serde_json::from_str(&payload_str)
@@ -2424,7 +2466,6 @@ mod tests {
     mod context_tests {
         use super::*;
         use crate::template::match_topic;
-        use crate::types::BridgeRequest;
         use serde_json::json;
         use tempfile::TempDir;
 
