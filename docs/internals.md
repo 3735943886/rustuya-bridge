@@ -688,7 +688,7 @@ exactly the bug we fixed in §4.1, just at startup instead of mid-run.
 The fix: **subscribe to your own state topic on connect, seed the
 cache from broker-retained snapshots, then start publishing**.
 
-The seed loop in [spawn_mqtt_task](../src/bridge.rs):
+The seed loop in [spawn_mqtt_task](../src/transport/mqtt.rs):
 
 1. On first `ConnAck`, subscribes to the state wildcard (event topic
    with `{type}=state` and other placeholders as `+`).
@@ -739,7 +739,7 @@ of truth at that point.
 ### 4.7 The scavenger
 
 When you `remove` or `clear` devices,
-[spawn_retain_scavenger](../src/bridge.rs) spins up a transient
+[spawn_retain_scavenger](../src/transport/mqtt.rs) spins up a transient
 MQTT client that:
 
 1. Subscribes to wildcard versions of the event and message topics
@@ -942,7 +942,7 @@ The sequence:
    because the override is applied at the `client.publish` call, not at message
    creation. Live (non-retained) delivery continues, so unlike a hard publish
    stop there is **no event loss**.
-2. **Purge** — [purge_all_retained](../src/bridge.rs) connects a transient MQTT
+2. **Purge** — [purge_all_retained](../src/transport/mqtt.rs) connects a transient MQTT
    client (its own client_id, like the scavenger), subscribes to the event +
    message topic wildcards under the *current* (old) templates, and clears every
    retained message it receives until `scavenger_timeout_secs` of idle. It skips
@@ -1181,7 +1181,7 @@ a retained `{root}/bridge/config` carrying its `session_id`. The hard part is
 telling a *live* incumbent apart from a *stale ghost* — a retained config left
 behind by an unclean exit whose LWT never cleared it (§7.1).
 
-**At startup** ([check_existing_instance](../src/bridge.rs)) runs two phases:
+**At startup** ([check_existing_instance](../src/transport/mqtt.rs)) runs two phases:
 
 1. Generate a `session_id = "sid_<unix_millis>"` for this instance, then
    subscribe to `{root}/bridge/config` with a temporary client.
@@ -1261,7 +1261,7 @@ fallback so the probe — not the will — is what normally resolves a ghost.
 
 ### 8.1 Retry with exponential backoff + jitter
 
-[spawn_mqtt_task](../src/bridge.rs) wraps `eventloop.poll()` in a
+[spawn_mqtt_task](../src/transport/mqtt.rs) wraps `eventloop.poll()` in a
 backoff loop. On any error:
 
 - `retry_delay` doubles, capped at `MAX_RETRY_DELAY_SECS = 1280` (~21
@@ -1333,7 +1333,7 @@ packet ever reaches the broker*: an oversized publish surfaces as
 packet size of: '10240'` (misleading — that 10 KiB is rumqttc's own default,
 not the broker's) and wedges the connection on a 10s retry loop, blocking
 *all* other publishes. The bridge lifts this with
-`set_max_packet_size(MAX_MQTT_PACKET_SIZE, …)` ([1 MiB](../src/bridge.rs)) so
+`set_max_packet_size(MAX_MQTT_PACKET_SIZE, …)` ([1 MiB](../src/transport/mqtt.rs)) so
 the client is never the bottleneck; the broker still enforces its own limit.
 
 This bit `status` hardest: it serialized **every** registered device into one
@@ -1350,7 +1350,7 @@ added metadata fields.
 
 ### 8.5 Publish QoS — derived from `retain`, and the burst-safety design
 
-The bridge has **no separate QoS knob**. The outbound loop ([spawn_mqtt_task](../src/bridge.rs))
+The bridge has **no separate QoS knob**. The outbound loop ([spawn_mqtt_task](../src/transport/mqtt.rs))
 maps each message's `retain` flag straight to a QoS level — `MqttMessage::retain`
 is the single source of truth for both:
 
@@ -1742,12 +1742,12 @@ binary (no shutdown-observation coupling at all).
 | ---------------------------------------- | ---------------------------------------------- |
 | Why an add changed something else        | [add_device](../src/bridge.rs)      |
 | Why a retain didn't fire                 | [IdentifierSet](../src/bridge.rs)       |
-| Why a retained message isn't clearing    | [spawn_retain_scavenger](../src/bridge.rs) |
-| How to apply a template/retain change     | [reconfigure](../src/bridge.rs), [purge_all_retained](../src/bridge.rs) (§4.11) |
+| Why a retained message isn't clearing    | [spawn_retain_scavenger](../src/transport/mqtt.rs) |
+| How to apply a template/retain change     | [reconfigure](../src/bridge.rs), [purge_all_retained](../src/transport/mqtt.rs) (§4.11) |
 | Why a topic substitution is wrong        | [render_template](../src/template.rs), [replace_vars](../src/bridge.rs) |
 | Why a command isn't matching             | [parse_mqtt_payload](../src/payload.rs), [compile_topic_regex](../src/template.rs) |
 | Why a sub-device command goes nowhere    | [get_connected_device](../src/bridge.rs), [resolve_cid](../src/bridge.rs) |
 | Why the listener seems wedged            | [spawn_device_listener](../src/bridge.rs) |
-| Why MQTT keeps reconnecting              | [spawn_mqtt_task](../src/bridge.rs)   |
-| Why two bridges fought                   | [check_existing_instance](../src/bridge.rs) |
+| Why MQTT keeps reconnecting              | [spawn_mqtt_task](../src/transport/mqtt.rs)   |
+| Why two bridges fought                   | [check_existing_instance](../src/transport/mqtt.rs) |
 | Why the state file looks weird           | [load_state](../src/config.rs)        |
