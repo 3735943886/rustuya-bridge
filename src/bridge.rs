@@ -3330,25 +3330,111 @@ mod tests {
         use serde_json::json;
         use tempfile::TempDir;
 
+        /// Reads one MQTT packet off a fake broker's socket as `(header, body)`.
+        async fn read_packet(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+            use tokio::io::AsyncReadExt;
+            let header = socket.read_u8().await.unwrap();
+            let mut len = 0;
+            let mut multiplier = 1;
+            loop {
+                let byte = socket.read_u8().await.unwrap();
+                len += usize::from(byte & 127) * multiplier;
+                if byte & 128 == 0 {
+                    break;
+                }
+                multiplier *= 128;
+            }
+            let mut body = vec![0; len];
+            socket.read_exact(&mut body).await.unwrap();
+            (header, body)
+        }
+
+        /// Everything already queued when shutdown starts still goes out, in order,
+        /// with the sentinel clear after it. Needs a fake broker: from a real one's
+        /// side a message dropped from the queue looks the same as one never queued.
+        #[tokio::test]
+        async fn shutdown_flushes_queued_messages_before_the_sentinel_clear() {
+            use tokio::io::AsyncWriteExt;
+            const QUEUED: usize = 50;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let broker_url = format!("mqtt://{}", listener.local_addr().unwrap());
+            let (ctx, _tmp, mqtt_rx, _save_rx, _refresh_rx) = make_ctx(|cli| {
+                cli.mqtt_broker = Some(broker_url);
+                cli.mqtt_retain = Some(false);
+            })
+            .await;
+            let (connected, ready) = tokio::sync::oneshot::channel();
+            let broker = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_packet(&mut socket).await.0 >> 4, 1); // CONNECT
+                socket.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+                let mut connected = Some(connected);
+                let mut subscriptions = 0;
+                let mut topics = Vec::new();
+                loop {
+                    let (header, body) = read_packet(&mut socket).await;
+                    match header >> 4 {
+                        8 => {
+                            socket
+                                .write_all(&[0x90, 3, body[0], body[1], 0])
+                                .await
+                                .unwrap();
+                            subscriptions += 1;
+                            if subscriptions == 2 {
+                                connected.take().unwrap().send(()).unwrap();
+                            }
+                        }
+                        3 => {
+                            let topic_len = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                            let id = [body[2 + topic_len], body[3 + topic_len]];
+                            topics
+                                .push(String::from_utf8(body[2..2 + topic_len].to_vec()).unwrap());
+                            socket.write_all(&[0x40, 2, id[0], id[1]]).await.unwrap();
+                        }
+                        14 => return topics,
+                        kind => panic!("unexpected packet {kind}"),
+                    }
+                }
+            });
+            let config_topic =
+                crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &ctx.mqtt_root_topic);
+            let mqtt = ctx
+                .clone()
+                .spawn_mqtt_task(&ctx.cli, mqtt_rx)
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), ready)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let queued: Vec<String> = (0..QUEUED).map(|i| format!("queued/{i}")).collect();
+            for topic in &queued {
+                ctx.try_send_mqtt(Some(MqttMessage {
+                    topic: topic.clone(),
+                    payload: "value".into(),
+                    retain: true,
+                }))
+                .await;
+            }
+            ctx.shutdown_mqtt().await;
+
+            let topics = tokio::time::timeout(Duration::from_secs(5), broker)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected = queued;
+            expected.push(config_topic);
+            assert_eq!(topics, expected);
+            tokio::time::timeout(Duration::from_secs(2), mqtt)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
         #[tokio::test]
         async fn shutdown_waits_for_clear_ack_after_earlier_publish_ack() {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            async fn read_packet(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
-                let header = socket.read_u8().await.unwrap();
-                let mut len = 0;
-                let mut multiplier = 1;
-                loop {
-                    let byte = socket.read_u8().await.unwrap();
-                    len += usize::from(byte & 127) * multiplier;
-                    if byte & 128 == 0 {
-                        break;
-                    }
-                    multiplier *= 128;
-                }
-                let mut body = vec![0; len];
-                socket.read_exact(&mut body).await.unwrap();
-                (header, body)
-            }
             fn publish_id(body: &[u8]) -> [u8; 2] {
                 let topic_len = usize::from(u16::from_be_bytes([body[0], body[1]]));
                 [body[2 + topic_len], body[3 + topic_len]]
