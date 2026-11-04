@@ -141,6 +141,29 @@ def fresh_retained(topic_filter, settle=2.0):
     return out
 
 
+def retained(topic_filter, settle=0.6):
+    """`{topic: payload}` currently retained under `topic_filter`."""
+    return {t: p for t, p, r in fresh_retained(topic_filter, settle=settle) if r and p}
+
+
+def publish_retained(messages):
+    """Publish `{topic: payload}` retained, returning once the broker has them."""
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    c.connect(BROKER_HOST, BROKER_PORT, 60)
+    c.loop_start()
+    infos = [c.publish(t, p, qos=1, retain=True) for t, p in messages.items()]
+    for info in infos:
+        info.wait_for_publish(5)
+    c.loop_stop()
+    c.disconnect()
+
+
+def sentinel_session(root):
+    """The `session_id` on the retained bridge-config sentinel, or None."""
+    payload = retained(f"{root}/bridge/config").get(f"{root}/bridge/config")
+    return json.loads(payload).get("session_id") if payload else None
+
+
 @pytest.fixture
 def bridge(tmp_path):
     """Start a cache-mode PyBridgeServer in a background thread on a unique
@@ -187,8 +210,19 @@ def bridge(tmp_path):
         handles.append(h)
         return h
 
+    # Lets a test prepare the broker before the first bridge starts on this root.
+    factory.root = root
+
     yield factory
 
     for h in handles:
         h.srv.stop()
         h.thread.join(timeout=10)
+
+
+@pytest.fixture
+def contract(bridge):
+    """`bridge`, plus removal of whatever a test left retained under its root."""
+    yield bridge
+    leftovers = retained(f"{bridge.root}/#", settle=1.0)
+    publish_retained({t: "" for t in leftovers})

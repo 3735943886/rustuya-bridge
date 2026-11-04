@@ -744,13 +744,17 @@ MQTT client that:
 
 1. Subscribes to wildcard versions of the event and message topics
    (`tpl_to_wildcard`, e.g. `rustuya/event/+/+`).
-2. For each retained message it receives, runs two passes:
-   - **Topic regex match** — extracts `{id}`/`{name}`/`{cid}` from the topic
-     using `compile_topic_regex` and compares against the removed devices'
-     identifiers.
-   - **Payload string fallback** — if topic match misses (or topic is
-     literal), searches the payload for `"<id>"`, `"<name>"`, or `"<cid>"`
-     as quoted string literals.
+2. For each retained message it receives, extracts `{id}`/`{name}`/`{cid}` from
+   the topic using `compile_topic_regex`, and decides by what the topic carries:
+   - **`{id}`** — the id alone decides. Names and cids aren't unique, so another
+     device sharing one keeps its retained.
+   - **`{name}`/`{cid}` without `{id}`** — a match on those clears it. On a miss,
+     searches the payload for the quoted `"<id>"`, which still catches a device
+     under a name it had before a rename.
+   - **No identifier, or no template matched** — searches the payload for
+     `"<id>"`, `"<name>"`, or `"<cid>"` as quoted string literals. This is the
+     one case that can clear an unrelated device: a name or cid can equal a DP key
+     (`"1"`) or a string DP value (`"white"`) in its payload.
 3. On match, publishes a zero-length retained message to clear it.
 4. Auto-exits after `scavenger_timeout_secs` (default 1s) of idle, unless
    new targets are queued (each new batch extends the deadline). Configurable
@@ -766,10 +770,10 @@ Subtleties:
   the heart of the scavenger uses `biased;` ordering so a simultaneous
   new-target arrival and deadline expiry cannot race — the new targets
   always win and the deadline gets extended.
-- The payload-fallback match uses **substring search for `"<id>"`** — quoted.
+- The payload search for `"<id>"` is a quoted substring match.
   `publish_device_message` always wraps non-object payloads into an object
-  before injecting `"id": "..."`, so the fallback always finds messages
-  regardless of caller-provided payload shape.
+  before injecting `"id": "..."`, so it finds those messages regardless of
+  caller-provided payload shape.
 
 ### 4.8 The "deleting the state file" hazard
 

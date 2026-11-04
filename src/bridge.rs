@@ -112,12 +112,14 @@ pub struct MqttMessage {
     /// There is no other QoS knob; this field is the single source of truth.
     ///
     /// Per message kind (see the `retain:` call sites):
-    ///   retain=true  → QoS1 : state snapshots (`{type}=state`, cache mode only),
-    ///                         bridge-config sentinel. Durable state a re-subscriber
-    ///                         must recover, so PUBACK-acknowledged delivery is worth it.
-    ///   retain=false → QoS0 : active/passive deltas, error/connect notices,
-    ///                         API/command responses. Live & transient — a drop
-    ///                         self-heals via the next push or the retained snapshot.
+    ///   retain=true  → QoS1 : state snapshots (`{type}=state`) and device error/connect
+    ///                         status (both cache mode only), bridge-config sentinel.
+    ///                         Durable state a re-subscriber must recover, so
+    ///                         PUBACK-acknowledged delivery is worth it.
+    ///   retain=false → QoS0 : active/passive deltas, API/command responses, scanner
+    ///                         results, and device status in pass-through mode. Live &
+    ///                         transient — a drop self-heals via the next push or the
+    ///                         retained snapshot.
     ///
     /// Why live = QoS0 (do NOT blanket-revert to QoS1): a whole-fleet fan-out emits
     /// hundreds of these at once; per-message PUBACK round-trips + rumqttc's in-flight
@@ -400,6 +402,42 @@ fn pinned_by_outer_layer(base: &Cli) -> Vec<&'static str> {
     .into_iter()
     .filter_map(|(name, pinned)| pinned.then_some(name))
     .collect()
+}
+
+/// Decides whether a retained message belongs to a device being removed, from
+/// the variables its topic yielded (`None` if it matched no template) and its
+/// payload.
+///
+/// How far the payload may be trusted depends on what the topic already says,
+/// because the payload check is a search for a quoted string in the whole body,
+/// where a name or cid can collide with a DP key (`"1"`) or a string value
+/// (`"white"`) of an unrelated device:
+/// - `{id}` in the topic settles it. Names and cids are not unique, so they must
+///   not be consulted: a sibling with the same name has its own topic to keep.
+/// - `{name}`/`{cid}` without `{id}`: a topic miss can still be this device under
+///   a name it no longer has, so look for its id, which is long enough not to
+///   collide. The payload's name and cid add nothing the topic didn't already say.
+/// - No identifier in the topic: the payload is all there is. Collisions remain
+///   possible here, and clearing is the only way not to orphan these messages.
+fn retained_belongs_to_targets(
+    topic_vars: Option<&HashMap<String, String>>,
+    payload: &str,
+    targets: &[crate::types::ScavengerTarget],
+) -> bool {
+    let var = |key| topic_vars.and_then(|vars| vars.get(key));
+    if let Some(id) = var("id") {
+        return targets.iter().any(|t| &t.id == id);
+    }
+    let (name, cid) = (var("name"), var("cid"));
+    let identified_by_topic = name.is_some() || cid.is_some();
+    let quoted = |value: &str| payload.contains(&format!("\"{value}\""));
+    targets.iter().any(|t| {
+        (name.is_some() && t.name.as_ref() == name)
+            || (cid.is_some() && t.cid.as_ref() == cid)
+            || quoted(&t.id)
+            || (!identified_by_topic
+                && (t.name.as_deref().is_some_and(quoted) || t.cid.as_deref().is_some_and(quoted)))
+    })
 }
 
 /// Subscribes one device's three streams into the listener's maps.
@@ -1038,8 +1076,8 @@ impl BridgeContext {
                 // Flush the queued publish without blocking. If the request channel
                 // is full, keep it pending; the poll arm below drains the in-flight
                 // window and we retry next iteration. QoS by message kind: retained
-                // state (per-device snapshots, the bridge-config sentinel) → QoS1;
-                // live/transient deltas, error/connect notices, and command responses
+                // state (per-device snapshots and status, the bridge-config sentinel)
+                // → QoS1; live/transient deltas and command responses
                 // → QoS0 (a fan-out emits hundreds at once and QoS1 PUBACK round-trips
                 // would stall the loop; a dropped live delta self-heals via the next
                 // push or the retained snapshot).
@@ -2307,37 +2345,10 @@ impl BridgeContext {
                 // Match the full set against the final target list, then clear.
                 let mut to_clear: Vec<String> = Vec::new();
                 for (topic, payload) in &seen {
-                    // 1. Precise topic match.
                     let vars = match_topic(topic, &event_tpl, event_re.as_ref())
                         .or_else(|| match_topic(topic, &msg_tpl, msg_re.as_ref()));
-                    let mut matched = false;
-                    if let Some(vars) = vars {
-                        let v_id = vars.get("id");
-                        let v_name = vars.get("name");
-                        let v_chan = vars.get("cid");
-                        matched = active_targets.iter().any(|t| {
-                            let id_hit = v_id.is_some_and(|v| v == &t.id);
-                            let cid_hit = v_chan.is_some() && t.cid.as_ref() == v_chan;
-                            let name_hit = v_name.is_some() && t.name.as_ref() == v_name;
-                            id_hit || cid_hit || name_hit
-                        });
-                    }
-                    // 2. Exact payload (quoted-id) fallback.
-                    if !matched {
-                        let payload = String::from_utf8_lossy(payload);
-                        matched = active_targets.iter().any(|t| {
-                            let id_match = payload.contains(&format!("\"{}\"", t.id));
-                            let cid_match = t
-                                .cid
-                                .as_ref()
-                                .is_some_and(|cid| payload.contains(&format!("\"{cid}\"")));
-                            let name_match = t
-                                .name
-                                .as_ref()
-                                .is_some_and(|name| payload.contains(&format!("\"{name}\"")));
-                            id_match || cid_match || name_match
-                        });
-                    }
+                    let payload = String::from_utf8_lossy(payload);
+                    let matched = retained_belongs_to_targets(vars.as_ref(), &payload, &active_targets);
                     if matched {
                         to_clear.push(topic.clone());
                     }
@@ -4185,6 +4196,91 @@ mod tests {
                 "{{type}} in payload template alone must keep cache mode active"
             );
             assert!(ctx.cache.is_some());
+        }
+
+        // ── scavenger matching ──────────────────────────────────────────────────────────
+
+        fn scav_target(
+            id: &str,
+            name: Option<&str>,
+            cid: Option<&str>,
+        ) -> crate::types::ScavengerTarget {
+            crate::types::ScavengerTarget {
+                id: id.into(),
+                name: name.map(Into::into),
+                cid: cid.map(Into::into),
+            }
+        }
+
+        fn topic_vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn scavenge_id_in_topic_decides_alone() {
+            let target = [scav_target("dev-a", Some("kitchen"), Some("c1"))];
+            let own = topic_vars(&[("id", "dev-a")]);
+            assert!(retained_belongs_to_targets(Some(&own), "{}", &target));
+            let sibling = topic_vars(&[("id", "dev-b"), ("name", "kitchen"), ("cid", "c1")]);
+            assert!(!retained_belongs_to_targets(
+                Some(&sibling),
+                r#"{"id":"dev-a","name":"kitchen","cid":"c1"}"#,
+                &target
+            ));
+        }
+
+        #[test]
+        fn scavenge_name_or_cid_in_topic_falls_back_to_payload_id_only() {
+            let target = [scav_target("dev-a", Some("kitchen"), Some("c1"))];
+            for vars in [
+                topic_vars(&[("name", "kitchen")]),
+                topic_vars(&[("cid", "c1")]),
+            ] {
+                assert!(retained_belongs_to_targets(Some(&vars), "{}", &target));
+            }
+            for vars in [
+                topic_vars(&[("name", "hall")]),
+                topic_vars(&[("cid", "c2")]),
+            ] {
+                assert!(!retained_belongs_to_targets(
+                    Some(&vars),
+                    r#"{"21":"kitchen","22":"c1"}"#,
+                    &target
+                ));
+                // The same device under a name it had before a rename.
+                assert!(retained_belongs_to_targets(
+                    Some(&vars),
+                    r#"{"id":"dev-a"}"#,
+                    &target
+                ));
+            }
+        }
+
+        #[test]
+        fn scavenge_without_identifier_in_topic_relies_on_payload() {
+            let target = [scav_target("dev-a", Some("kitchen"), Some("c1"))];
+            let literal = topic_vars(&[("type", "state")]);
+            for vars in [None, Some(&literal)] {
+                for payload in [
+                    r#"{"id":"dev-a"}"#,
+                    r#"{"name":"kitchen"}"#,
+                    r#"{"cid":"c1"}"#,
+                ] {
+                    assert!(
+                        retained_belongs_to_targets(vars, payload, &target),
+                        "{payload}"
+                    );
+                }
+                // Quoted match only: an id inside a longer string is someone else's.
+                assert!(!retained_belongs_to_targets(
+                    vars,
+                    r#"{"id":"dev-ab"}"#,
+                    &target
+                ));
+            }
         }
 
         // ── cache-mode publish routing ──────────────────────────────────────────────────

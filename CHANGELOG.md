@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `remove`/`clear` no longer clear another device's retained messages. The
+  scavenger searched the payload for the removed device's quoted name and cid,
+  so a DP key or string value equal to either (`"1"`, `"white"`) matched an
+  unrelated device, and with `{id}` in the topic a device sharing the name or cid
+  was cleared too. An `{id}` in the topic now decides alone; `{name}`/`{cid}`
+  without `{id}` only fall back to the quoted id. A topic with no identifier still
+  searches the payload for all three, and can still collide.
+
 ## [0.4.4] — 2026-10-18
 
 ### Fixed
