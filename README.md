@@ -358,7 +358,9 @@ MQTT topics and payloads can be fully customized using templates.
 **Variables:**
 - `{root}`: MQTT root topic prefix
 - `{id}`: Device ID (or `bridge` for bridge-level responses)
-- `{name}`: Device Name (or `bridge` for bridge-level responses)
+- `{name}`: Device Name (or `bridge` for bridge-level responses). Empty for a
+  device with no name, including a response about an unregistered id, so pair it
+  with `{id}` in `mqtt_message_topic` if those need to be told apart.
 - `{cid}`: Sub-device CID (if applicable, otherwise empty)
 - `{type}`: `active` or `passive` (raw device deltas) or `state` (retained merged snapshot, `mqtt_retain` only) — only for the event topic
 - `{dp}`: Data Point ID (only in single DP mode)

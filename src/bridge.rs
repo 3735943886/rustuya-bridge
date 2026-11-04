@@ -2073,11 +2073,28 @@ impl BridgeContext {
             crate::types::Status::Error => "error",
         };
         let id = response.id.as_deref().unwrap_or("bridge");
-        let name = (id == "bridge").then_some("bridge");
+        // A lookup per response is only worth it when the topic renders the name.
+        let name = if id == "bridge" {
+            Some("bridge".to_string())
+        } else if self
+            .mqtt_message_topic
+            .as_deref()
+            .is_some_and(|topic| topic.contains("{name}"))
+        {
+            match &response.removed_name {
+                Some(name) => Some(name.clone()),
+                None => {
+                    let state = self.state.read().await;
+                    state.configs.get(id).and_then(|cfg| cfg.name.clone())
+                }
+            }
+        } else {
+            None
+        };
 
         match serde_json::to_value(&response) {
             Ok(payload) => {
-                self.publish_device_message(id, name, None, level, payload, false)
+                self.publish_device_message(id, name.as_deref(), None, level, payload, false)
                     .await;
             }
             Err(e) => {
@@ -2610,8 +2627,8 @@ impl BridgeContext {
         Ok(ApiResponse::ok("add", id))
     }
 
-    /// Removes devices and their sub-devices, returning the ids actually removed
-    /// (the matched devices plus every cascaded sub-device).
+    /// Removes devices and their sub-devices, returning the id and name of each
+    /// one actually removed (the matched devices plus every cascaded sub-device).
     ///
     /// # Errors
     /// Returns [`BridgeError::NoMatchingDevices`] if no devices match the given selectors.
@@ -2619,7 +2636,7 @@ impl BridgeContext {
         &self,
         id: Option<Vec<String>>,
         name: Option<Vec<String>>,
-    ) -> Result<Vec<String>, BridgeError> {
+    ) -> Result<Vec<(String, Option<String>)>, BridgeError> {
         let mut targets = self.get_targets(id, name).await?;
 
         // Cascade removal to sub-devices
@@ -2693,15 +2710,20 @@ impl BridgeContext {
             }
         }
 
+        let removed = scavenger_targets
+            .iter()
+            .map(|target| (target.id.clone(), target.name.clone()))
+            .collect();
+
         // Scavenge retained messages for removed devices
         self.spawn_retain_scavenger(scavenger_targets).await;
 
         info!("Devices removed: {}", targets.join(", "));
         self.request_save();
 
-        // Return the removed ids (parent + cascaded subs); the handler emits one
+        // Return the removed devices (parent + cascaded subs); the handler emits one
         // per-id `remove` response so each lands on its own response topic.
-        Ok(targets)
+        Ok(removed)
     }
 
     /// Clears all registered devices and scavenges their retained MQTT messages.
@@ -4152,8 +4174,8 @@ mod tests {
                 .expect("remove by name");
 
             assert_eq!(removed.len(), 4, "cascade should remove gateway + 3 subs");
-            assert!(removed.contains(&"gw-1".to_string()));
-            assert!(removed.contains(&"sub-s2".to_string()));
+            assert!(removed.iter().any(|(id, _)| id == "gw-1"));
+            assert!(removed.iter().any(|(id, _)| id == "sub-s2"));
         }
 
         #[tokio::test]
@@ -4175,7 +4197,13 @@ mod tests {
                 .unwrap();
             removed.sort();
 
-            assert_eq!(removed, vec!["dev-a".to_string(), "dev-b".to_string()]);
+            assert_eq!(
+                removed,
+                vec![
+                    ("dev-a".to_string(), Some("kitchen".to_string())),
+                    ("dev-b".to_string(), Some("kitchen".to_string())),
+                ]
+            );
         }
 
         #[tokio::test]

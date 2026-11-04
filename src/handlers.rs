@@ -201,7 +201,10 @@ async fn handle_request_inner(
                 .await?;
             Ok(removed
                 .into_iter()
-                .map(|rid| ApiResponse::ok("remove", rid))
+                .map(|(rid, removed_name)| ApiResponse {
+                    removed_name,
+                    ..ApiResponse::ok("remove", rid)
+                })
                 .collect())
         }
         BridgeRequest::Clear => Ok(vec![ctx.clear_devices().await?]),

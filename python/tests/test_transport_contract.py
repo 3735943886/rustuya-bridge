@@ -139,8 +139,7 @@ OUTPUT_CASES = {
             (f"event/state/{DEV}", {"1": False, "2": 75}),
         ],
         status_topic=f"msg/error/{NAME}/{DEV}",
-        # A device response carries no name, so `{name}` renders as an empty level.
-        response_topic=f"msg/response//{DEV}",
+        response_topic=f"msg/response/{NAME}/{DEV}",
     ),
 }
 
@@ -169,7 +168,10 @@ def test_device_output_on_the_wire(contract, case):
 
         response = next((p for t, p, _ in startup if t == f"{root}/{case.response_topic}"), None)
         assert response is not None, f"no add response: {[t for t, _, _ in startup]}"
-        assert json.loads(response) == {"status": "ok", "action": "add", "id": DEV}
+        expected = {"status": "ok", "action": "add", "id": DEV}
+        if "{name}" in case.config.get("mqtt_message_topic", ""):
+            expected["name"] = NAME
+        assert json.loads(response) == expected
 
         assert mock.push({"1": False, "2": 75}) is True
         emitted = _settled(coll, quiet=2.0)
@@ -177,6 +179,67 @@ def test_device_output_on_the_wire(contract, case):
         assert got == sorted(case.events, key=lambda e: e[0]), f"got {got}"
     finally:
         mock.stop()
+        coll.close()
+
+
+@pytest.mark.parametrize("template,render", [
+    ("{root}/msg/{level}/{name}/{id}", lambda level, name, dev_id: f"msg/{level}/{name}/{dev_id}"),
+    ("{root}/msg/{level}/{name}", lambda level, name, dev_id: f"msg/{level}/{name}"),
+], ids=["name-and-id", "name-only"])
+def test_device_responses_render_the_name(contract, template, render):
+    """`remove` is the case that needs care: its response goes out after the
+    registry has forgotten the name. A cascaded sub-device gets its own."""
+    gateway, sub = "ebname00000000000001", "ebname00000000000002"
+    ip = loopback_ips(1, start=188)[0]
+    h = contract(mqtt_message_topic=template)
+    root = h.root
+    coll = Collector(f"{root}-name-col")
+    coll.subscribe(f"{root}/#")
+
+    def responded(action, name, dev_id):
+        topic = f"{root}/{render('response', name, dev_id)}"
+        return coll.wait_for(
+            lambda t, p, r: t == topic and json.loads(p).get("action") == action
+            and json.loads(p).get("id") == dev_id and json.loads(p).get("name") == name,
+            timeout=10,
+        )
+
+    try:
+        coll.publish(h.command(), json.dumps(_add_cmd(gateway, ip, name="hub")))
+        assert responded("add", "hub", gateway), "no add response under the device's name"
+        coll.publish(h.command(), json.dumps(
+            {"action": "add", "id": sub, "name": "plug", "cid": "c1", "parent_id": gateway}))
+        assert responded("add", "plug", sub), "no add response under the sub-device's name"
+
+        coll.publish(h.command(), json.dumps({"action": "remove", "name": "hub"}))
+        got = _settled(coll, quiet=2.0)
+        for name, dev_id in (("hub", gateway), ("plug", sub)):
+            topic = f"{root}/{render('response', name, dev_id)}"
+            assert any(t == topic and json.loads(p)["action"] == "remove" for t, p, _ in got), (
+                f"no remove response on {topic}: {[t for t, _, _ in got]}"
+            )
+    finally:
+        coll.close()
+
+
+def test_remove_response_stays_out_of_the_default_payload(contract):
+    """The name only goes where a topic asked for it: on the default template the
+    response payload is unchanged, on `remove` as on anything else."""
+    dev_id = "ebname00000000000003"
+    ip = loopback_ips(1, start=189)[0]
+    h = contract()
+    coll = Collector(f"{h.root}-noname-col")
+    coll.subscribe(f"{h.root}/#")
+    try:
+        coll.publish(h.command(), json.dumps(_add_cmd(dev_id, ip, name="lamp")))
+        assert coll.wait_for(lambda t, p, r: t == f"{h.root}/response/{dev_id}", timeout=10)
+        coll.publish(h.command(), json.dumps({"action": "remove", "id": dev_id}))
+        reply = coll.wait_for(
+            lambda t, p, r: t == f"{h.root}/response/{dev_id}" and '"remove"' in p, timeout=10,
+        )
+        assert reply, "no remove response"
+        assert json.loads(reply[1]) == {"status": "ok", "action": "remove", "id": dev_id}
+    finally:
         coll.close()
 
 

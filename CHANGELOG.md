@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the next registry change, so a second instance started in that gap took over and
   shut the first one down. The bridge now resends its sentinel unchanged after
   reconnecting, unless another instance has taken over in the meantime.
+- Device responses now fill `{name}` in `mqtt_message_topic`, matching the device's
+  status messages. It rendered empty before (`msg/response//<id>`, or a single
+  `msg/response/` shared by every device on a `{name}`-only template), so
+  subscribers on those topics need updating. With `{name}` in the template the
+  response payload also gains `name`; other templates are unchanged.
 
 ## [0.4.4] — 2026-10-18
 

@@ -152,6 +152,10 @@ pub struct ApiResponse {
     pub error: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+    /// The device's name when the registry can no longer supply it, because the
+    /// request removed the device. Only rendered if the message topic has `{name}`.
+    #[serde(skip)]
+    pub removed_name: Option<String>,
 }
 
 impl ApiResponse {
@@ -163,6 +167,7 @@ impl ApiResponse {
             id: Some(id.into()),
             error: None,
             extra: HashMap::new(),
+            removed_name: None,
         }
     }
 
@@ -175,6 +180,7 @@ impl ApiResponse {
             id: None,
             error: None,
             extra: HashMap::new(),
+            removed_name: None,
         }
     }
 
@@ -186,6 +192,7 @@ impl ApiResponse {
             id: None,
             error: Some(err.to_string()),
             extra: HashMap::new(),
+            removed_name: None,
         }
     }
 
