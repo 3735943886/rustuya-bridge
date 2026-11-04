@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was cleared too. An `{id}` in the topic now decides alone; `{name}`/`{cid}`
   without `{id}` only fall back to the quoted id. A topic with no identifier still
   searches the payload for all three, and can still collide.
+- A broker connection loss no longer leaves the root unclaimed. The will clears
+  `{root}/bridge/config` on an unclean disconnect and nothing restored it until
+  the next registry change, so a second instance started in that gap took over and
+  shut the first one down. The bridge now resends its sentinel unchanged after
+  reconnecting, unless another instance has taken over in the meantime.
 
 ## [0.4.4] — 2026-10-18
 

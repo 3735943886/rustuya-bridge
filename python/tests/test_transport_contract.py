@@ -19,12 +19,15 @@ import tuyamock
 from conftest import (
     BROKER_HOST,
     BROKER_PORT,
+    BROKER_URL,
     Collector,
     loopback_ips,
     publish_retained,
     retained,
     sentinel_session,
 )
+
+pyrustuyabridge = pytest.importorskip("pyrustuyabridge")
 
 KEY = "thisisarealkey00"  # 16 bytes, must match the `add` key
 VER = "3.4"
@@ -458,8 +461,9 @@ def blipped(contract, proxy):
         assert mock.push({"1": False, "2": 75}) is True
         state = h.state_topic(dev_id)
         assert _wait(lambda: state in retained(state), 15), "no snapshot before the outage"
-        sid = sentinel_session(h.root)
-        assert sid, "no sentinel before the outage"
+        config = f"{h.root}/bridge/config"
+        sentinel = retained(config).get(config)
+        assert sentinel, "no sentinel before the outage"
 
         proxy.sever()
         # A retained state nobody but a re-run seed phase would read.
@@ -474,7 +478,7 @@ def blipped(contract, proxy):
             return coll.wait_for(lambda t, p, r: t == f"{h.root}/response/bridge", timeout=2)
 
         assert _wait(answers, 90), "the bridge never came back after the outage"
-        yield h, coll, mock, dev_id, sid
+        yield h, coll, mock, dev_id, sentinel
     finally:
         proxy.restore()
         mock.stop()
@@ -501,14 +505,61 @@ def test_seed_does_not_run_again_after_a_broker_outage(blipped):
     assert json.loads(retained(state)[state]) == {"1": True, "2": 75}
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "known bug: reconnecting does not republish the sentinel the will cleared, so it "
-    "stays gone until the next registry change"
-))
-def test_sentinel_is_back_after_a_broker_outage(blipped):
-    """The outage fires the will, which clears the sentinel. Without it a second
-    instance sees an unclaimed root and starts: the one thing it exists to stop."""
-    h, _, _, _, sid = blipped
+def test_sentinel_is_restored_unchanged_after_a_broker_outage(blipped):
+    """The outage fires the will, which clears the sentinel. It has to come back
+    byte for byte: rustuya-manager reads a new `devices_updated_at` as a registry
+    change, and nothing about the registry changed."""
+    h, _, _, _, before = blipped
+    config = f"{h.root}/bridge/config"
     # Shorter than the save debounce a device's `add` left pending, whose republish
     # would otherwise pass for the reconnect's.
-    assert _wait(lambda: sentinel_session(h.root) == sid, 5), "sentinel gone after reconnecting"
+    assert _wait(lambda: config in retained(config), 5), "sentinel gone after reconnecting"
+    assert retained(config)[config] == before
+
+
+def test_second_instance_is_still_refused_after_a_broker_outage(blipped, tmp_path):
+    h, _, _, _, before = blipped
+    config = f"{h.root}/bridge/config"
+    assert _wait(lambda: config in retained(config), 5), "sentinel gone after reconnecting"
+
+    second = pyrustuyabridge.PyBridgeServer(
+        mqtt_broker=BROKER_URL,
+        mqtt_root_topic=h.root,
+        mqtt_client_id=f"{h.root}-second",
+        state_file=str(tmp_path / "second.json"),
+        no_signals=True,
+        log_level="warn",
+    )
+    outcome = []
+
+    def run():
+        try:
+            second.start()
+            outcome.append(None)
+        except RuntimeError as exc:
+            outcome.append(str(exc))
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=30)
+    if t.is_alive():
+        second.stop()
+        pytest.fail("a second instance started on the root after the outage")
+    assert outcome and "Duplicate instance" in (outcome[0] or ""), f"got {outcome}"
+    assert h.thread.is_alive(), "the incumbent went down"
+    assert retained(config)[config] == before
+
+
+def test_bridge_yields_to_an_instance_that_took_over_during_an_outage(contract, proxy):
+    """Restoring the sentinel without checking for a new owner first would make
+    each bridge see the other's and shut down, leaving the root with none."""
+    h = contract(mqtt_broker=f"mqtt://127.0.0.1:{proxy.port}")
+    assert sentinel_session(h.root), "no sentinel before the outage"
+    proxy.sever()
+    # Long enough for the will to land first, as it would before a new owner starts.
+    time.sleep(1.0)
+    publish_retained({f"{h.root}/bridge/config": '{"session_id":"new-owner"}'})
+    proxy.restore()
+    h.thread.join(timeout=60)
+    assert not h.thread.is_alive(), "the bridge kept running alongside the new owner"
+    assert sentinel_session(h.root) == "new-owner", "the bridge overwrote the new owner's sentinel"

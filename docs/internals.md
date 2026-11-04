@@ -814,7 +814,10 @@ serves three purposes simultaneously:
 - **Duplicate-instance detection** — see §7.
 - **Last Will and Testament** — registered as an empty retained payload on
   abnormal disconnect, so the
-  topic clears itself if the bridge crashes.
+  topic clears itself if the bridge crashes. Losing the connection fires it too,
+  so after reconnecting the bridge resends its last sentinel unchanged, 500ms
+  later. The wait lets another instance's retained sentinel arrive first: if one
+  took over during the outage, this bridge yields instead of overwriting it.
 
 > **Credentials are stripped.** `mqtt_user` and `mqtt_password` carry
 > `#[serde(skip_serializing)]`, so they never appear in this retained topic.

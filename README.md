@@ -412,8 +412,8 @@ The bridge publishes events to the following MQTT topics:
   (including the bridge `version` and `devices_updated_at`, a millisecond
   timestamp of the last time a device was added/removed/cleared), published
   at startup, republished (debounced) whenever the device registry changes,
-  and cleared on graceful shutdown (also serves as the presence/heartbeat
-  topic). `devices_updated_at` resets on every `reconfigure` restart, so
+  restored after a reconnect, and cleared on graceful shutdown (also serves as
+  the presence/heartbeat topic). `devices_updated_at` resets on every `reconfigure` restart, so
   don't treat it as surviving across one. MQTT credentials
   (`mqtt_user`/`mqtt_password`) are **not** included; note that credentials
   embedded inline in the broker URL still are — prefer the user/password

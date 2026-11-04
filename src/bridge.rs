@@ -1037,6 +1037,10 @@ impl BridgeContext {
         const SEED_QUIET: Duration = Duration::from_millis(200);
         let seed_wildcard = self.seed_state_wildcard.clone();
 
+        // How long after a reconnect to watch for another instance's sentinel
+        // before restoring ours. Same window `check_existing_instance` observes.
+        const SENTINEL_RESTORE_DELAY: Duration = Duration::from_millis(500);
+
         // Buffer bursts using the same bounded budget as the outbound channel.
         // One tracked driver owns all request futures; no detached task per command.
         let (request_tx, request_rx) = mpsc::channel(MQTT_CHANNEL_CAPACITY);
@@ -1064,6 +1068,17 @@ impl BridgeContext {
             let mut seed_active = false;
             let mut seed_deadline: Option<Instant> = None;
             let mut seed_last_msg: Option<Instant> = None;
+            // An unclean disconnect fires the will, which clears the sentinel, and
+            // nothing else restores it until the next registry change. Until then a
+            // second instance finds the root unclaimed, starts, and takes over. The
+            // restore waits out the retained replay first: if another instance did
+            // take over during the outage, overwriting its sentinel would make each
+            // bridge see the other's and both shut down. The payload is resent
+            // verbatim because a new `devices_updated_at` would announce a registry
+            // change that never happened.
+            let mut connected_before = false;
+            let mut last_sentinel: Option<String> = None;
+            let mut sentinel_restore_at: Option<Instant> = None;
             // At most one publish awaiting hand-off to rumqttc's request channel.
             // It is flushed with the non-blocking `try_publish` at the loop top, not
             // `publish().await` inside the arm: awaiting the latter blocks the
@@ -1095,8 +1110,13 @@ impl BridgeContext {
                     false
                 };
                 if flushed {
-                    if pending.as_ref().is_some_and(|msg| msg.retain) {
-                        outstanding_publishes += 1;
+                    if let Some(msg) = &pending {
+                        if msg.retain {
+                            outstanding_publishes += 1;
+                        }
+                        if msg.topic == config_topic {
+                            last_sentinel = (!msg.payload.is_empty()).then(|| msg.payload.clone());
+                        }
                     }
                     pending = None;
                 }
@@ -1130,11 +1150,34 @@ impl BridgeContext {
                         }
                         self.on_seed_complete().await;
                     }
+                    () = async {
+                        if let Some(deadline) = sentinel_restore_at {
+                            tokio::time::sleep_until(deadline).await;
+                        } else {
+                            futures_util::future::pending::<()>().await;
+                        }
+                    } => {
+                        sentinel_restore_at = None;
+                        if let Some(sentinel) = &last_sentinel {
+                            if client
+                                .try_publish(&config_topic, rumqttc::QoS::AtLeastOnce, true, sentinel.clone())
+                                .is_ok()
+                            {
+                                outstanding_publishes += 1;
+                            } else {
+                                sentinel_restore_at = Some(Instant::now() + SENTINEL_RESTORE_DELAY);
+                            }
+                        }
+                    }
                     notification = eventloop.poll(), if next_retry.is_none() => {
                         match notification {
                             Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
                                 info!("Connected to MQTT broker");
                                 retry_delay = INITIAL_RETRY_DELAY_SECS;
+                                if connected_before {
+                                    sentinel_restore_at = Some(Instant::now() + SENTINEL_RESTORE_DELAY);
+                                }
+                                connected_before = true;
                                 if let Err(e) = client.subscribe(&sub_topic, rumqttc::QoS::AtLeastOnce).await {
                                     error!("Subscription failed: {e}");
                                 } else {
@@ -1221,6 +1264,7 @@ impl BridgeContext {
                                 outstanding_publishes = outstanding_publishes.saturating_sub(1);
                             }
                             Err(e) => {
+                                sentinel_restore_at = None;
                                 error!("MQTT Error: {e}. Retrying in {retry_delay}s...");
                                 let jitter = u64::try_from(unix_millis() % 1000).unwrap_or(0);
                                 next_retry = Some(Instant::now() + Duration::from_secs(retry_delay) + Duration::from_millis(jitter));
