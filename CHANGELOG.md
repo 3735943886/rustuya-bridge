@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-11-04
+
 ### Fixed
 - `remove`/`clear` no longer clear another device's retained messages. The
   scavenger searched the payload for the removed device's quoted name and cid,
@@ -25,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `msg/response/` shared by every device on a `{name}`-only template), so
   subscribers on those topics need updating. With `{name}` in the template the
   response payload also gains `name`; other templates are unchanged.
+
+### Changed
+- Update `pyo3` and `pyo3-async-runtimes` to 0.30, with `pyo3-log` 0.13.5.
+
+### Validation
+- 159 Rust tests and workspace Clippy pass.
+- 78 MQTT-backed integration tests, the protocol-version matrix and the 1000-device
+  fleet test pass. New contract tests pin retain and scavenger behaviour, the wire
+  format, command addressing and behaviour across a broker outage. Each regression
+  they guard was confirmed caught by breaking the code on purpose.
 
 ## [0.4.4] — 2026-10-18
 
