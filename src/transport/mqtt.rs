@@ -13,10 +13,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::bridge::{BridgeContext, MqttMessage, TopicVars, unix_millis};
+use crate::bridge::{BridgeContext, unix_millis};
 use crate::config::Cli;
-use crate::template::{compile_topic_regex, match_topic, tpl_to_wildcard};
-use crate::types::BridgeRequest;
+use crate::outbound::{DeltaKind, Outbound};
+use crate::template::{compile_topic_regex, match_topic, render_template, tpl_to_wildcard};
+use crate::types::{ApiResponse, BridgeRequest};
 
 /// Client-side MQTT packet size cap (incoming and outgoing). rumqttc defaults
 /// *both* to a tiny 10 KiB, which silently refuses any larger publish — a big
@@ -27,7 +28,10 @@ use crate::types::BridgeRequest;
 pub const MAX_MQTT_PACKET_SIZE: usize = 1024 * 1024;
 pub const INITIAL_RETRY_DELAY_SECS: u64 = 10;
 pub const MAX_RETRY_DELAY_SECS: u64 = 1280;
+const MQTT_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const MQTT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+// One log line per this many dropped messages.
+const DROP_LOG_INTERVAL: u64 = 100;
 
 /// Decides whether a retained message belongs to a device being removed, from
 /// the variables its topic yielded (`None` if it matched no template) and its
@@ -63,6 +67,210 @@ fn retained_belongs_to_targets(
             || (!identified_by_topic
                 && (t.name.as_deref().is_some_and(quoted) || t.cid.as_deref().is_some_and(quoted)))
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct MqttMessage {
+    pub topic: String,
+    pub payload: String,
+    /// Drives BOTH the MQTT retain flag and the publish QoS — they are not
+    /// independent. The outbound loop (`spawn_mqtt_task`) maps `retain` → QoS:
+    /// `retain=true → QoS1 (AtLeastOnce)`, `retain=false → QoS0 (AtMostOnce)`.
+    /// There is no other QoS knob; this field is the single source of truth.
+    ///
+    /// Per message kind (see the `retain:` call sites):
+    ///   retain=true  → QoS1 : state snapshots (`{type}=state`) and device error/connect
+    ///                         status (both cache mode only), bridge-config sentinel.
+    ///                         Durable state a re-subscriber must recover, so
+    ///                         PUBACK-acknowledged delivery is worth it.
+    ///   retain=false → QoS0 : active/passive deltas, API/command responses, scanner
+    ///                         results, and device status in pass-through mode. Live &
+    ///                         transient — a drop self-heals via the next push or the
+    ///                         retained snapshot.
+    ///
+    /// Why live = QoS0 (do NOT blanket-revert to QoS1): a whole-fleet fan-out emits
+    /// hundreds of these at once; per-message PUBACK round-trips + rumqttc's in-flight
+    /// window (100) stalled the event loop and starved the device actors (~60% reset
+    /// on a 500-device name fan-out). The non-blocking `try_publish` in the loop is the
+    /// structural burst-safety fix; QoS0 on the live path is defense-in-depth that keeps
+    /// that path's protocol load low. NOTE: the one kind with a real delivery-guarantee
+    /// argument is command *responses* — if that ever matters, scope QoS1 to responses
+    /// specifically rather than reverting the whole `else` branch (it re-adds N PUBACKs
+    /// to the fan-out path).
+    pub retain: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct TopicVars<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: Option<&'a str>,
+    pub(crate) cid: Option<&'a str>,
+    pub(crate) level: Option<&'a str>,
+    pub(crate) event_type: Option<&'a str>,
+    pub(crate) action: Option<&'a str>,
+    pub(crate) dp: Option<&'a str>,
+    pub(crate) val: Option<&'a Value>,
+    pub(crate) dps_str: Option<&'a str>,
+}
+
+/// Records which identifier placeholders (`{id}`, `{name}`, `{cid}`) a set of
+/// topic/payload templates references. Used to decide whether `retain=true` is
+/// safe: a retained message must carry an identifier so the scavenger can find
+/// and clear it when the device is later removed.
+///
+/// `{id}` is treated as always-satisfied because every registered device has an
+/// id; `{name}` and `{cid}` only satisfy retain when the device actually has a
+/// non-empty value for that field.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IdentifierSet {
+    pub id: bool,
+    pub name: bool,
+    pub cid: bool,
+}
+
+impl IdentifierSet {
+    /// Union of identifiers referenced across all given templates.
+    #[must_use]
+    pub fn from_templates<'a, I: IntoIterator<Item = &'a str>>(templates: I) -> Self {
+        let mut set = Self::default();
+        for tpl in templates {
+            if tpl.contains("{id}") {
+                set.id = true;
+            }
+            if tpl.contains("{name}") {
+                set.name = true;
+            }
+            if tpl.contains("{cid}") {
+                set.cid = true;
+            }
+        }
+        set
+    }
+
+    /// `true` when the templates reference no identifier — retain is structurally
+    /// impossible to scavenge regardless of the device.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        !self.id && !self.name && !self.cid
+    }
+
+    /// `true` when at least one referenced identifier has a usable value for the
+    /// given device, so the scavenger can locate and clear the retained message.
+    #[must_use]
+    pub fn satisfied_by(self, name: Option<&str>, cid: Option<&str>) -> bool {
+        self.id
+            || (self.name && name.is_some_and(|s| !s.is_empty()))
+            || (self.cid && cid.is_some_and(|s| !s.is_empty()))
+    }
+}
+
+/// How the bridge's output is laid out on the broker, from the configuration.
+pub struct MqttLayout {
+    pub root_topic: String,
+    pub event_topic: String,
+    pub retain: bool,
+    pub message_topic: Option<String>,
+    pub payload_template: Option<String>,
+    pub scanner_topic: Option<String>,
+    /// Identifiers the event topic and payload templates reference: the scavenger
+    /// can only find a retained message through one of them.
+    pub event_identifiers: IdentifierSet,
+    pub seed_state_wildcard: Option<String>,
+    pub seed_state_regex: Option<Regex>,
+}
+
+impl MqttLayout {
+    pub(crate) fn from_cli(cli: &Cli) -> Self {
+        let (_, mqtt_event_topic) = cli.mqtt_topics();
+        let payload_tpl = cli
+            .mqtt_payload_template
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_MQTT_PAYLOAD_TEMPLATE);
+        let event_identifiers =
+            IdentifierSet::from_templates([mqtt_event_topic.as_str(), payload_tpl]);
+
+        if cli.mqtt_retain() && event_identifiers.is_empty() {
+            warn!(
+                "mqtt_retain=true but neither event_topic ('{mqtt_event_topic}') nor payload_template ('{payload_tpl}') references an identifier ({{id}}, {{name}}, or {{cid}}); retained device events would be unreachable for the scavenger and will be dropped"
+            );
+        }
+
+        // cache mode (mqtt_retain=true) splits each device update across
+        // no-retain raw deltas (`{type}=active` / `{type}=passive`) and a
+        // retained merged snapshot (`{type}=state`). MQTT semantics keep us
+        // safe on the reload path regardless of templates: a no-retain
+        // publish doesn't overwrite the retained value, so a re-subscribing
+        // client always receives only the latest `state` snapshot, never a
+        // stale delta. Spurious re-fires on reconnect — the primary bug we
+        // wanted to kill — are gone unconditionally.
+        //
+        // The only residual concern is *live* double-fire: when `{type}` is
+        // absent all three kinds (active delta, passive delta, state
+        // snapshot) land on one topic, so a live subscriber gets every delta
+        // *and* every snapshot and can't tell them apart. With `{type}` in
+        // the topic each kind is its own topic (subscribe to just what you
+        // want); in the payload, consumers filter via value_json.type.
+        // State entities are idempotent and don't care; event automations
+        // need the distinction. We warn rather than downgrade because
+        // mqtt_retain=true is the user's explicit opt-in, and a fleet with
+        // no event automations is perfectly happy with neither {type}.
+        let type_distinguishable =
+            mqtt_event_topic.contains("{type}") || payload_tpl.contains("{type}");
+        if cli.mqtt_retain() && !type_distinguishable {
+            warn!(
+                "mqtt_retain=true but {{type}} is absent from both mqtt_event_topic ('{mqtt_event_topic}') and mqtt_payload_template ('{payload_tpl}'). State recovery on reconnect works, but live subscribers can't separate active/passive deltas from the retained state snapshot — all three collide on one topic. Add {{type}} to either template to let consumers filter."
+            );
+        }
+        let effective_retain = cli.mqtt_retain();
+
+        // The seed phase parses broker-retained snapshots into the cache.
+        // Default `{value}` is handled directly; any other template is run
+        // through the JSON-tree reverse parser in [`crate::payload`]
+        // (sentinel + parallel walk), which works for any JSON-shaped
+        // template. Only text-style templates (e.g. `v={value};ts={timestamp}`)
+        // remain unparseable — those disable seed entirely and the bridge
+        // will overwrite broker retained on first publish per device.
+        let seed_supported = effective_retain
+            && match cli.mqtt_payload_template.as_deref() {
+                None | Some("{value}") => true,
+                Some(tpl) => crate::payload::validate_payload_template(tpl).is_ok(),
+            };
+        if effective_retain
+            && !seed_supported
+            && let Some(tpl) = cli.mqtt_payload_template.as_deref()
+            && let Err(why) = crate::payload::validate_payload_template(tpl)
+        {
+            warn!(
+                "Seed phase disabled: {why}. The bridge will overwrite broker retained on first publish per device."
+            );
+        }
+
+        let root_topic_str = cli
+            .mqtt_root_topic
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_MQTT_ROOT_TOPIC.to_string());
+
+        let (seed_state_wildcard, seed_state_regex) = if seed_supported {
+            let tpl = mqtt_event_topic.replace("{type}", "state");
+            let wildcard = tpl_to_wildcard(&tpl, &root_topic_str);
+            let regex = compile_topic_regex(&tpl);
+            (Some(wildcard), regex)
+        } else {
+            (None, None)
+        };
+
+        Self {
+            root_topic: root_topic_str,
+            event_topic: mqtt_event_topic,
+            retain: effective_retain,
+            message_topic: cli.mqtt_message_topic.clone(),
+            payload_template: cli.mqtt_payload_template.clone(),
+            scanner_topic: cli.mqtt_scanner_topic.clone(),
+            event_identifiers,
+            seed_state_wildcard,
+            seed_state_regex,
+        }
+    }
 }
 
 /// The seed phase (cache mode only). After the first `ConnAck` the bridge subscribes
@@ -129,6 +337,407 @@ fn parse_commands(
 }
 
 impl BridgeContext {
+    /// Sends an event to the broker. Rendering happens here on the sender's task,
+    /// so the loop only moves finished messages.
+    pub(crate) async fn send_over_mqtt(&self, event: &Outbound) {
+        if self.mqtt_tx.is_none() {
+            return;
+        }
+        for msg in self.render(event) {
+            self.try_send_mqtt(Some(msg)).await;
+        }
+    }
+
+    /// The messages an event becomes under the configured templates.
+    fn render(&self, event: &Outbound) -> Vec<MqttMessage> {
+        match event {
+            Outbound::DeviceDelta {
+                id,
+                name,
+                cid,
+                dps,
+                kind,
+            } => {
+                let event_type = match kind {
+                    DeltaKind::Active => "active",
+                    DeltaKind::Passive => "passive",
+                };
+                self.render_event(id, name.as_deref(), cid.as_deref(), dps, event_type, false)
+            }
+            Outbound::DeviceState {
+                id,
+                name,
+                cid,
+                dps,
+                changed,
+            } => self.render_state(id, name.as_deref(), cid.as_deref(), dps, changed.as_deref()),
+            Outbound::DeviceStatus {
+                id,
+                name,
+                cid,
+                payload,
+            } => vec![self.render_message(
+                id,
+                name.as_deref(),
+                cid.as_deref(),
+                "error",
+                payload.clone(),
+                self.mqtt.retain,
+            )],
+            Outbound::Response { response, name } => {
+                self.render_response(response, name.as_deref())
+            }
+            Outbound::ScanResult(payload) => vec![self.render_scan(payload)],
+            Outbound::BridgeInfo => vec![MqttMessage {
+                topic: crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt.root_topic),
+                payload: Self::build_bridge_config_payload(&self.cli),
+                retain: true,
+            }],
+        }
+    }
+
+    fn render_event(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        cid: Option<&str>,
+        dps: &Value,
+        event_type: &str,
+        retain: bool,
+    ) -> Vec<MqttMessage> {
+        self.generate_device_templates(id, name, cid, dps, event_type)
+            .into_iter()
+            .map(|(topic, payload)| MqttMessage {
+                topic,
+                payload,
+                retain,
+            })
+            .collect()
+    }
+
+    /// A device's snapshot on the `{type}=state` topic. With one topic per DP,
+    /// `changed` narrows it so an event that changed DP 1 doesn't republish a
+    /// still-current DP 2's retained. With one topic per device the filter means
+    /// nothing: a single message always carries the full snapshot.
+    ///
+    /// Applies the identifier-set retain gate: if the template references
+    /// `{name}`/`{cid}` and this device lacks them, retain is stripped so the
+    /// scavenger can still reach the message later.
+    fn render_state(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        cid: Option<&str>,
+        dps: &Value,
+        changed: Option<&[String]>,
+    ) -> Vec<MqttMessage> {
+        let tpl = &self.mqtt.event_topic;
+        let one_topic_per_dp = tpl.contains("{dp}") || tpl.contains("{value}");
+        let narrowed = match (one_topic_per_dp, changed, dps.as_object()) {
+            (true, Some(keys), Some(all)) => {
+                let filtered: serde_json::Map<String, Value> = keys
+                    .iter()
+                    .filter_map(|k| all.get(k).map(|v| (k.clone(), v.clone())))
+                    .collect();
+                if filtered.is_empty() {
+                    return Vec::new();
+                }
+                Some(Value::Object(filtered))
+            }
+            _ => None,
+        };
+
+        let retain = self.mqtt.event_identifiers.satisfied_by(name, cid);
+        if !retain {
+            debug!(
+                "Stripping retain for snapshot from '{id}': no template identifier resolvable (name={name:?}, cid={cid:?})"
+            );
+        }
+        self.render_event(
+            id,
+            name,
+            cid,
+            narrowed.as_ref().unwrap_or(dps),
+            "state",
+            retain,
+        )
+    }
+
+    /// A response goes out on the message topic, under the device's name when that
+    /// topic uses one. The name then also joins the payload; without it the payload
+    /// stays as it was.
+    fn render_response(&self, response: &ApiResponse, name: Option<&str>) -> Vec<MqttMessage> {
+        let level = match response.status {
+            crate::types::Status::Ok => "response",
+            crate::types::Status::Error => "error",
+        };
+        let id = response.id.as_deref().unwrap_or("bridge");
+        let name = if id == "bridge" {
+            Some("bridge")
+        } else if self
+            .mqtt
+            .message_topic
+            .as_deref()
+            .is_some_and(|topic| topic.contains("{name}"))
+        {
+            name
+        } else {
+            None
+        };
+        match serde_json::to_value(response) {
+            Ok(payload) => vec![self.render_message(id, name, None, level, payload, false)],
+            Err(e) => {
+                error!("Failed to serialize ApiResponse: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// A message on the message topic for a specific device.
+    fn render_message(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        cid: Option<&str>,
+        level: &str,
+        mut payload: Value,
+        retain: bool,
+    ) -> MqttMessage {
+        {
+            let topic = self.replace_vars(
+                self.mqtt.message_topic.as_deref().unwrap_or_default(),
+                &TopicVars {
+                    id,
+                    name,
+                    cid,
+                    level: Some(level),
+                    ..Default::default()
+                },
+            );
+
+            // Force the payload into an object so we can always inject `id` —
+            // the scavenger's payload-fallback match (`"<id>"`) relies on this
+            // and is the reason `message_topic` doesn't need its own
+            // `IdentifierSet` retain gate (unlike `event_topic`, which is
+            // gated in `publish_device_event`).
+            if !payload.is_object() {
+                let inner = std::mem::replace(&mut payload, Value::Object(serde_json::Map::new()));
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("payload".to_string(), inner);
+                }
+            }
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("id".to_string(), id.into());
+                if let Some(n) = name {
+                    obj.insert("name".to_string(), n.into());
+                }
+                if let Some(c) = cid {
+                    obj.insert("cid".to_string(), c.into());
+                }
+            }
+            MqttMessage {
+                topic,
+                payload: payload.to_string(),
+                retain,
+            }
+        }
+    }
+
+    fn render_scan(&self, payload: &Value) -> MqttMessage {
+        let topic = self.mqtt.scanner_topic.as_deref().map_or_else(
+            || {
+                self.replace_vars(
+                    self.mqtt.message_topic.as_deref().unwrap_or_default(),
+                    &TopicVars {
+                        id: "bridge",
+                        name: Some("bridge"),
+                        level: Some("scanner"),
+                        ..Default::default()
+                    },
+                )
+            },
+            |topic| {
+                self.replace_vars(
+                    topic,
+                    &TopicVars {
+                        id: "bridge",
+                        name: Some("bridge"),
+                        ..Default::default()
+                    },
+                )
+            },
+        );
+        MqttMessage {
+            topic,
+            payload: payload.to_string(),
+            retain: false,
+        }
+    }
+
+    /// Generates MQTT topics and payloads based on templates
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "MQTT topic template uses literal `{dp}`/`{value}` placeholders, not format args"
+    )]
+    pub(crate) fn generate_device_templates(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        cid: Option<&str>,
+        dps: &Value,
+        event_type: &str,
+    ) -> Vec<(String, String)> {
+        let dps_str = dps.to_string();
+
+        let replace_vars_local = |s: &str, dp: Option<&str>, val: Option<&Value>| {
+            self.replace_vars(
+                s,
+                &TopicVars {
+                    id,
+                    name,
+                    cid,
+                    event_type: Some(event_type),
+                    dp,
+                    val,
+                    dps_str: Some(&dps_str),
+                    ..Default::default()
+                },
+            )
+        };
+
+        let mut templates = Vec::new();
+        let tpl = &self.mqtt.event_topic;
+
+        if tpl.contains("{dp}") || tpl.contains("{value}") {
+            if let Some(dps_obj) = dps.as_object() {
+                for (dp, val) in dps_obj {
+                    let topic = replace_vars_local(tpl, Some(dp), Some(val));
+                    let p_tpl = self.mqtt.payload_template.as_deref().unwrap_or("{value}");
+                    let payload = replace_vars_local(p_tpl, Some(dp), Some(val));
+                    templates.push((topic, payload));
+                }
+            }
+        } else {
+            let topic = replace_vars_local(tpl, None, None);
+            let p_tpl = self.mqtt.payload_template.as_deref().unwrap_or("{value}");
+            let payload = replace_vars_local(p_tpl, None, None);
+            templates.push((topic, payload));
+        }
+
+        templates
+    }
+
+    /// Helper to replace template variables in a string
+    pub(crate) fn replace_vars(&self, template: &str, vars: &TopicVars<'_>) -> String {
+        use std::fmt::Write;
+
+        render_template(template, |key, out| match key {
+            "root" => {
+                out.push_str(&self.mqtt.root_topic);
+                true
+            }
+            "id" => {
+                out.push_str(vars.id);
+                true
+            }
+            "name" => {
+                out.push_str(vars.name.unwrap_or(""));
+                true
+            }
+            "cid" => {
+                out.push_str(vars.cid.unwrap_or(""));
+                true
+            }
+            "level" => {
+                out.push_str(vars.level.unwrap_or(""));
+                true
+            }
+            "type" => {
+                out.push_str(vars.event_type.unwrap_or(""));
+                true
+            }
+            "action" => {
+                out.push_str(vars.action.unwrap_or(""));
+                true
+            }
+            "dp" => {
+                out.push_str(vars.dp.unwrap_or(""));
+                true
+            }
+            "value" => {
+                if let Some(val) = vars.val {
+                    let _ = write!(out, "{val}");
+                } else if let Some(dps_str) = vars.dps_str {
+                    out.push_str(dps_str);
+                }
+                true
+            }
+            "dps" => {
+                out.push_str(vars.dps_str.unwrap_or(""));
+                true
+            }
+            "timestamp" => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let _ = write!(out, "{ts}");
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// Match an incoming topic against the seed wildcard regex and return
+    /// `(id, optional_dp)`. Returns `None` if not in cache-mode seed-enabled mode or
+    /// the topic doesn't match.
+    pub(crate) fn match_seed_topic(&self, topic: &str) -> Option<(String, Option<String>)> {
+        let regex = self.mqtt.seed_state_regex.as_ref()?;
+        let captures = regex.captures(topic)?;
+        let id = captures.name("id")?.as_str().to_string();
+        let dp = captures.name("dp").map(|m| m.as_str().to_string());
+        Some((id, dp))
+    }
+
+    /// Serializes the running config for the `{root}/bridge/config` topic,
+    /// injecting the bridge `version` (a build constant, not a `Cli` field, so
+    /// it never round-trips through the config file) and `devices_updated_at`
+    /// (last time the device registry changed — see `spawn_state_saver`, which
+    /// republishes this payload on the same debounce that flushes a registry
+    /// mutation to disk). Credentials are stripped by
+    /// `#[serde(skip_serializing)]` on the `Cli` fields themselves.
+    pub(crate) fn build_bridge_config_payload(cli: &crate::config::Cli) -> String {
+        let mut v =
+            serde_json::to_value(cli).unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "version".to_string(),
+                Value::String(env!("CARGO_PKG_VERSION").to_string()),
+            );
+            obj.insert(
+                "devices_updated_at".to_string(),
+                Value::from(u64::try_from(unix_millis()).unwrap_or(u64::MAX)),
+            );
+        }
+        serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub(crate) async fn try_send_mqtt(&self, msg: Option<MqttMessage>) {
+        if let Some(tx) = &self.mqtt_tx {
+            match tokio::time::timeout(MQTT_SEND_TIMEOUT, tx.send(msg)).await {
+                Ok(Ok(())) => {}
+                result => {
+                    let n = self.mqtt_drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Under overload this runs for every message; logging each one
+                    // would add to the load, and through Python would wait on the GIL.
+                    if n == 1 || n.is_multiple_of(DROP_LOG_INTERVAL) {
+                        error!("MQTT message not delivered ({result:?}; cumulative drops: {n})");
+                    }
+                }
+            }
+        }
+    }
+
     /// Starts MQTT task for command processing and event publishing.
     ///
     /// Returns `Ok(None)` if no broker is configured.
@@ -150,12 +759,12 @@ impl BridgeContext {
         let mqtt_options = self.create_mqtt_options(broker_url, &client_id, cli, true)?;
 
         let (client, mut eventloop) = rumqttc::AsyncClient::new(mqtt_options, 100);
-        let sub_topic = tpl_to_wildcard(&mqtt_command_topic, &self.mqtt_root_topic);
+        let sub_topic = tpl_to_wildcard(&mqtt_command_topic, &self.mqtt.root_topic);
         let command_topic_re = compile_topic_regex(&mqtt_command_topic);
         let config_topic =
-            crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
+            crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt.root_topic);
 
-        let seed_wildcard = self.seed_state_wildcard.clone();
+        let seed_wildcard = self.mqtt.seed_state_wildcard.clone();
 
         // How long after a reconnect to watch for another instance's sentinel
         // before restoring ours. Same window `check_existing_instance` observes.
@@ -372,7 +981,7 @@ impl BridgeContext {
     /// Returns whether it held any DPS.
     fn seed_cache(&self, id: &str, dp: Option<&str>, payload: &str) -> bool {
         let dps =
-            crate::payload::parse_seed_dps(payload, dp, self.mqtt_payload_template.as_deref());
+            crate::payload::parse_seed_dps(payload, dp, self.mqtt.payload_template.as_deref());
         match (dps, &self.cache) {
             (Some(dps), Some(cache)) => {
                 cache.fill_missing(id, &dps);
@@ -495,7 +1104,8 @@ impl BridgeContext {
     /// "response"), so subscribe == publish for any template.
     pub(crate) fn probe_response_topic(&self) -> String {
         self.replace_vars(
-            self.mqtt_message_topic
+            self.mqtt
+                .message_topic
                 .as_deref()
                 .unwrap_or(crate::config::DEFAULT_MQTT_MESSAGE_TOPIC),
             &TopicVars {
@@ -534,7 +1144,7 @@ impl BridgeContext {
         let opts = self.create_mqtt_options(broker_url, &client_id, &self.cli, false)?;
         let (client, mut eventloop) = rumqttc::AsyncClient::new(opts, 10);
         let config_topic =
-            crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic);
+            crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt.root_topic);
         client
             .subscribe(&config_topic, rumqttc::QoS::AtLeastOnce)
             .await?;
@@ -658,7 +1268,7 @@ impl BridgeContext {
         if with_lwt {
             // Set Last Will and Testament (LWT) to clear the config on abnormal termination
             opts.set_last_will(rumqttc::LastWill {
-                topic: crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt_root_topic),
+                topic: crate::config::BRIDGE_CONFIG_TOPIC.replace("{root}", &self.mqtt.root_topic),
                 message: bytes::Bytes::from(""),
                 qos: rumqttc::QoS::AtLeastOnce,
                 retain: true,
@@ -750,11 +1360,11 @@ impl BridgeContext {
         // Determine wildcard subscriptions based on templates
         let mut subs = HashSet::new();
         let templates = vec![
-            self.mqtt_event_topic.clone(),
-            self.mqtt_message_topic.clone().unwrap_or_default(),
+            self.mqtt.event_topic.clone(),
+            self.mqtt.message_topic.clone().unwrap_or_default(),
         ];
 
-        let root_topic = self.mqtt_root_topic.clone();
+        let root_topic = self.mqtt.root_topic.clone();
 
         for tpl in &templates {
             if tpl.is_empty() {
@@ -965,11 +1575,11 @@ impl BridgeContext {
             }
         };
 
-        let root_topic = self.mqtt_root_topic.clone();
+        let root_topic = self.mqtt.root_topic.clone();
         let mut subs = HashSet::new();
         for tpl in [
-            Some(self.mqtt_event_topic.as_str()),
-            self.mqtt_message_topic.as_deref(),
+            Some(self.mqtt.event_topic.as_str()),
+            self.mqtt.message_topic.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -1037,6 +1647,60 @@ impl BridgeContext {
 mod tests {
     use super::*;
 
+    #[test]
+    fn identifier_set_detects_each_placeholder() {
+        let s = IdentifierSet::from_templates(["{root}/event/{id}"]);
+        assert!(s.id && !s.name && !s.cid);
+
+        let s = IdentifierSet::from_templates(["{root}/event/{name}"]);
+        assert!(!s.id && s.name && !s.cid);
+
+        let s = IdentifierSet::from_templates(["{root}/event/{cid}"]);
+        assert!(!s.id && !s.name && s.cid);
+    }
+
+    #[test]
+    fn identifier_set_unions_across_multiple_templates() {
+        let s = IdentifierSet::from_templates(["{root}/event/{name}", r#"{"id":"{id}"}"#]);
+        assert!(s.id && s.name && !s.cid);
+    }
+
+    #[test]
+    fn identifier_set_is_empty_when_no_identifier_referenced() {
+        let s = IdentifierSet::from_templates(["{root}/event", "{value}"]);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn identifier_set_satisfied_by_id_always() {
+        let s = IdentifierSet {
+            id: true,
+            ..Default::default()
+        };
+        assert!(s.satisfied_by(None, None));
+        assert!(s.satisfied_by(Some(""), None));
+    }
+
+    #[test]
+    fn identifier_set_satisfied_by_name_requires_nonempty() {
+        let s = IdentifierSet {
+            name: true,
+            ..Default::default()
+        };
+        assert!(!s.satisfied_by(None, None));
+        assert!(!s.satisfied_by(Some(""), None));
+        assert!(s.satisfied_by(Some("kitchen"), None));
+    }
+
+    #[test]
+    fn identifier_set_satisfied_by_cid_requires_nonempty() {
+        let s = IdentifierSet {
+            cid: true,
+            ..Default::default()
+        };
+        assert!(!s.satisfied_by(None, None));
+        assert!(s.satisfied_by(None, Some("sub-1")));
+    }
     #[test]
     fn foreign_session_ignores_our_own_and_anything_without_one() {
         assert_eq!(

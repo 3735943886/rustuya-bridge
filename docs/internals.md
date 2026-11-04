@@ -293,7 +293,7 @@ site passes its own `TopicVars` struct, and unknown keys simply pass through.
 
 Three derived operations use this:
 
-- [replace_vars](../src/bridge.rs) — actual substitution for publish.
+- [replace_vars](../src/transport/mqtt.rs) — actual substitution for publish.
 - [tpl_to_wildcard](../src/bridge.rs) — replaces every known key with
   `+` for MQTT SUBSCRIBE.
 - [compile_topic_regex](../src/bridge.rs) — turns the template into
@@ -354,7 +354,7 @@ extraction.
 
 **Outbound event** — device reports DPs `{"1": true, "2": 50}`:
 
-1. `mqtt_event_topic` contains `{dp}` → [single-DP mode](../src/bridge.rs).
+1. `mqtt_event_topic` contains `{dp}` → [single-DP mode](../src/transport/mqtt.rs).
    The bridge iterates the DPS object and emits one message per key.
 2. For DP `1`:
    - Topic: `rustuya/event/active/ebabc.../1`
@@ -440,7 +440,7 @@ active/passive split maps onto two different kinds of DP semantics:
 
 ### 3.4 Single-DP vs multi-DP mode — the trap
 
-The branch [generate_device_templates](../src/bridge.rs) decides
+The branch [generate_device_templates](../src/transport/mqtt.rs) decides
 single vs multi-DP solely from the **event topic template**:
 
 ```rust
@@ -463,7 +463,7 @@ In multi-DP mode the `{value}` placeholder doubles as "the entire DPS object"
 
 ### 3.5 Payload variable reference
 
-The full set of placeholders resolved by [replace_vars](../src/bridge.rs).
+The full set of placeholders resolved by [replace_vars](../src/transport/mqtt.rs).
 Every known placeholder is **always consumed** — if the value isn't in
 scope for the current call site, it renders as an empty string. This is
 deliberate: it prevents literal `{foo}` substrings from leaking into
@@ -592,7 +592,7 @@ user opted in explicitly, and a fleet with no event automations doesn't care
 
 ### 4.4 The retain gate (`IdentifierSet`)
 
-[IdentifierSet::satisfied_by](../src/bridge.rs) decides, **per snapshot
+[IdentifierSet::satisfied_by](../src/transport/mqtt.rs) decides, **per snapshot
 publish**, whether `retain=true` is safe. The gate exists so that every
 retained message the bridge leaves on the broker can later be *located and
 cleared* by the scavenger (§4.7) — a retained message whose topic carries no
@@ -600,7 +600,7 @@ resolvable identifier would orphan forever.
 
 **What the gate reads.** At startup it scans **both** the event topic *and*
 the payload template (their union) for `{id}`/`{name}`/`{cid}` →
-`event_identifiers` ([from_templates](../src/bridge.rs)). So "has `{id}`"
+`event_identifiers` ([from_templates](../src/transport/mqtt.rs)). So "has `{id}`"
 means *either* template references it — not the topic alone.
 
 ```rust
@@ -633,7 +633,7 @@ the event topic **or** the payload template.
 | --- | --- | --- | --- | --- |
 | **① `{id}`** (± name/cid) | no | yes | **always retained** — every device, regardless of name/cid | none |
 | **② no `{id}`, but `{name}` and/or `{cid}`** | no | yes | **per-device**: retained iff this device has a non-empty value for a referenced identifier; otherwise retain stripped | stripped devices log one `debug` line per snapshot ([publish_snapshot](../src/bridge.rs)) |
-| **③ no identifier at all** (`is_empty`) | **yes, once at startup** ([BridgeContext::new](../src/bridge.rs)) | yes | **never retained** — `satisfied_by` is `false` for all devices, so every snapshot is `retain=false` | every device logs one `debug` strip line per snapshot |
+| **③ no identifier at all** (`is_empty`) | **yes, once at startup** ([MqttLayout::from_cli](../src/transport/mqtt.rs)) | yes | **never retained** — `satisfied_by` is `false` for all devices, so every snapshot is `retain=false` | every device logs one `debug` strip line per snapshot |
 
 Case ① — `self.id == true` short-circuits `satisfied_by` to `true`
 unconditionally, so a nameless device or a direct (no-cid) device still
@@ -669,7 +669,7 @@ share a cid.
 
 Independent of the identifier gate, if `mqtt_retain=true` and `{type}` is
 absent from **both** the event topic and payload template, the bridge emits a
-**second** one-time startup warning ([BridgeContext::new](../src/bridge.rs)):
+**second** one-time startup warning ([MqttLayout::from_cli](../src/transport/mqtt.rs)):
 active/passive/state then collide on one topic and live subscribers can't
 tell deltas from the retained snapshot. This warning changes nothing about
 retain or publishing — it's purely advisory. The two startup warnings are
@@ -771,7 +771,7 @@ Subtleties:
   new-target arrival and deadline expiry cannot race — the new targets
   always win and the deadline gets extended.
 - The payload search for `"<id>"` is a quoted substring match.
-  `publish_device_message` always wraps non-object payloads into an object
+  `render_message` always wraps non-object payloads into an object
   before injecting `"id": "..."`, so it finds those messages regardless of
   caller-provided payload shape.
 
@@ -1741,10 +1741,10 @@ binary (no shutdown-observation coupling at all).
 | If you're investigating...               | Start at                                       |
 | ---------------------------------------- | ---------------------------------------------- |
 | Why an add changed something else        | [add_device](../src/bridge.rs)      |
-| Why a retain didn't fire                 | [IdentifierSet](../src/bridge.rs)       |
+| Why a retain didn't fire                 | [IdentifierSet](../src/transport/mqtt.rs)       |
 | Why a retained message isn't clearing    | [spawn_retain_scavenger](../src/transport/mqtt.rs) |
 | How to apply a template/retain change     | [reconfigure](../src/bridge.rs), [purge_all_retained](../src/transport/mqtt.rs) (§4.11) |
-| Why a topic substitution is wrong        | [render_template](../src/template.rs), [replace_vars](../src/bridge.rs) |
+| Why a topic substitution is wrong        | [render_template](../src/template.rs), [replace_vars](../src/transport/mqtt.rs) |
 | Why a command isn't matching             | [parse_mqtt_payload](../src/payload.rs), [compile_topic_regex](../src/template.rs) |
 | Why a sub-device command goes nowhere    | [get_connected_device](../src/bridge.rs), [resolve_cid](../src/bridge.rs) |
 | Why the listener seems wedged            | [spawn_device_listener](../src/bridge.rs) |

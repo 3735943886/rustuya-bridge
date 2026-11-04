@@ -170,7 +170,7 @@ impl BridgeServer {
         self.background_handles.push(h1);
         self.background_handles.push(h2);
         self.mqtt_handle = h3;
-        ctx.publish_bridge_config(Some(&self.cli), false).await;
+        ctx.emit(crate::outbound::Outbound::BridgeInfo).await;
         Ok(ctx)
     }
 

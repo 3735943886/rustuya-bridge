@@ -4,6 +4,7 @@ pub mod devices;
 pub mod dps_cache;
 pub mod error;
 pub mod handlers;
+pub mod outbound;
 pub mod payload;
 pub mod server;
 pub mod template;
