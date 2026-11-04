@@ -597,10 +597,6 @@ impl BridgeContext {
         })
     }
 
-    /// Processes one device event: parses payload, branches on error vs DPS,
-    /// updates per-device error state, and dispatches to the appropriate
-    /// `publish_*` method. Extracted from the listener loop to keep the
-    /// `tokio::select!` driver shallow.
     /// Hands an event to the transport.
     pub(crate) async fn emit(&self, event: Outbound) {
         self.send_over_mqtt(&event).await;
@@ -691,6 +687,10 @@ impl BridgeContext {
         }
     }
 
+    /// Processes one device event: parses payload, branches on error vs DPS,
+    /// updates per-device error state, and dispatches to the appropriate
+    /// `publish_*` method. Extracted from the listener loop to keep the
+    /// `tokio::select!` driver shallow.
     async fn handle_device_event(&self, device_id: &str, payload_str: String) {
         trace!("Raw event from {device_id}: {payload_str}");
         let payload: Value = serde_json::from_str(&payload_str)
