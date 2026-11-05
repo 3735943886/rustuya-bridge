@@ -258,9 +258,19 @@ impl PyBridgeServer {
         if let Some(dict) = kwargs {
             // Maps a Python kwarg name onto a `Cli` field. Adding a new field
             // means appending one line here — kwarg presence/extract/assignment
-            // patterns are uniform.
+            // patterns are uniform. An unknown name is an error: ignored, a
+            // misspelled option looks accepted and takes no effect.
             macro_rules! map_kwargs {
                 ($($py_key:literal => $field:ident),* $(,)?) => {
+                    const KNOWN: &[&str] = &[$($py_key),*];
+                    for (key, _) in dict.iter() {
+                        let key: String = key.extract()?;
+                        if !KNOWN.contains(&key.as_str()) {
+                            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                                "PyBridgeServer got an unexpected keyword argument '{key}'"
+                            )));
+                        }
+                    }
                     $(
                         if let Ok(Some(val)) = dict.get_item($py_key) {
                             cli.$field = val.extract()?;
