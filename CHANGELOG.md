@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking (Python):** `PyBridgeServer` raises `TypeError` for a keyword argument
+  it doesn't know. It used to ignore one silently, so a misspelled option such as
+  `mqtt_username` for `mqtt_user` looked accepted and took no effect. Code passing an
+  unknown keyword now fails at construction; correct the name or drop it.
+
 ## [0.4.5] — 2026-11-04
 
 ### Fixed
