@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-11-15
+
 ### Added
 - A device's `905` message carries a `reason` — `not_located`, `refused`,
   `unreachable`, `dial_timeout`, `handshake_timeout`, `silent`, `closed`,
