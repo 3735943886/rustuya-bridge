@@ -116,7 +116,8 @@ spot it.
 | Direct, connected, success not yet handled by listener | `"online"` |
 | Direct, connected, last reported `errorCode 0`          | `"0"` — success/connected, **same as online** |
 | Direct, first attempt still pending                    | `"offline"` |
-| Direct, disconnected                                  | `"905"`, or `"914"` when that is the last reported error |
+| Direct, connected or disconnected, key rejected       | `"914"` (see the rule below the code table) |
+| Direct, disconnected                                  | `"905"` |
 | Direct, no driver instance                            | `"offline"` |
 
 `"invalid subdevice"` can only appear if you hand-edit the state file or
@@ -134,6 +135,27 @@ unaffected. The bridge publishes three of them, from
 | 905  | Network Error: Device Unreachable       | the first attempt fails or the link goes down |
 | 914  | Check device key or version             | the device rejects our credentials      |
 
+`905` carries a `reason`, from the driver's `Device::watch_failure()`: `not_located`
+(no IP or protocol version known, and none heard on the LAN), `refused`,
+`unreachable`, `dial_timeout`, `handshake_timeout`, `silent` (an established link
+stopped answering), `closed` (the device or network closed it) or `protocol`; a
+dial that failed another way is `dial_failed` with the OS error as `detail`.
+`914` carries the driver's error as `detail`. `errorCode` and `errorMsg` are
+unchanged, so consumers that only read those are unaffected:
+
+```
+rustuya/error/<id>  {"errorCode":905,"errorMsg":"Network Error: Device Unreachable","reason":"refused","id":"<id>"}
+rustuya/error/<id>  {"errorCode":914,"errorMsg":"Check device key or version","detail":"HMAC-SHA256 mismatch","id":"<id>"}
+```
+
+The code is computed from the connection state, the auth error and the failure
+reason together (`link_event` in [devices.rs](../src/devices.rs)), and published
+only when the result changes — so the order the driver's watches fire in does not
+decide it. A rejected key is `914` while the link is up (v3.1–v3.3 have no
+handshake, so a TCP connect is "up") or torn down over it, and stays `914` across
+reconnects until a connection proves the key. Once the device cannot be reached at
+all (`not_located`, the dial failed or timed out) it is `905` again.
+
 The source changed in 0.4 and the values did not. 0.3 pushed these through the
 device event stream as synthetic frames; 0.4 keeps connection state off the frame
 stream entirely and exposes it as watches, so the bridge synthesises the same
@@ -146,10 +168,10 @@ rejects us.
 
 `last_error_code` is **stored in memory only** — `#[serde(skip)]` in
 `DeviceConfig` ([config.rs](../src/config.rs), field `last_error_code`) means
-it is not persisted to the state file. Current driver state is also checked:
-a pending connection reports `"offline"` and a failed connection reports `"905"`
-(or the last reported authentication error `"914"`), even before the listener
-handles the connection change.
+it is not persisted to the state file. The `status` action reads the driver's
+current state the same way the listener does (`link_event`): a pending
+connection reports `"offline"`, and a failed or rejected one `"905"` or `"914"`,
+even before the listener handles the change.
 
 ---
 
@@ -164,25 +186,24 @@ handshake, backoff, heartbeat, idle-liveness — lives in the sans-I/O core. The
 task is spawned by `DeviceBuilder::connect()` and lives until its last `Device`
 handle is dropped.
 
-The bridge fans all of them into **one loop**, built from three keyed stream
+The bridge fans all of them into **one loop**, built from two keyed stream
 maps in [spawn_device_listener](../src/bridge.rs):
 
 | Map      | Carries                                    | Becomes                                    |
 | -------- | ------------------------------------------ | ------------------------------------------ |
 | `frames` | device pushes and command replies          | a device event (§3.3)                      |
-| `conns`  | connection state (`watch_connection_state`)       | a synthetic `errorCode` message (§1.4)     |
-| `auths`  | auth failures (`watch_error`)              | an `errorCode 914` message                 |
+| `links`  | a change of `watch_connection_state`, `watch_error` or `watch_failure` | a synthetic `errorCode` message (§1.4), read from all three |
 
 The split is 0.4's doing and it is the right one: connection state is *state*,
 not an event, so it lives on a `watch` rather than in the frame stream. The
 bridge re-joins the two for MQTT, synthesising the same `errorCode` payloads 0.3
 published inline so nothing downstream had to change.
 
-Connection and authentication watches replay their current value on subscription,
-so a failure before the listener attaches is still visible. The connection watch
-uses `ConnectionState`: `Pending` produces no message, the first failed attempt
-produces `905`, and success produces `0`. Repeated disconnected retries do not
-produce repeated offline messages.
+The watches replay their current value on subscription, so a failure before the
+listener attaches is still visible. `Pending` produces no message, the first
+failed attempt produces `905` (with its `reason`), and success produces `0`. A
+message is published only when the computed one changes, so repeated retries
+failing the same way do not repeat it, and a new reason does.
 
 ### 2.2 Deltas, not rebuilds
 

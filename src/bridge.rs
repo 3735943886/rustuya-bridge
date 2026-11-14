@@ -1,10 +1,12 @@
 use anyhow::Result;
 use futures_util::StreamExt;
+use futures_util::stream::{self, Stream};
 use log::{debug, error, info, trace, warn};
-use rustuya::tokio::{ConnectionState, CoreError, Device, Event, Listener};
+use rustuya::tokio::{Device, Event, Listener};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -13,7 +15,7 @@ use tokio_stream::StreamMap;
 use tokio_stream::wrappers::WatchStream;
 
 use crate::config::{Cli, DeviceConfig, load_state};
-use crate::devices::{Fleet, code, connection_event};
+use crate::devices::{Fleet, code, link_event};
 use crate::dps_cache::DpsCache;
 use crate::error::BridgeError;
 use crate::outbound::{DeltaKind, Outbound};
@@ -265,21 +267,62 @@ fn pinned_by_outer_layer(base: &Cli) -> Vec<&'static str> {
     .collect()
 }
 
-/// Subscribes one device's three streams into the listener's maps.
-///
-/// `StreamMap::insert` replaces any existing entry, so re-subscribing an id whose
-/// connection was rebuilt swaps in the new streams and drops the old ones — the
-/// single place instance replacement is handled.
-fn subscribe(
-    frames: &mut StreamMap<String, Listener>,
-    conns: &mut StreamMap<String, WatchStream<ConnectionState>>,
-    auths: &mut StreamMap<String, WatchStream<Option<CoreError>>>,
-    id: String,
-    dev: &Device,
-) {
-    frames.insert(id.clone(), dev.listener());
-    conns.insert(id.clone(), WatchStream::new(dev.watch_connection_state()));
-    auths.insert(id, WatchStream::new(dev.watch_error()));
+/// A wake-up whenever any of a device's link watches changes — its connection
+/// state, auth error or failure reason — and once at the start for their
+/// current values. What changed is read back from the device itself
+/// ([`link_event`]), so the order the three fire in does not matter.
+type LinkChanges = Pin<Box<dyn Stream<Item = ()> + Send>>;
+
+fn link_changes(dev: &Device) -> LinkChanges {
+    let state = WatchStream::new(dev.watch_connection_state()).map(|_| ());
+    let auth = WatchStream::new(dev.watch_error()).map(|_| ());
+    let failure = WatchStream::new(dev.watch_failure()).map(|_| ());
+    Box::pin(stream::select(stream::select(state, auth), failure))
+}
+
+/// The listener's per-device subscriptions: frames, link changes, the device
+/// handle the link state is read back from, and the link event last published.
+#[derive(Default)]
+struct Watched {
+    frames: StreamMap<String, Listener>,
+    links: StreamMap<String, LinkChanges>,
+    devices: HashMap<String, Device>,
+    published: HashMap<String, Value>,
+}
+
+impl Watched {
+    /// `StreamMap::insert` replaces any existing entry, so re-subscribing an id
+    /// whose connection was rebuilt swaps in the new streams and drops the old
+    /// ones — the single place instance replacement is handled. The new
+    /// instance's link state is published afresh.
+    fn subscribe(&mut self, id: String, dev: Device) {
+        self.frames.insert(id.clone(), dev.listener());
+        self.links.insert(id.clone(), link_changes(&dev));
+        self.published.remove(&id);
+        self.devices.insert(id, dev);
+    }
+
+    fn unsubscribe(&mut self, id: &str) {
+        self.frames.remove(id);
+        self.links.remove(id);
+        self.devices.remove(id);
+        self.published.remove(id);
+    }
+
+    /// The device's link event, if it differs from the one last published.
+    fn link_update(&mut self, id: &str) -> Option<Value> {
+        let dev = self.devices.get(id)?;
+        let event = link_event(
+            *dev.watch_connection_state().borrow(),
+            dev.watch_error().borrow().as_ref(),
+            *dev.watch_failure().borrow(),
+        )?;
+        if self.published.get(id) == Some(&event) {
+            return None;
+        }
+        self.published.insert(id.to_string(), event.clone());
+        Some(event)
+    }
 }
 
 impl BridgeContext {
@@ -479,10 +522,11 @@ impl BridgeContext {
     /// the whole fleet whenever any one device changed):
     ///
     /// * `frames` — device pushes and command replies, the actual device data.
-    /// * `conns` — connection state. rustuya 0.4 keeps this **off** the frame
-    ///   stream (it is state, not an event), so the bridge synthesises the
-    ///   `errorCode` messages 0.3 published inline. See [`connection_event`].
-    /// * `auths` — authentication failures, i.e. a wrong local key or version.
+    /// * `links` — the link: connection state, auth failure (a wrong local key or
+    ///   version) and why it is down. rustuya 0.4 keeps these **off** the frame
+    ///   stream (they are state, not events), so the bridge synthesises the
+    ///   `errorCode` messages 0.3 published inline, from all three at once
+    ///   ([`link_event`]) and only when the result changes.
     ///
     /// Replay current watch values so a failure before subscription is retained.
     /// `Pending` is ignored: a newly spawned actor is not a failed connection.
@@ -492,9 +536,7 @@ impl BridgeContext {
         cancel: tokio_util::sync::CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut frames: StreamMap<String, Listener> = StreamMap::new();
-            let mut conns: StreamMap<String, WatchStream<ConnectionState>> = StreamMap::new();
-            let mut auths: StreamMap<String, WatchStream<Option<CoreError>>> = StreamMap::new();
+            let mut watched = Watched::default();
 
             // Seed from the devices built at startup; every later change arrives
             // as a delta. Safe to do once here — the listener starts before the
@@ -507,23 +549,20 @@ impl BridgeContext {
                     .map(|(id, dev)| (id.clone(), dev.clone()))
                     .collect::<Vec<_>>()
             } {
-                subscribe(&mut frames, &mut conns, &mut auths, id, &dev);
+                watched.subscribe(id, dev);
             }
-            debug!("Device listener watching {} device(s)", frames.len());
+            debug!(
+                "Device listener watching {} device(s)",
+                watched.frames.len()
+            );
 
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => return,
 
                     update = refresh_rx.recv() => match update {
-                        Some(DeviceUpdate::Up(id, dev)) => {
-                            subscribe(&mut frames, &mut conns, &mut auths, id, &dev);
-                        }
-                        Some(DeviceUpdate::Down(id)) => {
-                            frames.remove(&id);
-                            conns.remove(&id);
-                            auths.remove(&id);
-                        }
+                        Some(DeviceUpdate::Up(id, dev)) => watched.subscribe(id, *dev),
+                        Some(DeviceUpdate::Down(id)) => watched.unsubscribe(&id),
                         // Every sender dropped: the context is going away.
                         None => return,
                     },
@@ -531,7 +570,7 @@ impl BridgeContext {
                     // Guarded because an empty `StreamMap` completes immediately
                     // rather than parking — an unguarded arm would spin the loop
                     // whenever no devices are registered.
-                    Some((id, event)) = frames.next(), if !frames.is_empty() => {
+                    Some((id, event)) = watched.frames.next(), if !watched.frames.is_empty() => {
                         match event {
                         Event::Frame(msg) => {
                             // Bare acks carry no payload and say nothing a
@@ -571,27 +610,14 @@ impl BridgeContext {
                         }
                     }},
 
-                    Some((id, connection)) = conns.next(), if !conns.is_empty() => {
-                        let code = match connection {
-                            ConnectionState::Pending => continue,
-                            ConnectionState::Connected => code::SUCCESS,
-                            ConnectionState::Disconnected => code::OFFLINE,
-                        };
-                        self.handle_device_event(&id, connection_event(code).to_string()).await;
-                    }
-
-                    Some((id, err)) = auths.next(), if !auths.is_empty() => {
-                        if let Some(e) = err {
-                            warn!("Device {id} rejected our credentials ({e})");
-                            self.handle_device_event(
-                                &id,
-                                connection_event(code::KEY_OR_VER).to_string(),
-                            )
-                            .await;
+                    Some((id, ())) = watched.links.next(), if !watched.links.is_empty() => {
+                        if let Some(event) = watched.link_update(&id) {
+                            if event["errorCode"] == code::KEY_OR_VER {
+                                warn!("Device {id} rejected our credentials ({})", event["detail"]);
+                            }
+                            self.handle_device_event(&id, event.to_string()).await;
                         }
                     }
-
-
                 }
             }
         })
@@ -1705,20 +1731,22 @@ impl BridgeContext {
                 })
                 .to_string()
         } else if let Some(dev) = instances.get(&cfg.id) {
-            match *dev.watch_connection_state().borrow() {
-                ConnectionState::Pending => "offline".to_string(),
-                ConnectionState::Connected => if cfg.last_error_code == Some(code::SUCCESS) {
-                    "0"
-                } else {
-                    "online"
+            // The same verdict the device listener publishes (`link_event`).
+            let event = link_event(
+                *dev.watch_connection_state().borrow(),
+                dev.watch_error().borrow().as_ref(),
+                *dev.watch_failure().borrow(),
+            );
+            match event {
+                None => "offline".to_string(),
+                // Up, but its `Connection Successful` not published yet.
+                Some(e)
+                    if e["errorCode"] == code::SUCCESS
+                        && cfg.last_error_code != Some(code::SUCCESS) =>
+                {
+                    "online".to_string()
                 }
-                .to_string(),
-                ConnectionState::Disconnected => if cfg.last_error_code == Some(code::KEY_OR_VER) {
-                    code::KEY_OR_VER
-                } else {
-                    code::OFFLINE
-                }
-                .to_string(),
+                Some(e) => e["errorCode"].to_string(),
             }
         } else {
             "offline".to_string()
@@ -2288,7 +2316,7 @@ mod tests {
             let dev = ctx.state.read().await.instances["missing-address"].clone();
             let mut state = dev.watch_connection_state();
             tokio::time::timeout(Duration::from_secs(2), async {
-                while *state.borrow_and_update() != ConnectionState::Disconnected {
+                while *state.borrow_and_update() != rustuya::tokio::ConnectionState::Disconnected {
                     state.changed().await.unwrap();
                 }
             })
@@ -2324,6 +2352,96 @@ mod tests {
             cancel.cancel();
             listener.await.unwrap();
             dev.close().await;
+            ctx.close().await;
+        }
+
+        /// A v3.3 device that rejects our key and hangs up: the auth failure and
+        /// the dropped link arrive on separate watches in either order, and the
+        /// v3.3 reconnect is only TCP. What is published must settle on 914 and
+        /// stay there — not end on "unreachable", nor flap back to "connected".
+        ///
+        /// Linux only: the device must listen on the Tuya port, so on its own
+        /// loopback address (all of 127/8 is local there) to stay clear of others.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_rejected_key_settles_on_914_across_reconnects() {
+            use std::sync::atomic::AtomicUsize;
+            use tokio::io::AsyncWriteExt;
+
+            // A 55AA frame whose CRC is wrong: to the driver, a payload that did
+            // not authenticate.
+            let mut frame = vec![0, 0, 0x55, 0xAA, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 28];
+            frame.extend_from_slice(&[0u8; 20]);
+            frame.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0xAA, 0x55]);
+            let ip = format!("127.0.{}.{}", std::process::id() % 200 + 20, 37);
+            let listener = tokio::net::TcpListener::bind((ip.as_str(), 6668))
+                .await
+                .unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let device = tokio::spawn({
+                let accepted = accepted.clone();
+                async move {
+                    let mut keep = Vec::new();
+                    while let Ok((mut sock, _)) = listener.accept().await {
+                        let _ = sock.write_all(&frame).await;
+                        if accepted.fetch_add(1, Ordering::SeqCst) == 0 {
+                            continue; // the first one: hung up on
+                        }
+                        keep.push(sock);
+                    }
+                }
+            });
+
+            let (ctx, _tmp, mut mqtt_rx, _save_rx, refresh_rx) = make_ctx(|_| {}).await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let listener = ctx
+                .clone()
+                .spawn_device_listener(refresh_rx, cancel.clone());
+            let mut cfg = direct_device("wrongkey", "0123456789abcdef", Some(&ip));
+            cfg.version = Some("3.3".into());
+            ctx.add_device(cfg).await.unwrap();
+
+            let mut codes = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while accepted.load(Ordering::SeqCst) < 2
+                || codes.last() != Some(&u64::from(code::KEY_OR_VER))
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no settled 914 (accepts {}, codes {codes:?})",
+                    accepted.load(Ordering::SeqCst)
+                );
+                if let Ok(Some(Some(msg))) =
+                    tokio::time::timeout(Duration::from_millis(50), mqtt_rx.recv()).await
+                    && msg.topic.ends_with("/error/wrongkey")
+                {
+                    let v: Value = serde_json::from_str(&msg.payload).unwrap();
+                    codes.push(v["errorCode"].as_u64().unwrap());
+                }
+            }
+            // Once rejected, nothing else: the reconnect did not say "connected".
+            let first = codes
+                .iter()
+                .position(|c| *c == u64::from(code::KEY_OR_VER))
+                .unwrap();
+            assert!(
+                codes[first..]
+                    .iter()
+                    .all(|c| *c == u64::from(code::KEY_OR_VER)),
+                "{codes:?}"
+            );
+            while let Ok(Some(Some(msg))) =
+                tokio::time::timeout(Duration::from_millis(200), mqtt_rx.recv()).await
+            {
+                assert!(
+                    !msg.topic.ends_with("/error/wrongkey"),
+                    "settled, then {}",
+                    msg.payload
+                );
+            }
+            cancel.cancel();
+            listener.await.unwrap();
+            device.abort();
             ctx.close().await;
         }
 

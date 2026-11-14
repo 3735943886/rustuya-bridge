@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A device's `905` message carries a `reason` — `not_located`, `refused`,
+  `unreachable`, `dial_timeout`, `handshake_timeout`, `silent`, `closed`,
+  `protocol`, or `dial_failed` with the OS error as `detail` — and `914` carries
+  the driver's error as `detail` (rustuya 0.4.7's `watch_failure`). `errorCode`
+  and `errorMsg` are unchanged.
+
+### Fixed
+- A device that rejects the local key no longer ends up reported as `905`
+  (unreachable): the auth failure and the dropped link arrive on separate
+  watches, and whichever the listener saw last decided the message. The message
+  is now computed from the connection state, auth error and failure reason
+  together, and published when it changes. A v3.1–v3.3 device with a wrong key
+  stays `914` across reconnects instead of flapping through `0`.
+
 ### Changed
 - **Breaking (Python):** `PyBridgeServer` raises `TypeError` for a keyword argument
   it doesn't know. It used to ignore one silently, so a misspelled option such as

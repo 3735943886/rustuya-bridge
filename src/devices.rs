@@ -16,7 +16,9 @@
 //!   process's panic hook or rlimits, so they live here now.
 
 use log::{info, warn};
-use rustuya::tokio::{ConnectLimiter, Device, Discovery, Version};
+use rustuya::tokio::{
+    ConnectLimiter, ConnectionState, CoreError, Device, Discovery, LinkFailure, Version,
+};
 use serde_json::{Value, json};
 
 use crate::config::DeviceConfig;
@@ -65,6 +67,56 @@ pub mod code {
 #[must_use]
 pub fn connection_event(code: u32) -> Value {
     json!({ "errorCode": code, "errorMsg": code::message(code) })
+}
+
+/// The connection event for a device's current link state, auth error and
+/// failure reason — computed from all three together, so the result does not
+/// depend on which of the device's watches the listener happened to see change
+/// last. `None` while no attempt has completed (`Pending`).
+///
+/// * An auth failure (wrong local key or version) is [`code::KEY_OR_VER`], with
+///   the driver's error as `detail` — unless the link is down for a reason that
+///   never reached the device (not located, the dial failed or timed out): then
+///   the device is unreachable now, whatever it said before.
+/// * Otherwise connected is [`code::SUCCESS`], and down is [`code::OFFLINE`] with
+///   the [`LinkFailure`] as `reason` (`refused`, `unreachable`, `dial_timeout`,
+///   `not_located`, `handshake_timeout`, `silent`, `closed`, `protocol`), plus the
+///   OS error as `detail` when the dial failed some other way.
+///
+/// `errorCode` and `errorMsg` stay as 0.3 published them; `reason` and `detail`
+/// are additions.
+#[must_use]
+pub fn link_event(
+    state: ConnectionState,
+    auth: Option<&CoreError>,
+    failure: Option<LinkFailure>,
+) -> Option<Value> {
+    let unreached = matches!(
+        failure,
+        Some(LinkFailure::NotLocated | LinkFailure::Dial(_) | LinkFailure::DialTimeout)
+    );
+    match (state, auth) {
+        (ConnectionState::Pending, _) => None,
+        (ConnectionState::Disconnected, Some(_)) if unreached => Some(offline_event(failure)),
+        (_, Some(e)) => {
+            let mut event = connection_event(code::KEY_OR_VER);
+            event["detail"] = json!(e.to_string());
+            Some(event)
+        }
+        (ConnectionState::Connected, None) => Some(connection_event(code::SUCCESS)),
+        (ConnectionState::Disconnected, None) => Some(offline_event(failure)),
+    }
+}
+
+fn offline_event(failure: Option<LinkFailure>) -> Value {
+    let mut event = connection_event(code::OFFLINE);
+    if let Some(f) = failure {
+        event["reason"] = json!(f.as_str());
+        if f.as_str() == "dial_failed" {
+            event["detail"] = json!(f.to_string());
+        }
+    }
+    event
 }
 
 /// Shared, per-process device machinery: the one [`Discovery`] every device
@@ -266,6 +318,44 @@ mod tests {
     /// The bridge's public status contract: `0` is success/liveness, and the two
     /// failure codes keep tinytuya's numbering so consumers written against 0.3
     /// keep working.
+    #[test]
+    fn a_link_event_reads_all_three_watches_together() {
+        use std::io::ErrorKind;
+        let refused = Some(LinkFailure::Dial(ErrorKind::ConnectionRefused));
+        let auth = CoreError::HmacMismatch;
+        assert_eq!(link_event(ConnectionState::Pending, None, None), None);
+        assert_eq!(
+            link_event(ConnectionState::Connected, None, None).unwrap()["errorCode"],
+            code::SUCCESS
+        );
+        let down = link_event(ConnectionState::Disconnected, None, refused).unwrap();
+        assert_eq!(down["errorCode"], code::OFFLINE);
+        assert_eq!(down["reason"], "refused");
+        assert!(down.get("detail").is_none());
+        // The device rejected us: that is the reason, whether the link is up
+        // (v3.3 has no handshake) or torn down over it ...
+        for (state, failure) in [
+            (ConnectionState::Connected, None),
+            (ConnectionState::Disconnected, Some(LinkFailure::Protocol)),
+            (ConnectionState::Disconnected, Some(LinkFailure::Closed)),
+        ] {
+            let ev = link_event(state, Some(&auth), failure).unwrap();
+            assert_eq!(ev["errorCode"], code::KEY_OR_VER, "{state:?} {failure:?}");
+            assert!(ev["detail"].is_string());
+        }
+        // ... but not once it cannot even be reached.
+        let gone = link_event(ConnectionState::Disconnected, Some(&auth), refused).unwrap();
+        assert_eq!(gone["errorCode"], code::OFFLINE);
+        let other = link_event(
+            ConnectionState::Disconnected,
+            None,
+            Some(LinkFailure::Dial(ErrorKind::PermissionDenied)),
+        )
+        .unwrap();
+        assert_eq!(other["reason"], "dial_failed");
+        assert!(other["detail"].is_string());
+    }
+
     #[test]
     fn connection_events_keep_the_0_3_codes() {
         assert_eq!(connection_event(code::SUCCESS)["errorCode"], 0);
